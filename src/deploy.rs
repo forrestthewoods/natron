@@ -2,7 +2,7 @@
 //! using one of three modes: `hardlink`, `symlink`, `copy`.
 
 use anyhow::{Context, Result, bail};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::config::DeployMode;
 use crate::fs_util;
@@ -190,6 +190,7 @@ pub fn undeploy(dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn make_install_tree(root: &Path) -> PathBuf {

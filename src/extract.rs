@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::config::ArchiveKind;
