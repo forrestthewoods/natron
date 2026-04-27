@@ -8,7 +8,7 @@
 //! rather than `zig-windows-x86_64-0.15.2/zig.exe`. Override via
 //! `options.strip_prefix = "..."` if you want a different layout.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value as Json;
 
 use super::{InstallCtx, Installed, Provider};

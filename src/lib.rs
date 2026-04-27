@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod cas;
+pub mod cli;
 pub mod config;
 pub mod deploy;
 pub mod download;

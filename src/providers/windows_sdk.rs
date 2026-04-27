@@ -9,7 +9,7 @@
 use anyhow::{Result, anyhow};
 use std::path::Path;
 
-use super::vs_manifest::{self, VsManifest};
+use super::vs_manifest;
 use super::{InstallCtx, Installed, Provider};
 use crate::cache::sanitize_fingerprint;
 use crate::extract;
