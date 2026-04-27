@@ -17,7 +17,7 @@ pub use engine::{
     EntryError, EntryOutcome, Natron, SyncAction, SyncOptions, SyncReport,
 };
 pub use providers::{
-    GithubProvider, InstallCtx, Installed, Provider, ProviderRegistry, UrlProvider,
-    ZigProvider,
+    GithubProvider, InstallCtx, Installed, MsvcProvider, Provider, ProviderRegistry,
+    UrlProvider, ZigProvider,
 };
 pub use state::{DeployState, DeployedEntry, StateDiff};

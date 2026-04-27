@@ -10,11 +10,14 @@ use crate::cache::Cache;
 use crate::download;
 
 pub mod github;
+pub mod msvc;
 pub mod url;
+pub mod vs_manifest;
 pub mod zig;
-// msvc / windows_sdk land in steps 11 / 12.
+// windows_sdk lands in step 12.
 
 pub use github::GithubProvider;
+pub use msvc::MsvcProvider;
 pub use url::UrlProvider;
 pub use zig::ZigProvider;
 
@@ -134,6 +137,7 @@ impl ProviderRegistry {
         r.register(UrlProvider::new());
         r.register(GithubProvider::new());
         r.register(ZigProvider::new());
+        r.register(MsvcProvider::new());
         r
     }
 
