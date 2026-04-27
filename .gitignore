@@ -1,3 +1,8 @@
 /target
 **/*.rs.bk
 Cargo.lock.bak
+
+# anubis_demo example writes its deploy tree + state file here. The
+# natron.toml is committed; everything else is generated at runtime.
+/examples/anubis_demo/toolchains/
+/examples/anubis_demo/.natron-state.toml

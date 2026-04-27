@@ -1,0 +1,70 @@
+# Demo / example natron config. Vendors a realistic set of toolchains for
+# Windows C/C++ development into examples/anubis_demo/toolchains/.
+#
+# Run:
+#   cargo run --release --example anubis_demo
+#
+# Or via the CLI:
+#   natron --config examples/anubis_demo/natron.toml install
+#
+# First run will fetch ~3-5 GB of toolchains from upstream (LLVM is the
+# bulk). Subsequent runs hit the cache and complete in seconds — they
+# only verify deploy state and refresh hardlinks if anything is missing.
+#
+# Cache location is the default platform cache dir:
+#   Linux/macOS: ~/.cache/natron/
+#   Windows:     %LOCALAPPDATA%\.cache\natron\
+
+[settings]
+deploy_dir  = "toolchains"
+deploy_mode = "hardlink"
+# cache_dir intentionally omitted — uses the platform default so the cache
+# survives across runs and is shared across projects.
+
+# === LLVM/Clang for Windows MSVC target ===
+[[toolchain]]
+name        = "llvm21"
+deploy_dir  = "llvm21"
+provider    = "github"
+[toolchain.options]
+repo         = "llvm/llvm-project"
+tag          = "llvmorg-21.1.6"
+version      = "21.1.6"
+asset        = "clang+llvm-21.1.6-x86_64-pc-windows-msvc.tar.xz"
+strip_prefix = "clang+llvm-21.1.6-x86_64-pc-windows-msvc"
+
+# === Zig (used here for its bundled libc when cross-compiling) ===
+[[toolchain]]
+name        = "zig"
+deploy_dir  = "zig"
+provider    = "zig"
+[toolchain.options]
+version  = "0.15.2"
+platform = "x86_64-windows"
+
+# === NASM (assembler — small, demonstrates the `url` provider) ===
+[[toolchain]]
+name        = "nasm"
+deploy_dir  = "nasm"
+provider    = "url"
+[toolchain.options]
+url          = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
+strip_prefix = "nasm-3.01"
+
+# === MSVC compiler + CRT (Visual Studio 18 series) ===
+[[toolchain]]
+name        = "msvc"
+deploy_dir  = "msvc"
+provider    = "msvc"
+[toolchain.options]
+vs_channel   = "18"
+msvc_version = "14.51"
+
+# === Windows SDK ===
+[[toolchain]]
+name        = "windows_sdk"
+deploy_dir  = "windows_sdk"
+provider    = "windows_sdk"
+[toolchain.options]
+vs_channel  = "18"
+sdk_version = "26100"
