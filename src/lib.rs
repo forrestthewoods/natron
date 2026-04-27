@@ -2,6 +2,8 @@
 
 pub mod cache;
 pub mod config;
+pub mod download;
+pub mod extract;
 pub mod fs_util;
 pub mod state;
 
