@@ -6,7 +6,7 @@
 //! component package is a meta-package whose `dependencies` map names the
 //! actual MSI-bearing packages.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::path::Path;
 
 use super::vs_manifest;
@@ -127,61 +127,74 @@ impl Provider for WindowsSdkProvider {
         })?;
         let dep_ids: Vec<String> = component.dependencies.keys().cloned().collect();
 
-        // Stage extraction into a temp area, then move "Windows Kits/10/*"
-        // contents up to the staging root.
-        let staging_raw = ctx.staging_dir()?;
-        let temp_extract = staging_raw.join("__msi_extract");
-        std::fs::create_dir_all(&temp_extract)?;
+        // Stage all CABs + MSIs in ONE flat directory. msiexec /a resolves
+        // CAB references in the same directory as the MSI, so they MUST be
+        // siblings. msiexec /a ALSO copies the MSI itself into TARGETDIR
+        // for record-keeping; we don't want that polluting the deploy
+        // tree, so we extract into a scratch dir and move only `Windows
+        // Kits/10/*` up to the staging root afterward.
+        let staging_raw = ctx.staging_dir()?.to_path_buf();
+        let payloads_dir = staging_raw.join("__sdk_payloads");
+        let extract_dir = staging_raw.join("__sdk_extract");
+        std::fs::create_dir_all(&payloads_dir)
+            .with_context(|| format!("creating {}", payloads_dir.display()))?;
+        std::fs::create_dir_all(&extract_dir)
+            .with_context(|| format!("creating {}", extract_dir.display()))?;
 
-        // Download every payload (CABs + MSIs) and extract only the
-        // essential MSIs. CABs are sibling files referenced by MSIs during
-        // extraction; they must be in the same dir as the MSI when
-        // msiexec runs.
-        let downloads_dir = ctx.cache().downloads.clone();
+        let mut essential_msis: Vec<std::path::PathBuf> = Vec::new();
         for dep_id in &dep_ids {
             let Some(pkg) = manifest.find_package(dep_id) else {
                 tracing::warn!("SDK dep package {dep_id} not in manifest; skipping");
                 continue;
             };
-            // Track which files this package contributed; among them the
-            // .msi files that match an essential prefix must be extracted.
-            let mut staged_msis = Vec::new();
             for p in &pkg.payloads {
                 let filename = p
                     .file_name
                     .clone()
                     .or_else(|| filename_from_url(&p.url))
                     .unwrap_or_else(|| "unknown.bin".to_string());
-                let downloaded = ctx.download(&p.url, p.sha256.as_deref())?;
-                // Stage CAB/MSI files together in a per-package extraction
-                // dir so msiexec can find the CABs as siblings of the MSI.
-                let pkg_tmp = temp_extract.join(sanitize_fingerprint(dep_id));
-                std::fs::create_dir_all(&pkg_tmp)?;
-                let dest = pkg_tmp.join(strip_installer_prefix(&filename));
+                let basename = strip_installer_prefix(&filename);
+                let downloaded = ctx
+                    .download(&p.url, p.sha256.as_deref())
+                    .with_context(|| format!("downloading SDK payload {filename} for {dep_id}"))?;
+                let dest = payloads_dir.join(&basename);
                 if !dest.exists() {
-                    // hardlink from downloads/ if same volume; else copy.
-                    if std::fs::hard_link(&downloaded, &dest).is_err() {
-                        std::fs::copy(&downloaded, &dest)?;
-                    }
+                    // Hardlink from downloads/ if possible, else copy.
+                    let r = std::fs::hard_link(&downloaded, &dest).or_else(|_| {
+                        std::fs::copy(&downloaded, &dest).map(|_| ())
+                    });
+                    r.with_context(|| {
+                        format!(
+                            "staging SDK payload {} -> {}",
+                            downloaded.display(),
+                            dest.display()
+                        )
+                    })?;
                 }
-                let _ = downloads_dir; // silence unused on some cfgs
                 if filename.to_lowercase().ends_with(".msi") && is_essential_msi(&filename) {
-                    staged_msis.push(dest);
+                    essential_msis.push(dest);
                 }
-            }
-            for msi in staged_msis {
-                tracing::debug!("extracting SDK MSI {}", msi.display());
-                extract::extract_msi(&msi, &staging_raw)?;
             }
         }
 
-        // After extraction, contents live under `staging_raw/Windows Kits/10/*`.
-        // Flatten by moving each child of Windows Kits/10/ up to staging_raw/
-        // and removing the Windows Kits skeleton.
-        flatten_windows_kits(&staging_raw)?;
+        tracing::info!("extracting {} essential SDK MSIs", essential_msis.len());
+        for msi in &essential_msis {
+            tracing::debug!("extracting SDK MSI {}", msi.display());
+            extract::extract_msi(msi, &extract_dir).with_context(|| {
+                format!("extracting MSI {}", msi.display())
+            })?;
+        }
 
-        // Clean up the per-package staging dirs.
-        let _ = fs_util::remove_dir_all_writable(&temp_extract);
+        // After extraction, the wanted SDK content is at
+        // `extract_dir/Windows Kits/10/*`. Move each child of Windows
+        // Kits/10/ up to staging_raw/ and discard everything else
+        // (including the .msi copies msiexec /a leaves behind).
+        flatten_windows_kits_into(&extract_dir, &staging_raw)
+            .context("flattening Windows Kits/10")?;
+
+        // Drop the scratch dirs.
+        let _ = fs_util::remove_dir_all_writable(&payloads_dir);
+        let _ = fs_util::remove_dir_all_writable(&extract_dir);
 
         Ok(Installed {
             fingerprint: fp,
@@ -198,12 +211,16 @@ fn is_essential_msi(filename: &str) -> bool {
     ESSENTIAL_MSIS.iter().any(|prefix| base.starts_with(prefix))
 }
 
+/// Take just the basename of a manifest filename. VS manifest sometimes
+/// nests filenames under directories like `Installers\foo.msi` or
+/// `Redistributable\10.1.0.0\UAPSDKAddOn-x86.msi`. We flatten everything
+/// into one directory so msiexec /a can resolve sibling CABs by basename.
 fn strip_installer_prefix(filename: &str) -> String {
-    // VS manifest sometimes prefixes filenames with "Installers\".
-    filename
-        .strip_prefix("Installers\\")
-        .or_else(|| filename.strip_prefix("Installers/"))
-        .unwrap_or(filename)
+    let normalized = filename.replace('\\', "/");
+    normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(&normalized)
         .to_string()
 }
 
@@ -215,28 +232,26 @@ fn filename_from_url(url: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// MSIs extract to `<staging>/Windows Kits/10/*`. Move every direct child
-/// of `Windows Kits/10/` up to `<staging>/` and remove the empty skeleton.
-fn flatten_windows_kits(staging: &Path) -> Result<()> {
-    let kits = staging.join("Windows Kits").join("10");
+/// MSIs extracted to `<src>/Windows Kits/10/*`. Move every direct child of
+/// `Windows Kits/10/` to `<dst>/`, merging when names collide. Anything
+/// else under `<src>/` (the `.msi` copies msiexec leaves behind, etc.) is
+/// not touched.
+fn flatten_windows_kits_into(src: &Path, dst: &Path) -> Result<()> {
+    let kits = src.join("Windows Kits").join("10");
     if !kits.exists() {
-        // Some hand-faked test inputs may not have this layout; that's
-        // fine — leave staging as-is.
         return Ok(());
     }
+    std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(&kits)? {
         let entry = entry?;
-        let dest = staging.join(entry.file_name());
-        // If something already exists at dest (rare), merge by moving
-        // children individually.
-        if dest.exists() {
-            merge_into(&entry.path(), &dest)?;
+        let target = dst.join(entry.file_name());
+        if target.exists() {
+            merge_into(&entry.path(), &target)?;
             fs_util::remove_dir_all_writable(&entry.path()).ok();
         } else {
-            std::fs::rename(entry.path(), dest)?;
+            std::fs::rename(entry.path(), target)?;
         }
     }
-    fs_util::remove_dir_all_writable(&staging.join("Windows Kits")).ok();
     Ok(())
 }
 
@@ -328,14 +343,32 @@ mod tests {
         assert!(is_essential_msi(
             "Installers\\Windows SDK OnecoreUap Headers-x86_en-us.msi"
         ));
+        assert!(is_essential_msi(
+            "Redistributable\\10.1.0.0\\Windows SDK Desktop Libs x64-x86.msi"
+        ));
         assert!(!is_essential_msi("Random Other.msi"));
     }
 
     #[test]
-    fn flatten_windows_kits_moves_children_up() {
+    fn strip_installer_prefix_flattens_subdirs() {
+        assert_eq!(strip_installer_prefix("simple.msi"), "simple.msi");
+        assert_eq!(
+            strip_installer_prefix("Installers\\foo.msi"),
+            "foo.msi"
+        );
+        assert_eq!(
+            strip_installer_prefix("Redistributable\\10.1.0.0\\UAPSDKAddOn-x86.msi"),
+            "UAPSDKAddOn-x86.msi"
+        );
+        assert_eq!(strip_installer_prefix("a/b/c.cab"), "c.cab");
+    }
+
+    #[test]
+    fn flatten_windows_kits_moves_children_to_dst() {
         let tmp = TempDir::new().unwrap();
-        let staging = tmp.path().join("staging");
-        let kits = staging.join("Windows Kits").join("10");
+        let src = tmp.path().join("extract");
+        let dst = tmp.path().join("install");
+        let kits = src.join("Windows Kits").join("10");
         std::fs::create_dir_all(kits.join("Include").join("10.0.0")).unwrap();
         std::fs::write(
             kits.join("Include").join("10.0.0").join("foo.h"),
@@ -348,18 +381,13 @@ mod tests {
             b"libdata",
         )
         .unwrap();
+        // Stray files in src that should NOT be carried into dst.
+        std::fs::write(src.join("Some-Random.msi"), b"msi-bytes").unwrap();
 
-        flatten_windows_kits(&staging).unwrap();
+        flatten_windows_kits_into(&src, &dst).unwrap();
 
-        assert!(staging.join("Include").join("10.0.0").join("foo.h").is_file());
-        assert!(
-            staging
-                .join("Lib")
-                .join("10.0.0")
-                .join("um")
-                .join("foo.lib")
-                .is_file()
-        );
-        assert!(!staging.join("Windows Kits").exists());
+        assert!(dst.join("Include").join("10.0.0").join("foo.h").is_file());
+        assert!(dst.join("Lib").join("10.0.0").join("um").join("foo.lib").is_file());
+        assert!(!dst.join("Some-Random.msi").exists(), "stray .msi must not leak into install");
     }
 }

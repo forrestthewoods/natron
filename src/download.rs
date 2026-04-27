@@ -86,9 +86,34 @@ fn stream_http_into_cache(
     expected_sha256: Option<&str>,
 ) -> Result<()> {
     tracing::info!("downloading {url}");
-    let response = ureq::get(url)
-        .call()
-        .map_err(|e| anyhow!("HTTP GET {url}: {e}"))?;
+    // Retry the GET on transient errors. We've seen "No such host is known"
+    // from ureq's resolver on hosts that work fine via curl; the failure
+    // typically clears within a few hundred ms. Do not retry once we have
+    // an opened response stream — a partial download is the streamer's job
+    // to resolve.
+    let mut last_err: Option<String> = None;
+    let mut delay_ms = 100u64;
+    let response = loop {
+        match ureq::get(url).call() {
+            Ok(r) => break r,
+            Err(err) => {
+                let msg = err.to_string();
+                let transient = msg.contains("No such host is known")
+                    || msg.contains("dns error")
+                    || msg.contains("resolve")
+                    || msg.contains("connection reset")
+                    || msg.contains("timed out");
+                if !transient || delay_ms > 4000 {
+                    return Err(anyhow!("HTTP GET {url}: {err}"));
+                }
+                tracing::warn!("transient HTTP error on {url}: {err}; retrying in {delay_ms}ms");
+                last_err = Some(msg);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms *= 2;
+            }
+        }
+    };
+    let _ = last_err;
     let status = response.status();
     if status.as_u16() >= 400 {
         bail!("HTTP {status} for {url}");

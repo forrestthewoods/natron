@@ -49,6 +49,12 @@ pub struct Package {
     pub id: String,
     #[serde(default)]
     pub payloads: Vec<Payload>,
+    /// Many VS packages exist in multiple variants distinguished only by
+    /// `language` (e.g. en-US, cs-CZ, ja-JP). When picking by id alone we
+    /// must filter by language or we'll get the first one alphabetically
+    /// (cs-CZ).
+    #[serde(default)]
+    pub language: Option<String>,
     /// VS package dependencies. The KEYS of this map are the dependent
     /// package ids; the VALUES are version constraints we don't currently
     /// inspect.
@@ -107,10 +113,33 @@ fn version_key(v: &str) -> Vec<u64> {
 }
 
 impl VsManifest {
-    /// Find a package by exact id (case-insensitive).
+    /// Find a package by exact id (case-insensitive). When multiple variants
+    /// exist (different `language` attribute), prefer en-US, then no
+    /// language at all, then any.
     pub fn find_package(&self, id: &str) -> Option<&Package> {
         let lower = id.to_lowercase();
-        self.packages.iter().find(|p| p.id.to_lowercase() == lower)
+        let matches: Vec<&Package> = self
+            .packages
+            .iter()
+            .filter(|p| p.id.to_lowercase() == lower)
+            .collect();
+        if matches.is_empty() {
+            return None;
+        }
+        // Prefer en-US.
+        if let Some(p) = matches
+            .iter()
+            .copied()
+            .find(|p| p.language.as_deref() == Some("en-US"))
+        {
+            return Some(p);
+        }
+        // Then language-less.
+        if let Some(p) = matches.iter().copied().find(|p| p.language.is_none()) {
+            return Some(p);
+        }
+        // Fall back to first match.
+        Some(matches[0])
     }
 
     /// Find every MSVC compiler+CRT package matching `microsoft.vc.{ver}.tools.host{host}.target{target}.base`.
@@ -265,6 +294,45 @@ mod tests {
         let m = sample_manifest();
         let p = m.find_package("MICROSOFT.VC.14.50.18.0.CRT.HEADERS.BASE");
         assert!(p.is_some());
+    }
+
+    #[test]
+    fn find_package_prefers_en_us_among_language_variants() {
+        let json = r#"{
+            "packages": [
+                {"id": "Foo.Bar", "language": "cs-CZ", "payloads": []},
+                {"id": "Foo.Bar", "language": "en-US", "payloads": []},
+                {"id": "Foo.Bar", "language": "ja-JP", "payloads": []}
+            ]
+        }"#;
+        let m: VsManifest = serde_json::from_str(json).unwrap();
+        let p = m.find_package("Foo.Bar").unwrap();
+        assert_eq!(p.language.as_deref(), Some("en-US"));
+    }
+
+    #[test]
+    fn find_package_falls_back_to_languageless_then_first() {
+        // No en-US: prefer the languageless one.
+        let json = r#"{
+            "packages": [
+                {"id": "Foo.Bar", "language": "cs-CZ", "payloads": []},
+                {"id": "Foo.Bar", "payloads": []}
+            ]
+        }"#;
+        let m: VsManifest = serde_json::from_str(json).unwrap();
+        let p = m.find_package("Foo.Bar").unwrap();
+        assert!(p.language.is_none());
+
+        // Only language variants, no en-US: take the first.
+        let json2 = r#"{
+            "packages": [
+                {"id": "Foo.Bar", "language": "ja-JP", "payloads": []},
+                {"id": "Foo.Bar", "language": "de-DE", "payloads": []}
+            ]
+        }"#;
+        let m2: VsManifest = serde_json::from_str(json2).unwrap();
+        let p2 = m2.find_package("Foo.Bar").unwrap();
+        assert_eq!(p2.language.as_deref(), Some("ja-JP"));
     }
 
     #[test]

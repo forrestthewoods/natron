@@ -235,26 +235,39 @@ pub fn extract_vsix(archive: &Path, dest: &Path) -> Result<()> {
 
 /// Run `msiexec /a` to do an "administrative" extraction of an MSI into a
 /// destination directory. Windows-only.
+///
+/// msiexec is picky about path formatting: it wants all-backslash native
+/// paths, not mixed `/` and `\`. We normalize before invocation. We also
+/// avoid the `\\?\` prefix that `canonicalize` adds — msiexec rejects that
+/// too.
 #[cfg(windows)]
 #[allow(dead_code)] // Used by msvc + windows_sdk providers in steps 11/12
 pub fn extract_msi(msi: &Path, dest: &Path) -> Result<()> {
     tracing::debug!("extracting msi {} -> {}", msi.display(), dest.display());
     std::fs::create_dir_all(dest)?;
+    let abs_msi = if msi.is_absolute() {
+        msi.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(msi)
+    };
     let abs_dest = if dest.is_absolute() {
         dest.to_path_buf()
     } else {
         std::env::current_dir()?.join(dest)
     };
+    let msi_native = to_native_windows_path(&abs_msi);
+    let dest_native = to_native_windows_path(&abs_dest);
     // TARGETDIR must end with a backslash for msiexec.
-    let target = format!("{}\\", abs_dest.display());
+    let target = format!("{dest_native}\\");
     let log_path = abs_dest.join("msi_install.log");
+    let log_native = to_native_windows_path(&log_path);
     let output = std::process::Command::new("msiexec.exe")
         .arg("/a")
-        .arg(msi.as_os_str())
+        .arg(&msi_native)
         .arg("/qn")
         .arg(format!("TARGETDIR={target}"))
         .arg("/L*V")
-        .arg(&log_path)
+        .arg(&log_native)
         .output()
         .with_context(|| "running msiexec.exe")?;
     if !output.status.success() {
@@ -262,7 +275,7 @@ pub fn extract_msi(msi: &Path, dest: &Path) -> Result<()> {
             .unwrap_or_else(|_| "<could not read msi log>".to_string());
         let tail: Vec<_> = log.lines().rev().take(40).collect();
         bail!(
-            "msiexec /a failed: status={} stderr={}\n--- log tail ---\n{}",
+            "msiexec /a failed (msi={msi_native}): status={} stderr={}\n--- log tail ---\n{}",
             output.status,
             String::from_utf8_lossy(&output.stderr),
             tail.into_iter().rev().collect::<Vec<_>>().join("\n")
@@ -271,6 +284,14 @@ pub fn extract_msi(msi: &Path, dest: &Path) -> Result<()> {
     // Clean up the log file we asked msiexec to write.
     let _ = std::fs::remove_file(&log_path);
     Ok(())
+}
+
+/// Convert a Path to a native Windows path string with all backslashes and
+/// no `\\?\` prefix (which msiexec rejects).
+#[cfg(windows)]
+fn to_native_windows_path(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('/', "\\");
+    s.strip_prefix(r"\\?\").map(|s| s.to_string()).unwrap_or(s)
 }
 
 #[cfg(not(windows))]

@@ -113,9 +113,15 @@ impl Provider for MsvcProvider {
         }
 
         // Collect all payloads from MSVC base + companion packages.
+        // The Res.base package carries language resource DLLs (clui.dll
+        // etc.) that cl.exe needs to even start up.
+        let host_lower = HOST.to_lowercase();
         let target_lower = TARGET.to_lowercase();
         let companion_ids = vec![
             base_pkg_id,
+            format!(
+                "Microsoft.VC.{resolved_ver}.Tools.Host{host_lower}.Target{target_lower}.Res.base"
+            ),
             format!("Microsoft.VC.{resolved_ver}.CRT.Headers.base"),
             format!("Microsoft.VC.{resolved_ver}.CRT.{target_lower}.Desktop.base"),
             format!("Microsoft.VC.{resolved_ver}.CRT.{target_lower}.Store.base"),
