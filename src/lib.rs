@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod cas;
 pub mod config;
+pub mod deploy;
 pub mod download;
 pub mod extract;
 pub mod fs_util;
