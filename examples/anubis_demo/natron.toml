@@ -11,9 +11,7 @@
 # bulk). Subsequent runs hit the cache and complete in seconds — they
 # only verify deploy state and refresh hardlinks if anything is missing.
 #
-# Cache location is the default platform cache dir:
-#   Linux/macOS: ~/.cache/natron/
-#   Windows:     %LOCALAPPDATA%\.cache\natron\
+# Cache location is the default: ~/.natron/ (shared across all projects).
 
 [settings]
 deploy_dir  = "toolchains"

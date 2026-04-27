@@ -125,8 +125,8 @@ machinery is independent of the deploy mode and isn't user-visible.
 
 ## Cache layout
 
-natron uses one global cache (default `~/.cache/natron` on Linux/macOS,
-`%LOCALAPPDATA%\.cache\natron` on Windows):
+natron uses one global cache (default `~/.natron/` on every platform —
+shared across all projects, like `~/.cargo` or `~/.rustup`):
 
 ```
 <cache>/

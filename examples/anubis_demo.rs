@@ -12,8 +12,8 @@
 //!   cargo run --release --example anubis_demo
 //!
 //! First run downloads ~3-5 GB. Subsequent runs hit the shared cache at
-//! the platform default (`~/.cache/natron` / `%LOCALAPPDATA%\.cache\natron`)
-//! and finish in seconds.
+//! `~/.natron/` (default, shared across all projects on the machine) and
+//! finish in seconds.
 
 use std::path::{Path, PathBuf};
 

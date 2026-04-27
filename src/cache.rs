@@ -116,26 +116,16 @@ impl Cache {
     }
 }
 
-/// Find the platform default cache directory.
+/// Find the default cache directory: `~/.natron` on every platform.
 ///
-/// Linux/macOS: `~/.cache/natron/` (XDG-honoring via `dirs::cache_dir`).
-/// Windows: `%LOCALAPPDATA%\.cache\natron\` — mirrors the Unix `~/.cache/...`
-/// shape inside `AppData\Local`. This matches the cross-platform convention
-/// other tools tend to use rather than the older `<vendor>\<tool>\cache`
-/// pattern.
+/// One dot-directory in the user's home, matching the convention of
+/// cross-project tools like `~/.cargo`, `~/.rustup`, `~/.gradle`. The cache
+/// is shared across every project on the machine, so a home-dir location
+/// makes more sense than a platform-specific app-data dir.
 fn default_cache_dir() -> Result<PathBuf> {
-    #[cfg(windows)]
-    {
-        let base = dirs::data_local_dir()
-            .ok_or_else(|| anyhow!("could not determine LOCALAPPDATA"))?;
-        Ok(base.join(".cache").join("natron"))
-    }
-    #[cfg(not(windows))]
-    {
-        let base = dirs::cache_dir()
-            .ok_or_else(|| anyhow!("could not determine cache directory"))?;
-        Ok(base.join("natron"))
-    }
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow!("could not determine user home directory"))?;
+    Ok(home.join(".natron"))
 }
 
 /// Sanitize a fingerprint for use as a directory name.
