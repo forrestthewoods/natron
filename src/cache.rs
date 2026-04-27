@@ -117,13 +117,18 @@ impl Cache {
 }
 
 /// Find the platform default cache directory.
+///
+/// Linux/macOS: `~/.cache/natron/` (XDG-honoring via `dirs::cache_dir`).
+/// Windows: `%LOCALAPPDATA%\.cache\natron\` — mirrors the Unix `~/.cache/...`
+/// shape inside `AppData\Local`. This matches the cross-platform convention
+/// other tools tend to use rather than the older `<vendor>\<tool>\cache`
+/// pattern.
 fn default_cache_dir() -> Result<PathBuf> {
     #[cfg(windows)]
     {
-        // %LOCALAPPDATA%\natron\cache
         let base = dirs::data_local_dir()
             .ok_or_else(|| anyhow!("could not determine LOCALAPPDATA"))?;
-        Ok(base.join("natron").join("cache"))
+        Ok(base.join(".cache").join("natron"))
     }
     #[cfg(not(windows))]
     {

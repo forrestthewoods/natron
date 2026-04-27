@@ -122,7 +122,7 @@ block with distinct `name` and `deploy_dir`.
 ## Cache layout
 
 natron uses one global cache (default `~/.cache/natron` on Linux/macOS,
-`%LOCALAPPDATA%\natron\cache` on Windows):
+`%LOCALAPPDATA%\.cache\natron` on Windows):
 
 ```
 <cache>/
