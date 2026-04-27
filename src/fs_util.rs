@@ -123,16 +123,46 @@ pub fn try_rename(from: &Path, to: &Path) -> Result<bool> {
     }
 }
 
-/// Create a hardlink. Wraps `std::fs::hard_link` with better error context.
+/// Create a hardlink. Retries a few times on transient Access-Denied errors,
+/// which can surface on Windows when another thread/process is holding the
+/// source file open (e.g. via `SetFileAttributesW`) at the same instant.
 pub fn hard_link(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::hard_link(src, dst).with_context(|| {
-        format!("hardlink {} -> {}", src.display(), dst.display())
-    })?;
-    Ok(())
+    const MAX_ATTEMPTS: u32 = 6;
+    let mut delay_ms = 5u64;
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match std::fs::hard_link(src, dst) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let kind = err.kind();
+                let raw = err.raw_os_error();
+                // Retry on Access Denied / Sharing Violation (transient on
+                // Windows under contention with concurrent attribute writes
+                // on the source). On other kinds of error, fail fast.
+                let transient = kind == std::io::ErrorKind::PermissionDenied
+                    || raw == Some(5)   // ERROR_ACCESS_DENIED
+                    || raw == Some(32); // ERROR_SHARING_VIOLATION
+                if !transient || attempt + 1 == MAX_ATTEMPTS {
+                    last_err = Some(err);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(80);
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "hardlink {} -> {}: {}",
+        src.display(),
+        dst.display(),
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown error".to_string())
+    ))
 }
 
 /// Create a directory symlink. On Windows, falls back to a junction if

@@ -250,7 +250,10 @@ impl Natron {
                 cas_report.bytes_freed
             );
 
-            fs_util::set_readonly_recursive(&staging_tree)?;
+            // Note: we do NOT walk staging_tree to mark files readonly here.
+            // CAS-managed files are marked readonly at insertion time inside
+            // cas::run; --no-cas mode leaves files writable, which is the
+            // correct semantic for that opt-out (FAT32 / cross-volume).
             let _ = std::fs::remove_dir_all(&staging_raw);
 
             let metadata = InstallMetadata::new(

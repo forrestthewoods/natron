@@ -128,6 +128,7 @@ fn cas_file(
 
     // Try to claim the CAS slot.
     let cas_existed = cas_path.is_file();
+    let mut just_inserted = false;
     if cas_existed {
         // Byte-compare to detect a (vanishingly rare) hash collision.
         if !files_equal(src, &cas_path)? {
@@ -153,7 +154,9 @@ fn cas_file(
         // Try atomic rename; on EEXIST fall through to byte-compare branch
         // (peer raced us between our existence check and rename).
         match std::fs::rename(src, &cas_path) {
-            Ok(()) => {}
+            Ok(()) => {
+                just_inserted = true;
+            }
             Err(err) => {
                 if cas_path.is_file() {
                     if !files_equal(src, &cas_path)? {
@@ -181,9 +184,32 @@ fn cas_file(
         }
     }
 
-    // Hardlink CAS → install tree position.
+    // Hardlink CAS → install tree position. Do this BEFORE marking the CAS
+    // file readonly: on Windows, marking a file's attributes momentarily
+    // contends with concurrent CreateHardLinkW from a peer thread. We
+    // mark readonly AFTER successfully creating our hardlink so future
+    // peers linking to the same CAS blob can do so without contention
+    // with our SetFileAttributes call. (And the hardlink helper itself
+    // retries on transient access-denied for the same reason.)
     fs_util::hard_link(&cas_path, dst)?;
+
+    if just_inserted {
+        // Best-effort readonly on the CAS blob. The hardlink we just
+        // created shares the inode, so this also makes our install-tree
+        // entry readonly. Failure here is non-fatal.
+        let _ = fs_util::clear_readonly(&cas_path); // first clear in case set
+        let _ = mark_readonly(&cas_path);
+    }
+
     report.files_processed += 1;
+    Ok(())
+}
+
+fn mark_readonly(path: &Path) -> Result<()> {
+    let md = std::fs::metadata(path)?;
+    let mut perms = md.permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(path, perms)?;
     Ok(())
 }
 
