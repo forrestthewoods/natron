@@ -13,12 +13,13 @@ pub mod github;
 pub mod msvc;
 pub mod url;
 pub mod vs_manifest;
+pub mod windows_sdk;
 pub mod zig;
-// windows_sdk lands in step 12.
 
 pub use github::GithubProvider;
 pub use msvc::MsvcProvider;
 pub use url::UrlProvider;
+pub use windows_sdk::WindowsSdkProvider;
 pub use zig::ZigProvider;
 
 /// A single source of toolchain bytes (LLVM via GitHub release, NASM at a
@@ -138,6 +139,7 @@ impl ProviderRegistry {
         r.register(GithubProvider::new());
         r.register(ZigProvider::new());
         r.register(MsvcProvider::new());
+        r.register(WindowsSdkProvider::new());
         r
     }
 

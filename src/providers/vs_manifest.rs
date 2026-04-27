@@ -49,6 +49,11 @@ pub struct Package {
     pub id: String,
     #[serde(default)]
     pub payloads: Vec<Payload>,
+    /// VS package dependencies. The KEYS of this map are the dependent
+    /// package ids; the VALUES are version constraints we don't currently
+    /// inspect.
+    #[serde(default)]
+    pub dependencies: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Fetch the channel manifest, follow it to the VS manifest, and return the
