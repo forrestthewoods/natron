@@ -1,6 +1,7 @@
 //! Natron — vendor compiler toolchains into source-controlled projects.
 
 pub mod cache;
+pub mod cas;
 pub mod config;
 pub mod download;
 pub mod extract;
