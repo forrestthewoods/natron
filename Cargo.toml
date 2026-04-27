@@ -42,3 +42,12 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Integration tests build synthetic archives + URLs at runtime. These also
+# appear under [dependencies] (used in src/), but cargo doesn't propagate
+# regular deps into the integration-test compilation unit, so list them here.
+filetime = "0.2"
+tar = "0.4"
+toml = "0.8"
+url = "2.5"
+xz2 = "0.1"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }

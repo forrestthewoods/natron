@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use crate::cache::Cache;
 use crate::download;
 
-// url / github / zig / msvc / windows_sdk land in steps 8 / 9 / 10 / 11 / 12.
+pub mod url;
+// github / zig / msvc / windows_sdk land in steps 9 / 10 / 11 / 12.
+
+pub use url::UrlProvider;
 
 /// A single source of toolchain bytes (LLVM via GitHub release, NASM at a
 /// fixed URL, Zig via index.json, MSVC via VS manifest, etc.).
@@ -121,10 +124,11 @@ impl ProviderRegistry {
         }
     }
 
-    /// All built-in providers configured with production URLs. Currently
-    /// empty; populated as providers are added in steps 8–12.
+    /// All built-in providers configured with production URLs.
     pub fn default() -> Self {
-        Self::empty()
+        let mut r = Self::empty();
+        r.register(UrlProvider::new());
+        r
     }
 
     pub fn register<P: Provider + 'static>(&mut self, p: P) {
@@ -213,10 +217,8 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_is_empty_for_now() {
-        // Once step 8+ providers land, this becomes a sanity check that
-        // each is registered.
+    fn default_registry_has_url_provider() {
         let r = ProviderRegistry::default();
-        assert_eq!(r.ids().count(), 0);
+        assert!(r.get("url").is_some());
     }
 }

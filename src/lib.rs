@@ -16,5 +16,5 @@ pub use config::{ArchiveKind, Config, DeployMode, Settings, ToolchainEntry};
 pub use engine::{
     EntryError, EntryOutcome, Natron, SyncAction, SyncOptions, SyncReport,
 };
-pub use providers::{InstallCtx, Installed, Provider, ProviderRegistry};
+pub use providers::{InstallCtx, Installed, Provider, ProviderRegistry, UrlProvider};
 pub use state::{DeployState, DeployedEntry, StateDiff};
