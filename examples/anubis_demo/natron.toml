@@ -17,7 +17,10 @@
 
 [settings]
 deploy_dir  = "toolchains"
-deploy_mode = "hardlink"
+# deploy_mode defaults to "symlink" — instant + atomic version swaps.
+# Override per-toolchain with `deploy_mode = "hardlink"` if a tool can't
+# follow reparse points, or `deploy_mode = "copy"` to commit the bytes
+# into source control.
 # cache_dir intentionally omitted — uses the platform default so the cache
 # survives across runs and is shared across projects.
 

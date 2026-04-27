@@ -107,17 +107,21 @@ block with distinct `name` and `deploy_dir`.
 
 ## Deploy modes
 
-- **`hardlink`** (default): mirror the cache tree with hardlinks. Files in
-  the cache and the deploy dir share inodes; the cache file's read-only
-  attr means accidental edits via the deploy tree fail. Requires the
-  deploy dir to be on the same filesystem volume as the cache.
-- **`symlink`**: a single directory symlink from the deploy dir to the
-  cache install tree. On Windows, falls back to a junction if creating
-  symlinks lacks privilege.
-- **`copy`**: a real file copy. Slow and uses real disk space, but is
-  the only mode where the deployed files are independent of the cache —
-  useful if you actually want to commit the toolchain into source
-  control.
+- **`symlink`** (default): a single directory symlink from the deploy dir
+  to the cache install tree. Instant. Atomic version swaps (just rewrite
+  the link). Cross-volume safe. On Windows, falls back to a directory
+  junction when creating symlinks lacks privilege.
+- **`hardlink`**: mirror the cache tree with one hardlink per file. The
+  deploy looks like a plain directory tree to every tool. Requires the
+  deploy dir on the same filesystem volume as the cache. Use this when
+  a tool you depend on can't follow reparse points (rare).
+- **`copy`**: a real file copy. Slow and uses real disk space, but the
+  only mode where deployed files are independent of the cache — use
+  when you want to commit the toolchain into source control.
+
+The cache itself always uses hardlinks internally (each install tree's
+files are hardlinks into a content-addressed `cas/` directory). That
+machinery is independent of the deploy mode and isn't user-visible.
 
 ## Cache layout
 

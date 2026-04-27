@@ -66,7 +66,12 @@ pub enum DeployMode {
 
 impl Default for DeployMode {
     fn default() -> Self {
-        DeployMode::Hardlink
+        // Symlink is the right default for deployment: instant, atomic
+        // version swaps, cross-volume safe, and on Windows we transparently
+        // fall back to a directory junction when symlink privilege is
+        // missing. Hardlinks within the cache (CAS dedup) are unaffected
+        // — that machinery is internal to <cache>/cas/ and <cache>/installs/.
+        DeployMode::Symlink
     }
 }
 
@@ -343,7 +348,7 @@ url = "https://example.com/{name}.zip"
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.toolchains.len(), 1);
         assert_eq!(cfg.toolchains[0].name, "foo");
-        assert_eq!(cfg.settings.deploy_mode, DeployMode::Hardlink);
+        assert_eq!(cfg.settings.deploy_mode, DeployMode::Symlink);
         assert_eq!(cfg.config_dir, tmp.path().canonicalize().unwrap_or(tmp.path().to_path_buf()).parent().map(|_| tmp.path().to_path_buf()).unwrap_or_else(|| tmp.path().to_path_buf()));
     }
 
@@ -483,8 +488,8 @@ cache_dir = "~/some/where"
     }
 
     #[test]
-    fn deploy_mode_default_is_hardlink() {
-        assert_eq!(DeployMode::default(), DeployMode::Hardlink);
+    fn deploy_mode_default_is_symlink() {
+        assert_eq!(DeployMode::default(), DeployMode::Symlink);
     }
 
     #[test]
@@ -526,6 +531,6 @@ cache_dir = "~/some/where"
         assert_eq!(cfg.effective_mode(&entry), DeployMode::Copy);
 
         let entry2 = ToolchainEntry { deploy_mode: None, ..entry };
-        assert_eq!(cfg.effective_mode(&entry2), DeployMode::Hardlink);
+        assert_eq!(cfg.effective_mode(&entry2), DeployMode::Symlink);
     }
 }
