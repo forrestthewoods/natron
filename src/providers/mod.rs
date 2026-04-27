@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use crate::cache::Cache;
 use crate::download;
 
+pub mod github;
 pub mod url;
-// github / zig / msvc / windows_sdk land in steps 9 / 10 / 11 / 12.
+// zig / msvc / windows_sdk land in steps 10 / 11 / 12.
 
+pub use github::GithubProvider;
 pub use url::UrlProvider;
 
 /// A single source of toolchain bytes (LLVM via GitHub release, NASM at a
@@ -128,6 +130,7 @@ impl ProviderRegistry {
     pub fn default() -> Self {
         let mut r = Self::empty();
         r.register(UrlProvider::new());
+        r.register(GithubProvider::new());
         r
     }
 

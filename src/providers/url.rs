@@ -7,6 +7,7 @@
 use anyhow::{Context, Result, anyhow};
 
 use super::{InstallCtx, Installed, Provider};
+use crate::cache::sanitize_fingerprint;
 use crate::config::ArchiveKind;
 use crate::extract;
 
@@ -51,7 +52,8 @@ impl Provider for UrlProvider {
         // Fingerprint is deterministic from URL (and strip_prefix +
         // archive_kind, since two configs differing only in those still
         // produce different install trees from the same bytes).
-        let fingerprint = compute_fingerprint(url, &strip_prefix, archive_kind);
+        let fingerprint =
+            sanitize_fingerprint(&compute_fingerprint(url, &strip_prefix, archive_kind));
 
         // Cache hit fast path.
         if ctx.cache().install_present(&fingerprint) {

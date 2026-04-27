@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{TestEnv, url_entry};
+use common::{TestEnv, github_entry, url_entry};
 use natron::{DeployMode, SyncAction, SyncOptions};
 use std::fs;
 use std::path::Path;
@@ -390,6 +390,67 @@ fn test_fresh_cache_dir() {
             "{sub} subdir should be created"
         );
     }
+}
+
+#[test]
+fn test_install_github_provider() {
+    let env = TestEnv::new();
+    // Build the asset archive.
+    let archive = env.make_tar_xz(
+        "clang+llvm-21.1.6-x86_64-pc-windows-msvc.tar.xz",
+        &[
+            ("bin/clang.exe", b"CLANG-BIN"),
+            ("LICENSE", b"llvm-license"),
+        ],
+    );
+    // Pre-populate the fake GitHub release JSON.
+    env.write_github_release_json(
+        "llvm/llvm-project",
+        "llvmorg-21.1.6",
+        "clang+llvm-21.1.6-x86_64-pc-windows-msvc.tar.xz",
+        &archive,
+    );
+
+    let cfg = env.build_config(vec![github_entry(
+        "llvm21",
+        "llvm21",
+        "llvm/llvm-project",
+        "llvmorg-21.1.6",
+        "clang+llvm-21.1.6-x86_64-pc-windows-msvc.tar.xz",
+    )]);
+    let n = env.make_natron(cfg);
+    let report = n.sync().unwrap();
+    assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+    assert_eq!(report.entries[0].action, SyncAction::InstalledAndDeployed);
+
+    let deploy = env.deploy_root().join("llvm21");
+    assert_eq!(fs::read(deploy.join("bin").join("clang.exe")).unwrap(), b"CLANG-BIN");
+    assert_eq!(fs::read(deploy.join("LICENSE")).unwrap(), b"llvm-license");
+}
+
+#[test]
+fn test_install_three_providers_at_once() {
+    // url + github (zig added in step 10).
+    let env = TestEnv::new();
+    let url_archive = env.make_zip("nasm.zip", &[("nasm.exe", b"NASM")]);
+    let gh_archive = env.make_tar_xz("llvm.tar.xz", &[("clang", b"CLANG")]);
+    env.write_github_release_json(
+        "llvm/llvm-project",
+        "llvmorg-21",
+        "llvm.tar.xz",
+        &gh_archive,
+    );
+
+    let cfg = env.build_config(vec![
+        url_entry("nasm", "nasm", &url_archive),
+        github_entry("llvm21", "llvm21", "llvm/llvm-project", "llvmorg-21", "llvm.tar.xz"),
+    ]);
+    let n = env.make_natron(cfg);
+    let report = n.sync().unwrap();
+    assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+    assert_eq!(report.entries.len(), 2);
+    assert!(env.deploy_root().join("nasm").join("nasm.exe").exists());
+    assert!(env.deploy_root().join("llvm21").join("clang").exists());
 }
 
 #[test]
