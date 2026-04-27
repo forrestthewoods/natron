@@ -6,7 +6,7 @@
 
 use natron::{
     Cache, Config, DeployMode, GithubProvider, Natron, ProviderRegistry, Settings,
-    ToolchainEntry, UrlProvider,
+    ToolchainEntry, UrlProvider, ZigProvider,
 };
 use std::fs::File;
 use std::io::Write as _;
@@ -91,13 +91,54 @@ impl TestEnv {
 
     /// Build a Natron with a default-style registry. The github provider's
     /// api_base is set to a `file://` URL pointing at `<fixture_root>/api/`
-    /// so tests can pre-populate fake release JSON there.
+    /// so tests can pre-populate fake release JSON there. The zig provider's
+    /// index_url points at `<fixture_root>/zig-index.json`; tests that use
+    /// the zig provider must call `write_zig_index_json` first.
     pub fn make_natron(&self, cfg: Config) -> Natron {
         let cache = Cache::at(self.cache_dir.clone());
         let mut reg = ProviderRegistry::empty();
         reg.register(UrlProvider::new());
         reg.register(GithubProvider::with_api_base(self.api_base()));
+        reg.register(ZigProvider::with_index_url(self.zig_index_url()));
         Natron::new(cfg, cache, reg)
+    }
+
+    /// `file://` URL for the fake Zig index.json the test harness uses.
+    pub fn zig_index_url(&self) -> String {
+        let path = self.fixture_root.join("zig-index.json");
+        // We may construct this URL before the file exists; that's fine
+        // because url::Url::from_file_path doesn't require the path to
+        // resolve. We DO ensure the parent dir exists.
+        std::fs::create_dir_all(&self.fixture_root).ok();
+        url::Url::from_file_path(&path).unwrap().to_string()
+    }
+
+    /// Write a fake Zig index.json. The single entry maps
+    /// `(version, platform)` to a `tarball` file:// URL pointing at
+    /// `archive_path` and a `shasum` of those bytes.
+    pub fn write_zig_index_json(
+        &self,
+        version: &str,
+        platform: &str,
+        archive_path: &Path,
+    ) {
+        let path = self.fixture_root.join("zig-index.json");
+        let archive_url = url::Url::from_file_path(archive_path).unwrap().to_string();
+        // Compute sha256 of the archive bytes.
+        let bytes = std::fs::read(archive_path).unwrap();
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let result = hasher.finalize();
+        let mut sha = String::with_capacity(64);
+        for b in result.iter() {
+            use std::fmt::Write as _;
+            write!(sha, "{b:02x}").unwrap();
+        }
+        let json = format!(
+            r#"{{"{version}":{{"{platform}":{{"tarball":"{archive_url}","shasum":"{sha}"}}}}}}"#
+        );
+        std::fs::write(&path, json).unwrap();
     }
 
     /// API base URL used by the github provider in tests. Format:
@@ -185,6 +226,26 @@ pub fn github_entry(
         name: name.into(),
         deploy_dir: deploy_dir.into(),
         provider: "github".into(),
+        deploy_mode: None,
+        options: opts,
+    }
+}
+
+/// Build a `[[toolchain]]` entry using `provider = "zig"`. Caller is
+/// responsible for `TestEnv::write_zig_index_json` first.
+pub fn zig_entry(
+    name: &str,
+    deploy_dir: &str,
+    version: &str,
+    platform: &str,
+) -> ToolchainEntry {
+    let mut opts = toml::Table::new();
+    opts.insert("version".into(), toml::Value::String(version.into()));
+    opts.insert("platform".into(), toml::Value::String(platform.into()));
+    ToolchainEntry {
+        name: name.into(),
+        deploy_dir: deploy_dir.into(),
+        provider: "zig".into(),
         deploy_mode: None,
         options: opts,
     }

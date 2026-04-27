@@ -11,10 +11,12 @@ use crate::download;
 
 pub mod github;
 pub mod url;
-// zig / msvc / windows_sdk land in steps 10 / 11 / 12.
+pub mod zig;
+// msvc / windows_sdk land in steps 11 / 12.
 
 pub use github::GithubProvider;
 pub use url::UrlProvider;
+pub use zig::ZigProvider;
 
 /// A single source of toolchain bytes (LLVM via GitHub release, NASM at a
 /// fixed URL, Zig via index.json, MSVC via VS manifest, etc.).
@@ -131,6 +133,7 @@ impl ProviderRegistry {
         let mut r = Self::empty();
         r.register(UrlProvider::new());
         r.register(GithubProvider::new());
+        r.register(ZigProvider::new());
         r
     }
 

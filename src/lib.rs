@@ -18,5 +18,6 @@ pub use engine::{
 };
 pub use providers::{
     GithubProvider, InstallCtx, Installed, Provider, ProviderRegistry, UrlProvider,
+    ZigProvider,
 };
 pub use state::{DeployState, DeployedEntry, StateDiff};

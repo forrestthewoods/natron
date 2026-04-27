@@ -46,6 +46,7 @@ tempfile = "3"
 # appear under [dependencies] (used in src/), but cargo doesn't propagate
 # regular deps into the integration-test compilation unit, so list them here.
 filetime = "0.2"
+sha2 = "0.10"
 tar = "0.4"
 toml = "0.8"
 url = "2.5"

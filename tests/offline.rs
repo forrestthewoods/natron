@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{TestEnv, github_entry, url_entry};
+use common::{TestEnv, github_entry, url_entry, zig_entry};
 use natron::{DeployMode, SyncAction, SyncOptions};
 use std::fs;
 use std::path::Path;
@@ -429,28 +429,57 @@ fn test_install_github_provider() {
 }
 
 #[test]
+fn test_install_zig_provider() {
+    let env = TestEnv::new();
+    // Synthetic zig archive shaped like the real one.
+    let archive = env.make_zip(
+        "zig-windows-x86_64-0.15.2.zip",
+        &[
+            ("zig-windows-x86_64-0.15.2/zig.exe", b"ZIG-BIN"),
+            ("zig-windows-x86_64-0.15.2/lib/std.zig", b"STD-LIB"),
+        ],
+    );
+    env.write_zig_index_json("0.15.2", "x86_64-windows", &archive);
+
+    let cfg = env.build_config(vec![zig_entry("zig", "zig", "0.15.2", "x86_64-windows")]);
+    let n = env.make_natron(cfg);
+    let report = n.sync().unwrap();
+    assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+    let deploy = env.deploy_root().join("zig");
+    // strip_prefix should have flattened the top-level dir.
+    assert_eq!(fs::read(deploy.join("zig.exe")).unwrap(), b"ZIG-BIN");
+    assert_eq!(fs::read(deploy.join("lib").join("std.zig")).unwrap(), b"STD-LIB");
+}
+
+#[test]
 fn test_install_three_providers_at_once() {
-    // url + github (zig added in step 10).
     let env = TestEnv::new();
     let url_archive = env.make_zip("nasm.zip", &[("nasm.exe", b"NASM")]);
     let gh_archive = env.make_tar_xz("llvm.tar.xz", &[("clang", b"CLANG")]);
+    let zig_archive = env.make_zip(
+        "zig-windows-x86_64-0.15.2.zip",
+        &[("zig-windows-x86_64-0.15.2/zig.exe", b"ZIG")],
+    );
     env.write_github_release_json(
         "llvm/llvm-project",
         "llvmorg-21",
         "llvm.tar.xz",
         &gh_archive,
     );
+    env.write_zig_index_json("0.15.2", "x86_64-windows", &zig_archive);
 
     let cfg = env.build_config(vec![
         url_entry("nasm", "nasm", &url_archive),
         github_entry("llvm21", "llvm21", "llvm/llvm-project", "llvmorg-21", "llvm.tar.xz"),
+        zig_entry("zig", "zig", "0.15.2", "x86_64-windows"),
     ]);
     let n = env.make_natron(cfg);
     let report = n.sync().unwrap();
     assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
-    assert_eq!(report.entries.len(), 2);
+    assert_eq!(report.entries.len(), 3);
     assert!(env.deploy_root().join("nasm").join("nasm.exe").exists());
     assert!(env.deploy_root().join("llvm21").join("clang").exists());
+    assert!(env.deploy_root().join("zig").join("zig.exe").exists());
 }
 
 #[test]
