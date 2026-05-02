@@ -6,7 +6,7 @@
 //! SDK is a separate provider (`windows_sdk`). The two are logically
 //! independent.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 
 use super::vs_manifest::{self, VsManifest};
 use super::{InstallCtx, Installed, Provider};
@@ -20,19 +20,49 @@ const TARGET: &str = "x64";
 
 pub struct MsvcProvider {
     channel_url_template: String,
+    history_commits_url_template: String,
+    history_raw_url_template: String,
+    history_max_pages: u32,
 }
 
 impl MsvcProvider {
     pub fn new() -> Self {
         Self {
             channel_url_template: vs_manifest::DEFAULT_CHANNEL_URL_TEMPLATE.to_string(),
+            history_commits_url_template:
+                vs_manifest::DEFAULT_HISTORY_COMMITS_URL_TEMPLATE.to_string(),
+            history_raw_url_template:
+                vs_manifest::DEFAULT_HISTORY_RAW_URL_TEMPLATE.to_string(),
+            history_max_pages: vs_manifest::DEFAULT_HISTORY_MAX_PAGES,
         }
     }
 
     pub fn with_channel_url_template(template: impl Into<String>) -> Self {
         Self {
             channel_url_template: template.into(),
+            ..Self::new()
         }
+    }
+
+    /// Override the manifest-history URL templates. `commits_template` should
+    /// honor `{channel}` and `{page}`; `raw_template` should honor `{sha}`.
+    /// Used by tests to point at file:// fixtures.
+    pub fn with_history_urls(
+        commits_template: impl Into<String>,
+        raw_template: impl Into<String>,
+    ) -> Self {
+        Self {
+            history_commits_url_template: commits_template.into(),
+            history_raw_url_template: raw_template.into(),
+            ..Self::new()
+        }
+    }
+
+    /// Cap on commit pages scanned during a manifest-history lookup. Defaults
+    /// to [`vs_manifest::DEFAULT_HISTORY_MAX_PAGES`] (5 pages = 500 commits).
+    pub fn with_history_max_pages(mut self, n: u32) -> Self {
+        self.history_max_pages = n;
+        self
     }
 }
 
@@ -59,6 +89,16 @@ impl Provider for MsvcProvider {
                 anyhow!("`msvc` provider requires options.vs_channel (string)")
             })?;
         let pinned_version = options.get("msvc_version").and_then(|v| v.as_str());
+        let manifest_history = options
+            .get("manifest_history")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if manifest_history && pinned_version.is_none() {
+            bail!(
+                "`msvc` provider: `manifest_history = true` requires `msvc_version` to be pinned"
+            );
+        }
 
         // Fast-path when version is pinned: deterministic fingerprint, no
         // network needed.
@@ -74,12 +114,31 @@ impl Provider for MsvcProvider {
             }
         }
 
-        // Need the manifest.
-        let manifest = vs_manifest::fetch_vs_manifest(
-            &self.channel_url_template,
-            vs_channel,
-            ctx,
-        )?;
+        // Need the manifest. With manifest_history we walk
+        // roblabla/msvc-manifest-history for the commit whose manifest still
+        // contains the requested version; otherwise fetch the live channel
+        // manifest from aka.ms.
+        let manifest = if manifest_history {
+            let want = pinned_version.expect("checked above");
+            vs_manifest::find_vs_manifest_in_history(
+                &self.history_commits_url_template,
+                &self.history_raw_url_template,
+                vs_channel,
+                self.history_max_pages,
+                ctx,
+                |m| {
+                    m.find_msvc_candidates(HOST, TARGET)
+                        .iter()
+                        .any(|(v, _)| v == want)
+                },
+            )?
+        } else {
+            vs_manifest::fetch_vs_manifest(
+                &self.channel_url_template,
+                vs_channel,
+                ctx,
+            )?
+        };
         let candidates = manifest.find_msvc_candidates(HOST, TARGET);
         if candidates.is_empty() {
             anyhow::bail!(
