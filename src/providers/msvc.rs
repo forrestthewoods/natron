@@ -22,7 +22,6 @@ pub struct MsvcProvider {
     channel_url_template: String,
     history_commits_url_template: String,
     history_raw_url_template: String,
-    history_max_pages: u32,
 }
 
 impl MsvcProvider {
@@ -33,7 +32,6 @@ impl MsvcProvider {
                 vs_manifest::DEFAULT_HISTORY_COMMITS_URL_TEMPLATE.to_string(),
             history_raw_url_template:
                 vs_manifest::DEFAULT_HISTORY_RAW_URL_TEMPLATE.to_string(),
-            history_max_pages: vs_manifest::DEFAULT_HISTORY_MAX_PAGES,
         }
     }
 
@@ -44,9 +42,9 @@ impl MsvcProvider {
         }
     }
 
-    /// Override the manifest-history URL templates. `commits_template` should
-    /// honor `{channel}` and `{page}`; `raw_template` should honor `{sha}`.
-    /// Used by tests to point at file:// fixtures.
+    /// Override the manifest-history URL templates. `commits_template` honors
+    /// `{channel}` and `{page}`; `raw_template` honors `{sha}`. Used by tests
+    /// to point at `file://` fixtures.
     pub fn with_history_urls(
         commits_template: impl Into<String>,
         raw_template: impl Into<String>,
@@ -56,13 +54,6 @@ impl MsvcProvider {
             history_raw_url_template: raw_template.into(),
             ..Self::new()
         }
-    }
-
-    /// Cap on commit pages scanned during a manifest-history lookup. Defaults
-    /// to [`vs_manifest::DEFAULT_HISTORY_MAX_PAGES`] (5 pages = 500 commits).
-    pub fn with_history_max_pages(mut self, n: u32) -> Self {
-        self.history_max_pages = n;
-        self
     }
 }
 
@@ -124,7 +115,6 @@ impl Provider for MsvcProvider {
                 &self.history_commits_url_template,
                 &self.history_raw_url_template,
                 vs_channel,
-                self.history_max_pages,
                 ctx,
                 |m| {
                     m.find_msvc_candidates(HOST, TARGET)

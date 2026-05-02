@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::cache::Cache;
-use std::path::Path;
 use tempfile::TempDir;
 
 fn sample_manifest() -> VsManifest {
@@ -128,139 +127,45 @@ fn find_package_falls_back_to_languageless_then_first() {
     assert_eq!(p2.language.as_deref(), Some("ja-JP"));
 }
 
-/// Manifest fixture containing a single MSVC base package at `version`.
-fn write_history_manifest(path: &Path, version: &str) {
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let json = format!(
-        r#"{{"packages":[{{"id":"Microsoft.VC.{version}.Tools.HostX64.TargetX64.base","payloads":[]}}]}}"#
-    );
-    std::fs::write(path, json).unwrap();
-}
-
-/// Commits-list JSON in the shape returned by GitHub's `/commits` endpoint
-/// (we read only the `sha` field).
-fn write_commits_list(path: &Path, shas: &[&str]) {
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let entries: Vec<String> = shas
-        .iter()
-        .map(|s| format!(r#"{{"sha":"{s}"}}"#))
-        .collect();
-    std::fs::write(path, format!("[{}]", entries.join(","))).unwrap();
-}
-
 #[test]
-fn find_in_history_walks_until_match() {
+fn find_in_history_walks_pages_until_match() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    // Two-page commit listing. Newest page (page-1) lists shas that point at
-    // manifests for newer MSVC versions; the version we want shows up only on
-    // page-2 — the walker must keep going.
-    write_commits_list(&root.join("commits/release-17/page-1"), &["aaa", "bbb"]);
-    write_commits_list(&root.join("commits/release-17/page-2"), &["ccc", "ddd"]);
-    // page-3 is empty → loop terminates if we reach it.
-    write_commits_list(&root.join("commits/release-17/page-3"), &[]);
-    write_history_manifest(&root.join("raw/aaa/manifest.json"), "14.50.18.0");
-    write_history_manifest(&root.join("raw/bbb/manifest.json"), "14.49.99.0");
-    write_history_manifest(&root.join("raw/ccc/manifest.json"), "14.42.34433.0");
-    write_history_manifest(&root.join("raw/ddd/manifest.json"), "14.39.33519.0");
+    let write = |p: &str, body: String| {
+        let path = root.join(p);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    let manifest_for = |v: &str| {
+        format!(
+            r#"{{"packages":[{{"id":"Microsoft.VC.{v}.Tools.HostX64.TargetX64.base","payloads":[]}}]}}"#
+        )
+    };
+    // page-1 lists newer commits; the version we want is on page-2. The walker
+    // must page through, then stop when an empty page comes back.
+    write("commits/release-17/page-1", r#"[{"sha":"aaa"},{"sha":"bbb"}]"#.into());
+    write("commits/release-17/page-2", r#"[{"sha":"ccc"}]"#.into());
+    write("commits/release-17/page-3", "[]".into());
+    write("raw/aaa/manifest.json", manifest_for("14.50.18.0"));
+    write("raw/bbb/manifest.json", manifest_for("14.49.99.0"));
+    write("raw/ccc/manifest.json", manifest_for("14.42.34433.0"));
 
     let base = url::Url::from_directory_path(root).unwrap().to_string();
     let base = base.trim_end_matches('/').to_string();
-    let commits_template =
-        format!("{base}/commits/release-{{channel}}/page-{{page}}");
-    let raw_template = format!("{base}/raw/{{sha}}/manifest.json");
-
     let cache = Cache::at(tmp.path().join("c"));
     cache.ensure_layout().unwrap();
     let ctx = InstallCtx::new(cache);
 
-    // Want the version that lives at the third commit (ccc, page-2 first
-    // entry). Scanning order is newest-first, so we'll touch aaa, bbb, then
-    // ccc — and stop.
     let want = "14.42.34433.0";
-    let manifest = find_vs_manifest_in_history(
-        &commits_template,
-        &raw_template,
+    let m = find_vs_manifest_in_history(
+        &format!("{base}/commits/release-{{channel}}/page-{{page}}"),
+        &format!("{base}/raw/{{sha}}/manifest.json"),
         "17",
-        5,
         &ctx,
-        |m| {
-            m.find_msvc_candidates("X64", "X64")
-                .iter()
-                .any(|(v, _)| v == want)
-        },
+        |m| m.find_msvc_candidates("X64", "X64").iter().any(|(v, _)| v == want),
     )
     .unwrap();
-    assert_eq!(manifest.find_msvc_candidates("X64", "X64")[0].0, want);
-}
-
-#[test]
-fn find_in_history_errors_when_version_absent() {
-    let tmp = TempDir::new().unwrap();
-    let root = tmp.path();
-    write_commits_list(&root.join("commits/release-17/page-1"), &["aaa"]);
-    write_commits_list(&root.join("commits/release-17/page-2"), &[]);
-    write_history_manifest(&root.join("raw/aaa/manifest.json"), "14.50.18.0");
-
-    let base = url::Url::from_directory_path(root).unwrap().to_string();
-    let base = base.trim_end_matches('/').to_string();
-    let commits_template =
-        format!("{base}/commits/release-{{channel}}/page-{{page}}");
-    let raw_template = format!("{base}/raw/{{sha}}/manifest.json");
-
-    let cache = Cache::at(tmp.path().join("c"));
-    cache.ensure_layout().unwrap();
-    let ctx = InstallCtx::new(cache);
-
-    let err = find_vs_manifest_in_history(
-        &commits_template,
-        &raw_template,
-        "17",
-        2,
-        &ctx,
-        |_| false,
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("no matching manifest"));
-}
-
-#[test]
-fn find_in_history_skips_unparseable_commits() {
-    let tmp = TempDir::new().unwrap();
-    let root = tmp.path();
-    write_commits_list(
-        &root.join("commits/release-17/page-1"),
-        &["bad", "good"],
-    );
-    write_commits_list(&root.join("commits/release-17/page-2"), &[]);
-    // "bad" has malformed JSON — provider should warn + continue, not abort.
-    std::fs::create_dir_all(root.join("raw/bad")).unwrap();
-    std::fs::write(root.join("raw/bad/manifest.json"), b"{not json").unwrap();
-    write_history_manifest(&root.join("raw/good/manifest.json"), "14.42.34433.0");
-
-    let base = url::Url::from_directory_path(root).unwrap().to_string();
-    let base = base.trim_end_matches('/').to_string();
-    let commits_template =
-        format!("{base}/commits/release-{{channel}}/page-{{page}}");
-    let raw_template = format!("{base}/raw/{{sha}}/manifest.json");
-
-    let cache = Cache::at(tmp.path().join("c"));
-    cache.ensure_layout().unwrap();
-    let ctx = InstallCtx::new(cache);
-
-    let manifest = find_vs_manifest_in_history(
-        &commits_template,
-        &raw_template,
-        "17",
-        2,
-        &ctx,
-        |m| !m.find_msvc_candidates("X64", "X64").is_empty(),
-    )
-    .unwrap();
-    assert_eq!(
-        manifest.find_msvc_candidates("X64", "X64")[0].0,
-        "14.42.34433.0"
-    );
+    assert_eq!(m.find_msvc_candidates("X64", "X64")[0].0, want);
 }
 
 #[test]

@@ -75,9 +75,8 @@ name        = "msvc"
 deploy_dir  = "msvc"
 provider    = "msvc"
 [toolchain.options]
-vs_channel       = "18"            # required; e.g. "17" for VS 2022
-msvc_version     = "14.50.18.0"    # optional; latest if omitted
-manifest_history = false           # optional; opt in for older versions
+vs_channel   = "18"            # required; e.g. "17" for VS 2022
+msvc_version = "14.50.18.0"    # optional; latest if omitted
 
 [[toolchain]]
 name        = "windows_sdk"
@@ -102,14 +101,11 @@ block with distinct `name` and `deploy_dir`.
   `https://ziglang.org/download/index.json`, sha-verified via the index.
 - **`msvc`**: extract MSVC compiler + CRT from a Visual Studio channel
   manifest. Required `vs_channel`. Optional `msvc_version` (latest if
-  omitted; "latest" requires a network call to fingerprint). Optional
-  `manifest_history = true` (requires a pinned `msvc_version`): when the
-  current channel manifest no longer lists the requested version,
-  walk the [`roblabla/msvc-manifest-history`][mh] mirror's
-  `release-{vs_channel}` branch backwards in time until a snapshot
-  containing that version is found, then install from it. This is the
-  only known way to fetch a specific older MSVC build — Microsoft does
-  not publish historical channel manifests.
+  omitted). Optional `manifest_history = true` (requires a pinned
+  `msvc_version`): walks [`roblabla/msvc-manifest-history`][mh]'s
+  `release-<vs_channel>` branch newest-first to find a historical
+  snapshot containing the requested version. The only known workaround
+  for older MSVC builds — Microsoft only serves the latest manifest.
 
   [mh]: https://github.com/roblabla/msvc-manifest-history
 - **`windows_sdk`**: extract Windows SDK headers + libs from a VS channel
