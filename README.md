@@ -166,7 +166,7 @@ overriding its base URL).
 release JSON are generated at test time and served via `file://` URLs.
 
 ```bash
-cargo test                            # 143 tests, no network
+cargo test                            # 160 tests, no network
 NATRON_NETWORK_TESTS=1 cargo test     # adds tests/network.rs (real upstream)
 ```
 

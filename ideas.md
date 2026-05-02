@@ -29,8 +29,6 @@ A parking lot for things deliberately deferred from v1.
 
 ## Reliability / performance
 
-- HTTP retries with exponential backoff for flaky downloads. LLVM is
-  ~1.5 GB and a transient failure means the whole download restarts.
 - Parallel CAS hash pass (rayon) — meaningful for MSVC's hundreds of
   files.
 - Parallel cross-toolchain installs.

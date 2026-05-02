@@ -3,8 +3,9 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use url::Url;
 
 /// Fetch `url` into the `cache` directory and return the absolute path of the
@@ -53,7 +54,7 @@ pub fn fetch(url: &str, expected_sha256: Option<&str>, cache: &Path) -> Result<P
             stream_file_into_cache(&src, &cached_path, expected_sha256)?;
         }
         "http" | "https" => {
-            stream_http_into_cache(url, &cached_path, expected_sha256)?;
+            stream_http_into_cache(url, &cached_path, expected_sha256, RetryPolicy::default())?;
         }
         other => bail!("unsupported URL scheme: {other}"),
     }
@@ -80,45 +81,73 @@ fn derive_cached_name(url: &Url, expected_sha256: Option<&str>) -> String {
     }
 }
 
+/// Tunable retry behavior for HTTP downloads. Defaults are wired straight
+/// into `fetch`; expose later if a consumer needs to override.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetryPolicy {
+    pub max_attempts: u32,
+    pub initial_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+    pub jitter: bool,
+}
+
+impl RetryPolicy {
+    pub(crate) const fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 10_000,
+            jitter: true,
+        }
+    }
+
+    /// Delay before the next retry, given the 1-indexed `attempt` number that
+    /// just failed. Exponential up to `max_backoff_ms`, optionally multiplied
+    /// by a 0.5..1.5 jitter factor.
+    pub(crate) fn compute_delay(&self, attempt: u32) -> Duration {
+        let shift = attempt.saturating_sub(1).min(20);
+        let base = self.initial_backoff_ms.saturating_mul(1u64 << shift);
+        let capped = base.min(self.max_backoff_ms);
+        let final_ms = if self.jitter {
+            let frac = pseudo_random_unit();
+            ((capped as f64) * (0.5 + frac)) as u64
+        } else {
+            capped
+        };
+        Duration::from_millis(final_ms)
+    }
+}
+
+/// 0..1 quasi-random value for jitter. Quality matters only enough to
+/// desynchronize concurrent retries hitting the same upstream.
+fn pseudo_random_unit() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let h = xxhash_rust::xxh3::xxh3_64(&nanos.to_le_bytes());
+    (h as f64) / (u64::MAX as f64)
+}
+
+/// Result of one HTTP attempt inside the retry loop.
+enum StreamErr {
+    /// Network blip; back off and retry. If `bytes_received > 0`, the next
+    /// attempt sends `Range:` to resume.
+    Transient(anyhow::Error),
+    /// Server responded but didn't honor `Range` (returned 200 not 206, or
+    /// 416). Truncate the tempfile, reset the hasher, retry from byte 0.
+    ResetRequired(String),
+    /// Permanent error; surface immediately.
+    Fatal(anyhow::Error),
+}
+
 fn stream_http_into_cache(
     url: &str,
     cached_path: &Path,
     expected_sha256: Option<&str>,
+    policy: RetryPolicy,
 ) -> Result<()> {
     tracing::info!("downloading {url}");
-    // Retry the GET on transient errors. We've seen "No such host is known"
-    // from ureq's resolver on hosts that work fine via curl; the failure
-    // typically clears within a few hundred ms. Do not retry once we have
-    // an opened response stream — a partial download is the streamer's job
-    // to resolve.
-    let mut last_err: Option<String> = None;
-    let mut delay_ms = 100u64;
-    let response = loop {
-        match ureq::get(url).call() {
-            Ok(r) => break r,
-            Err(err) => {
-                let msg = err.to_string();
-                let transient = msg.contains("No such host is known")
-                    || msg.contains("dns error")
-                    || msg.contains("resolve")
-                    || msg.contains("connection reset")
-                    || msg.contains("timed out");
-                if !transient || delay_ms > 4000 {
-                    return Err(anyhow!("HTTP GET {url}: {err}"));
-                }
-                tracing::warn!("transient HTTP error on {url}: {err}; retrying in {delay_ms}ms");
-                last_err = Some(msg);
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                delay_ms *= 2;
-            }
-        }
-    };
-    let _ = last_err;
-    let status = response.status();
-    if status.as_u16() >= 400 {
-        bail!("HTTP {status} for {url}");
-    }
-
     let parent = cached_path
         .parent()
         .ok_or_else(|| anyhow!("no parent for {}", cached_path.display()))?;
@@ -127,38 +156,184 @@ fn stream_http_into_cache(
         .tempfile_in(parent)
         .with_context(|| format!("creating tempfile in {}", parent.display()))?;
 
-    let mut reader = response.into_body().into_reader();
     let mut hasher = Sha256::new();
+    let mut bytes_received: u64 = 0;
+    let verify = expected_sha256.is_some();
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 1..=policy.max_attempts {
+        match stream_once(url, &mut tmp, &mut hasher, &mut bytes_received, verify) {
+            Ok(()) => {
+                if let Some(expected) = expected_sha256 {
+                    let got = hex_of(hasher.finalize_reset().as_slice());
+                    if !sha256_eq(&got, expected) {
+                        bail!(
+                            "sha256 mismatch downloading {url}: expected {expected}, got {got}"
+                        );
+                    }
+                }
+                tmp.as_file_mut().flush()?;
+                let tmp_path = tmp.into_temp_path();
+                tmp_path
+                    .persist(cached_path)
+                    .map_err(|e| anyhow!("persisting download to {}: {e}", cached_path.display()))?;
+                return Ok(());
+            }
+            Err(StreamErr::Transient(err)) => {
+                if attempt >= policy.max_attempts {
+                    return Err(err.context(format!(
+                        "{url} failed after {} attempts",
+                        policy.max_attempts
+                    )));
+                }
+                let delay = policy.compute_delay(attempt);
+                if bytes_received > 0 {
+                    tracing::warn!(
+                        "transient error on {url} after {bytes_received} bytes (attempt {attempt}/{}): {err}; retrying in {}ms with Range",
+                        policy.max_attempts,
+                        delay.as_millis(),
+                    );
+                } else {
+                    tracing::warn!(
+                        "transient error on {url} (attempt {attempt}/{}): {err}; retrying in {}ms",
+                        policy.max_attempts,
+                        delay.as_millis(),
+                    );
+                }
+                last_err = Some(err);
+                std::thread::sleep(delay);
+            }
+            Err(StreamErr::ResetRequired(reason)) => {
+                if attempt >= policy.max_attempts {
+                    bail!("{reason} (exhausted {} attempts)", policy.max_attempts);
+                }
+                tracing::warn!(
+                    "{reason} (attempt {attempt}/{}); restarting from byte 0",
+                    policy.max_attempts,
+                );
+                bytes_received = 0;
+                hasher = Sha256::new();
+                tmp.as_file_mut().set_len(0)?;
+                tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+                last_err = Some(anyhow!("{reason}"));
+                // No sleep — server is responsive, just non-cooperative.
+            }
+            Err(StreamErr::Fatal(err)) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("download retry loop exited without success")))
+}
+
+/// One HTTP attempt. Sends `Range: bytes=N-` when `*bytes_received > 0`.
+/// Updates `tmp`, `hasher`, and `*bytes_received` in place; the retry loop
+/// reuses these across attempts.
+fn stream_once(
+    url: &str,
+    tmp: &mut tempfile::NamedTempFile,
+    hasher: &mut Sha256,
+    bytes_received: &mut u64,
+    verify_sha: bool,
+) -> std::result::Result<(), StreamErr> {
+    let mut req = ureq::get(url);
+    if *bytes_received > 0 {
+        req = req.header("Range", format!("bytes={}-", *bytes_received));
+    }
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(err) => {
+            let msg = err.to_string();
+            return if is_transient_msg(&msg) {
+                Err(StreamErr::Transient(anyhow!("HTTP GET {url}: {err}")))
+            } else {
+                Err(StreamErr::Fatal(anyhow!("HTTP GET {url}: {err}")))
+            };
+        }
+    };
+
+    let status = resp.status();
+    let code = status.as_u16();
+    if code == 200 && *bytes_received > 0 {
+        return Err(StreamErr::ResetRequired(format!(
+            "server returned 200 to Range request for {url}"
+        )));
+    }
+    if code == 416 {
+        return Err(StreamErr::ResetRequired(format!(
+            "HTTP 416 (range not satisfiable) for {url}"
+        )));
+    }
+    if code >= 400 {
+        return Err(StreamErr::Fatal(anyhow!("HTTP {status} for {url}")));
+    }
+
+    let advertised_len: Option<u64> = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let mut reader = resp.into_body().into_reader();
     let mut buf = vec![0u8; 64 * 1024];
+    let mut chunk_read: u64 = 0;
 
     loop {
-        let n = reader
-            .read(&mut buf)
-            .with_context(|| format!("reading from {url}"))?;
-        if n == 0 {
-            break;
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                let msg = e.to_string();
+                if is_transient_msg(&msg) {
+                    return Err(StreamErr::Transient(anyhow!(
+                        "reading body of {url} after {} bytes: {e}",
+                        *bytes_received + chunk_read
+                    )));
+                }
+                return Err(StreamErr::Fatal(anyhow!("reading body of {url}: {e}")));
+            }
+        };
+        if let Err(e) = tmp.as_file_mut().write_all(&buf[..n]) {
+            return Err(StreamErr::Fatal(anyhow!("write tempfile: {e}")));
         }
-        tmp.as_file_mut().write_all(&buf[..n])?;
-        if expected_sha256.is_some() {
+        if verify_sha {
             hasher.update(&buf[..n]);
         }
+        *bytes_received += n as u64;
+        chunk_read += n as u64;
     }
-    tmp.as_file_mut().flush()?;
 
-    if let Some(expected) = expected_sha256 {
-        let got = hex_of(hasher.finalize().as_slice());
-        if !sha256_eq(&got, expected) {
-            bail!(
-                "sha256 mismatch downloading {url}: expected {expected}, got {got}"
-            );
+    // Detect short body: stream EOF'd before Content-Length was satisfied.
+    // Some HTTP libraries surface this as a read error; some return Ok(0).
+    if let Some(expected) = advertised_len {
+        if chunk_read < expected {
+            return Err(StreamErr::Transient(anyhow!(
+                "short read from {url}: got {chunk_read} of {expected} bytes in this chunk"
+            )));
         }
     }
 
-    let tmp_path = tmp.into_temp_path();
-    tmp_path
-        .persist(cached_path)
-        .map_err(|e| anyhow!("persisting download to {}: {e}", cached_path.display()))?;
     Ok(())
+}
+
+/// Pattern-matches transient network failure strings. ureq v3 doesn't expose
+/// a structured error kind we can switch on cleanly, so we sniff the message.
+fn is_transient_msg(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("no such host is known")
+        || m.contains("dns error")
+        || m.contains("resolve")
+        || m.contains("connection reset")
+        || m.contains("connection closed")
+        || m.contains("connection aborted")
+        || m.contains("connection was aborted")
+        || m.contains("established connection")
+        || m.contains("forcibly closed")
+        || m.contains("broken pipe")
+        || m.contains("unexpected eof")
+        || m.contains("timed out")
+        || m.contains("timeout")
+        || m.contains("peer disconnected")
+        || m.contains("peer closed")
+        || m.contains("end of file")
 }
 
 fn stream_file_into_cache(
