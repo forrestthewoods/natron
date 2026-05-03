@@ -30,11 +30,6 @@ const HISTORY_COMMITS_URL_TEMPLATE: &str =
 const HISTORY_RAW_URL_TEMPLATE: &str =
     "https://raw.githubusercontent.com/roblabla/msvc-manifest-history/{sha}/manifest.json";
 
-/// Cap on commit pages (100 each) scanned during a manifest-history walk.
-/// The mirror updates roughly once per upstream channel bump, so 5 pages
-/// comfortably covers more than a year of releases.
-const HISTORY_MAX_PAGES: u32 = 5;
-
 pub struct MsvcProvider {
     channel_url_template: String,
     history_commits_url_template: String,
@@ -204,7 +199,9 @@ impl Provider for MsvcProvider {
 }
 
 /// Walk the `roblabla/msvc-manifest-history` mirror newest-first for a
-/// snapshot whose manifest still lists `msvc_version`.
+/// snapshot whose manifest still lists `msvc_version`. The loop terminates
+/// when GitHub returns an empty page (end of branch history), so any version
+/// the mirror has ever covered is reachable.
 fn find_manifest_in_history(
     commits_url_template: &str,
     raw_url_template: &str,
@@ -216,7 +213,7 @@ fn find_manifest_in_history(
     struct Commit {
         sha: String,
     }
-    for page in 1..=HISTORY_MAX_PAGES {
+    for page in 1u32.. {
         let url = commits_url_template
             .replace("{channel}", vs_channel)
             .replace("{page}", &page.to_string());
