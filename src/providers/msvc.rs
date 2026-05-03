@@ -6,7 +6,7 @@
 //! SDK is a separate provider (`windows_sdk`). The two are logically
 //! independent.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use super::vs_manifest::{self, VsManifest};
 use super::{InstallCtx, Installed, Provider};
@@ -44,16 +44,16 @@ impl MsvcProvider {
 
     /// Override the manifest-history URL templates. `commits_template` honors
     /// `{channel}` and `{page}`; `raw_template` honors `{sha}`. Used by tests
-    /// to point at `file://` fixtures.
+    /// to point at `file://` fixtures. Chainable so a test can override both
+    /// the channel URL and the history URLs in one expression.
     pub fn with_history_urls(
+        mut self,
         commits_template: impl Into<String>,
         raw_template: impl Into<String>,
     ) -> Self {
-        Self {
-            history_commits_url_template: commits_template.into(),
-            history_raw_url_template: raw_template.into(),
-            ..Self::new()
-        }
+        self.history_commits_url_template = commits_template.into();
+        self.history_raw_url_template = raw_template.into();
+        self
     }
 }
 
@@ -121,7 +121,8 @@ impl Provider for MsvcProvider {
                         .iter()
                         .any(|(v, _)| v == want)
                 },
-            )?
+            )
+            .with_context(|| format!("looking up MSVC version {want} in manifest history"))?
         } else {
             vs_manifest::fetch_vs_manifest(
                 &self.channel_url_template,

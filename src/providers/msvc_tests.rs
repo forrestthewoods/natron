@@ -70,3 +70,37 @@ fn msvc_manifest_history_requires_pinned_version() {
     let err = MsvcProvider::new().install(&opts, &mut ctx).unwrap_err();
     assert!(err.to_string().contains("msvc_version"), "got: {err}");
 }
+
+#[test]
+fn msvc_manifest_history_routes_to_walker_not_channel() {
+    // Hermetic regression test for the if/else in install(). Both URL families
+    // are pointed at distinguishable file:// paths that don't exist; whichever
+    // path the provider actually takes surfaces its template fragment in the
+    // resulting error. Asserts we hit the history walker, not aka.ms.
+    let tmp = TempDir::new().unwrap();
+    let cache = Cache::at(tmp.path().join("c"));
+    cache.ensure_layout().unwrap();
+    let mut ctx = InstallCtx::new(cache);
+
+    let mut opts = toml::Table::new();
+    opts.insert("vs_channel".into(), toml::Value::String("17".into()));
+    opts.insert(
+        "msvc_version".into(),
+        toml::Value::String("14.39.33519.0".into()),
+    );
+    opts.insert("manifest_history".into(), toml::Value::Boolean(true));
+
+    let provider = MsvcProvider::with_channel_url_template(
+        "file:///nope/CHANNEL-{channel}",
+    )
+    .with_history_urls(
+        "file:///nope/COMMITS-{channel}-{page}",
+        "file:///nope/RAW-{sha}",
+    );
+    let err = provider.install(&opts, &mut ctx).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("COMMITS-"), "expected walker path; got: {msg}");
+    assert!(!msg.contains("CHANNEL-"), "fell through to channel; got: {msg}");
+    // The new with_context should surface the searched version.
+    assert!(msg.contains("14.39.33519.0"), "missing version; got: {msg}");
+}
