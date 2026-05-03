@@ -102,10 +102,11 @@ block with distinct `name` and `deploy_dir`.
 - **`msvc`**: extract MSVC compiler + CRT from a Visual Studio channel
   manifest. Required `vs_channel`. Optional `msvc_version` (latest if
   omitted). Optional `manifest_history = true` (requires a pinned
-  `msvc_version`): walks [`roblabla/msvc-manifest-history`][mh]'s
-  `release-<vs_channel>` branch newest-first to find a historical
-  snapshot containing the requested version. The only known workaround
-  for older MSVC builds — Microsoft only serves the latest manifest.
+  `msvc_version`): fetches the accumulated VS manifest from
+  [`roblabla/msvc-manifest-history`][mh]'s `release-<vs_channel>`
+  branch instead of `aka.ms`. The mirror's manifest lists every MSVC
+  build the channel has ever shipped, so older versions that
+  `aka.ms` no longer advertises remain installable.
 
   [mh]: https://github.com/roblabla/msvc-manifest-history
 - **`windows_sdk`**: extract Windows SDK headers + libs from a VS channel

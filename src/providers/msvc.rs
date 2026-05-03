@@ -7,7 +7,6 @@
 //! independent.
 
 use anyhow::{Result, anyhow, bail};
-use serde::Deserialize;
 
 use super::vs_manifest::{self, VsManifest};
 use super::{InstallCtx, Installed, Provider};
@@ -19,29 +18,26 @@ pub const ID: &str = "msvc";
 const HOST: &str = "x64";
 const TARGET: &str = "x64";
 
-/// URL templates for the `roblabla/msvc-manifest-history` mirror, our
-/// workaround for issue #1: Microsoft only publishes the latest channel
-/// manifest, so older MSVC versions need to be looked up in this history.
-/// The mirror's branch convention is `release-<channel>` for stable releases.
-/// `{channel}` substitutes the VS channel; `{page}` is 1-indexed; `{sha}` is
-/// a commit hash.
-const HISTORY_COMMITS_URL_TEMPLATE: &str =
-    "https://api.github.com/repos/roblabla/msvc-manifest-history/commits?sha=release-{channel}&per_page=100&page={page}";
-const HISTORY_RAW_URL_TEMPLATE: &str =
-    "https://raw.githubusercontent.com/roblabla/msvc-manifest-history/{sha}/manifest.json";
+/// URL template for the `roblabla/msvc-manifest-history` mirror, our
+/// workaround for issue #1: aka.ms's channel manifest is a moving target
+/// that drops older MSVC versions over time, so it can't reliably resolve
+/// a pinned older version. The mirror's `release-<channel>` branch keeps
+/// a stable VS manifest whose package list spans every MSVC build the
+/// channel has ever shipped — one fetch, no commit walking. `{channel}`
+/// substitutes the VS channel.
+const HISTORY_MANIFEST_URL_TEMPLATE: &str =
+    "https://raw.githubusercontent.com/roblabla/msvc-manifest-history/release-{channel}/manifest.json";
 
 pub struct MsvcProvider {
     channel_url_template: String,
-    history_commits_url_template: String,
-    history_raw_url_template: String,
+    history_manifest_url_template: String,
 }
 
 impl MsvcProvider {
     pub fn new() -> Self {
         Self {
             channel_url_template: vs_manifest::DEFAULT_CHANNEL_URL_TEMPLATE.to_string(),
-            history_commits_url_template: HISTORY_COMMITS_URL_TEMPLATE.to_string(),
-            history_raw_url_template: HISTORY_RAW_URL_TEMPLATE.to_string(),
+            history_manifest_url_template: HISTORY_MANIFEST_URL_TEMPLATE.to_string(),
         }
     }
 
@@ -52,17 +48,11 @@ impl MsvcProvider {
         }
     }
 
-    /// Override the manifest-history URL templates. `commits_template` honors
-    /// `{channel}` and `{page}`; `raw_template` honors `{sha}`. Used by tests
-    /// to point at `file://` fixtures. Chainable so a test can override both
-    /// the channel URL and the history URLs in one expression.
-    pub fn with_history_urls(
-        mut self,
-        commits_template: impl Into<String>,
-        raw_template: impl Into<String>,
-    ) -> Self {
-        self.history_commits_url_template = commits_template.into();
-        self.history_raw_url_template = raw_template.into();
+    /// Override the manifest-history URL template. Honors `{channel}`. Used
+    /// by tests to point at a `file://` fixture. Chainable so a test can
+    /// override both the channel URL and the history URL in one expression.
+    pub fn with_history_url_template(mut self, template: impl Into<String>) -> Self {
+        self.history_manifest_url_template = template.into();
         self
     }
 }
@@ -109,23 +99,21 @@ impl Provider for MsvcProvider {
             }
         }
 
-        // Need the manifest. With manifest_history we walk
-        // roblabla/msvc-manifest-history for the commit whose manifest still
-        // contains the requested version; otherwise fetch the live channel
-        // manifest from aka.ms.
+        // Need the manifest. With manifest_history we fetch the
+        // accumulated VS manifest from roblabla/msvc-manifest-history (its
+        // package list spans every MSVC build the channel has ever shipped);
+        // otherwise fetch the live channel manifest from aka.ms.
         let manifest = if manifest_history {
-            let want = pinned_version.ok_or_else(|| {
-                anyhow!(
+            if pinned_version.is_none() {
+                bail!(
                     "`msvc` provider: `manifest_history = true` requires `msvc_version` to be pinned"
-                )
-            })?;
-            find_manifest_in_history(
-                &self.history_commits_url_template,
-                &self.history_raw_url_template,
-                vs_channel,
-                want,
-                ctx,
-            )?
+                );
+            }
+            let url = self
+                .history_manifest_url_template
+                .replace("{channel}", vs_channel);
+            let path = ctx.download(&url, None)?;
+            serde_json::from_str(&std::fs::read_to_string(&path)?)?
         } else {
             vs_manifest::fetch_vs_manifest(
                 &self.channel_url_template,
@@ -196,47 +184,6 @@ impl Provider for MsvcProvider {
             freshly_extracted: true,
         })
     }
-}
-
-/// Walk the `roblabla/msvc-manifest-history` mirror newest-first for a
-/// snapshot whose manifest still lists `msvc_version`. The loop terminates
-/// when GitHub returns an empty page (end of branch history), so any version
-/// the mirror has ever covered is reachable.
-fn find_manifest_in_history(
-    commits_url_template: &str,
-    raw_url_template: &str,
-    vs_channel: &str,
-    msvc_version: &str,
-    ctx: &InstallCtx,
-) -> Result<VsManifest> {
-    #[derive(Deserialize)]
-    struct Commit {
-        sha: String,
-    }
-    for page in 1u32.. {
-        let url = commits_url_template
-            .replace("{channel}", vs_channel)
-            .replace("{page}", &page.to_string());
-        let path = ctx.download(&url, None)?;
-        let commits: Vec<Commit> = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-        if commits.is_empty() {
-            break;
-        }
-        for c in &commits {
-            let url = raw_url_template.replace("{sha}", &c.sha);
-            let path = ctx.download(&url, None)?;
-            let m: VsManifest = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-            if m.find_msvc_candidates(HOST, TARGET)
-                .iter()
-                .any(|(v, _)| v == msvc_version)
-            {
-                return Ok(m);
-            }
-        }
-    }
-    bail!(
-        "no snapshot in roblabla/msvc-manifest-history lists MSVC {msvc_version} (vs_channel={vs_channel})"
-    )
 }
 
 /// Look up each package id in the manifest and gather all its payloads.

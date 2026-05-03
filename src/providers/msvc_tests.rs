@@ -72,11 +72,11 @@ fn msvc_manifest_history_requires_pinned_version() {
 }
 
 #[test]
-fn msvc_manifest_history_routes_to_walker_not_channel() {
-    // Hermetic regression test for the if/else in install(). Both URL families
-    // are pointed at distinguishable file:// paths that don't exist; whichever
-    // path the provider actually takes surfaces its template fragment in the
-    // resulting error. Asserts we hit the history walker, not aka.ms.
+fn msvc_manifest_history_routes_to_mirror_not_channel() {
+    // Hermetic regression test for the if/else in install(). Both URLs are
+    // pointed at distinguishable file:// paths that don't exist; whichever
+    // path the provider actually takes surfaces its template fragment in
+    // the error. Asserts we hit the history mirror, not aka.ms.
     let tmp = TempDir::new().unwrap();
     let cache = Cache::at(tmp.path().join("c"));
     cache.ensure_layout().unwrap();
@@ -90,56 +90,11 @@ fn msvc_manifest_history_routes_to_walker_not_channel() {
     );
     opts.insert("manifest_history".into(), toml::Value::Boolean(true));
 
-    let provider = MsvcProvider::with_channel_url_template(
-        "file:///nope/CHANNEL-{channel}",
-    )
-    .with_history_urls(
-        "file:///nope/COMMITS-{channel}-{page}",
-        "file:///nope/RAW-{sha}",
-    );
+    let provider =
+        MsvcProvider::with_channel_url_template("file:///nope/CHANNEL-{channel}")
+            .with_history_url_template("file:///nope/MIRROR-{channel}.json");
     let err = provider.install(&opts, &mut ctx).unwrap_err();
     let msg = format!("{err:#}");
-    assert!(msg.contains("COMMITS-"), "expected walker path; got: {msg}");
+    assert!(msg.contains("MIRROR-"), "expected mirror path; got: {msg}");
     assert!(!msg.contains("CHANNEL-"), "fell through to channel; got: {msg}");
-}
-
-#[test]
-fn find_manifest_in_history_walks_pages_until_match() {
-    let tmp = TempDir::new().unwrap();
-    let root = tmp.path();
-    let write = |p: &str, body: String| {
-        let path = root.join(p);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
-    };
-    let manifest_for = |v: &str| {
-        format!(
-            r#"{{"packages":[{{"id":"Microsoft.VC.{v}.Tools.HostX64.TargetX64.base","payloads":[]}}]}}"#
-        )
-    };
-    // page-1 lists newer commits; the version we want is on page-2. The walker
-    // must page through, then stop when an empty page comes back.
-    write("commits/release-17/page-1", r#"[{"sha":"aaa"},{"sha":"bbb"}]"#.into());
-    write("commits/release-17/page-2", r#"[{"sha":"ccc"}]"#.into());
-    write("commits/release-17/page-3", "[]".into());
-    write("raw/aaa/manifest.json", manifest_for("14.50.18.0"));
-    write("raw/bbb/manifest.json", manifest_for("14.49.99.0"));
-    write("raw/ccc/manifest.json", manifest_for("14.42.34433.0"));
-
-    let base = url::Url::from_directory_path(root).unwrap().to_string();
-    let base = base.trim_end_matches('/').to_string();
-    let cache = Cache::at(tmp.path().join("c"));
-    cache.ensure_layout().unwrap();
-    let ctx = InstallCtx::new(cache);
-
-    let want = "14.42.34433.0";
-    let m = find_manifest_in_history(
-        &format!("{base}/commits/release-{{channel}}/page-{{page}}"),
-        &format!("{base}/raw/{{sha}}/manifest.json"),
-        "17",
-        want,
-        &ctx,
-    )
-    .unwrap();
-    assert_eq!(m.find_msvc_candidates(HOST, TARGET)[0].0, want);
 }
