@@ -6,7 +6,8 @@
 //! SDK is a separate provider (`windows_sdk`). The two are logically
 //! independent.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
+use serde::Deserialize;
 
 use super::vs_manifest::{self, VsManifest};
 use super::{InstallCtx, Installed, Provider};
@@ -18,6 +19,22 @@ pub const ID: &str = "msvc";
 const HOST: &str = "x64";
 const TARGET: &str = "x64";
 
+/// URL templates for the `roblabla/msvc-manifest-history` mirror, our
+/// workaround for issue #1: Microsoft only publishes the latest channel
+/// manifest, so older MSVC versions need to be looked up in this history.
+/// The mirror's branch convention is `release-<channel>` for stable releases.
+/// `{channel}` substitutes the VS channel; `{page}` is 1-indexed; `{sha}` is
+/// a commit hash.
+const HISTORY_COMMITS_URL_TEMPLATE: &str =
+    "https://api.github.com/repos/roblabla/msvc-manifest-history/commits?sha=release-{channel}&per_page=100&page={page}";
+const HISTORY_RAW_URL_TEMPLATE: &str =
+    "https://raw.githubusercontent.com/roblabla/msvc-manifest-history/{sha}/manifest.json";
+
+/// Cap on commit pages (100 each) scanned during a manifest-history walk.
+/// The mirror updates roughly once per upstream channel bump, so 5 pages
+/// comfortably covers more than a year of releases.
+const HISTORY_MAX_PAGES: u32 = 5;
+
 pub struct MsvcProvider {
     channel_url_template: String,
     history_commits_url_template: String,
@@ -28,10 +45,8 @@ impl MsvcProvider {
     pub fn new() -> Self {
         Self {
             channel_url_template: vs_manifest::DEFAULT_CHANNEL_URL_TEMPLATE.to_string(),
-            history_commits_url_template:
-                vs_manifest::DEFAULT_HISTORY_COMMITS_URL_TEMPLATE.to_string(),
-            history_raw_url_template:
-                vs_manifest::DEFAULT_HISTORY_RAW_URL_TEMPLATE.to_string(),
+            history_commits_url_template: HISTORY_COMMITS_URL_TEMPLATE.to_string(),
+            history_raw_url_template: HISTORY_RAW_URL_TEMPLATE.to_string(),
         }
     }
 
@@ -109,7 +124,7 @@ impl Provider for MsvcProvider {
                     "`msvc` provider: `manifest_history = true` requires `msvc_version` to be pinned"
                 )
             })?;
-            vs_manifest::find_msvc_manifest_in_history(
+            find_manifest_in_history(
                 &self.history_commits_url_template,
                 &self.history_raw_url_template,
                 vs_channel,
@@ -186,6 +201,45 @@ impl Provider for MsvcProvider {
             freshly_extracted: true,
         })
     }
+}
+
+/// Walk the `roblabla/msvc-manifest-history` mirror newest-first for a
+/// snapshot whose manifest still lists `msvc_version`.
+fn find_manifest_in_history(
+    commits_url_template: &str,
+    raw_url_template: &str,
+    vs_channel: &str,
+    msvc_version: &str,
+    ctx: &InstallCtx,
+) -> Result<VsManifest> {
+    #[derive(Deserialize)]
+    struct Commit {
+        sha: String,
+    }
+    for page in 1..=HISTORY_MAX_PAGES {
+        let url = commits_url_template
+            .replace("{channel}", vs_channel)
+            .replace("{page}", &page.to_string());
+        let path = ctx.download(&url, None)?;
+        let commits: Vec<Commit> = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        if commits.is_empty() {
+            break;
+        }
+        for c in &commits {
+            let url = raw_url_template.replace("{sha}", &c.sha);
+            let path = ctx.download(&url, None)?;
+            let m: VsManifest = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+            if m.find_msvc_candidates(HOST, TARGET)
+                .iter()
+                .any(|(v, _)| v == msvc_version)
+            {
+                return Ok(m);
+            }
+        }
+    }
+    bail!(
+        "no snapshot in roblabla/msvc-manifest-history lists MSVC {msvc_version} (vs_channel={vs_channel})"
+    )
 }
 
 /// Look up each package id in the manifest and gather all its payloads.

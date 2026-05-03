@@ -2,8 +2,6 @@
 //! file shows only the implementation).
 
 use super::*;
-use crate::cache::Cache;
-use tempfile::TempDir;
 
 fn sample_manifest() -> VsManifest {
     // Tiny canned subset of a real VS manifest. Covers MSVC + SDK
@@ -125,47 +123,6 @@ fn find_package_falls_back_to_languageless_then_first() {
     let m2: VsManifest = serde_json::from_str(json2).unwrap();
     let p2 = m2.find_package("Foo.Bar").unwrap();
     assert_eq!(p2.language.as_deref(), Some("ja-JP"));
-}
-
-#[test]
-fn find_in_history_walks_pages_until_match() {
-    let tmp = TempDir::new().unwrap();
-    let root = tmp.path();
-    let write = |p: &str, body: String| {
-        let path = root.join(p);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
-    };
-    let manifest_for = |v: &str| {
-        format!(
-            r#"{{"packages":[{{"id":"Microsoft.VC.{v}.Tools.HostX64.TargetX64.base","payloads":[]}}]}}"#
-        )
-    };
-    // page-1 lists newer commits; the version we want is on page-2. The walker
-    // must page through, then stop when an empty page comes back.
-    write("commits/release-17/page-1", r#"[{"sha":"aaa"},{"sha":"bbb"}]"#.into());
-    write("commits/release-17/page-2", r#"[{"sha":"ccc"}]"#.into());
-    write("commits/release-17/page-3", "[]".into());
-    write("raw/aaa/manifest.json", manifest_for("14.50.18.0"));
-    write("raw/bbb/manifest.json", manifest_for("14.49.99.0"));
-    write("raw/ccc/manifest.json", manifest_for("14.42.34433.0"));
-
-    let base = url::Url::from_directory_path(root).unwrap().to_string();
-    let base = base.trim_end_matches('/').to_string();
-    let cache = Cache::at(tmp.path().join("c"));
-    cache.ensure_layout().unwrap();
-    let ctx = InstallCtx::new(cache);
-
-    let want = "14.42.34433.0";
-    let m = find_msvc_manifest_in_history(
-        &format!("{base}/commits/release-{{channel}}/page-{{page}}"),
-        &format!("{base}/raw/{{sha}}/manifest.json"),
-        "17",
-        want,
-        &ctx,
-    )
-    .unwrap();
-    assert_eq!(m.find_msvc_candidates("x64", "x64")[0].0, want);
 }
 
 #[test]

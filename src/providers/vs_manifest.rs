@@ -1,7 +1,7 @@
 //! Internal helper for fetching + parsing the Visual Studio channel manifest.
 //! Shared between the `msvc` and `windows_sdk` providers.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use super::InstallCtx;
@@ -9,24 +9,6 @@ use super::InstallCtx;
 /// Default URL template for the channel manifest. `{channel}` is substituted
 /// with the user-provided VS channel (e.g. "18" for VS 2022 + 17 series).
 pub const DEFAULT_CHANNEL_URL_TEMPLATE: &str = "https://aka.ms/vs/{channel}/stable/channel";
-
-/// Default URL template for listing commits on a branch of the
-/// `roblabla/msvc-manifest-history` mirror. `{channel}` substitutes the VS
-/// channel (e.g. "17"); `{page}` is the 1-indexed page number.
-///
-/// The mirror's branch convention is `release-<channel>` for stable releases.
-pub const DEFAULT_HISTORY_COMMITS_URL_TEMPLATE: &str =
-    "https://api.github.com/repos/roblabla/msvc-manifest-history/commits?sha=release-{channel}&per_page=100&page={page}";
-
-/// Default URL template for fetching a single historical `manifest.json` blob
-/// at a specific commit SHA. `{sha}` substitutes the commit hash.
-pub const DEFAULT_HISTORY_RAW_URL_TEMPLATE: &str =
-    "https://raw.githubusercontent.com/roblabla/msvc-manifest-history/{sha}/manifest.json";
-
-/// Cap on commit pages (100 each) scanned during a manifest-history walk.
-/// The mirror updates roughly once per upstream channel bump, so 5 pages
-/// comfortably covers more than a year of releases.
-const HISTORY_MAX_PAGES: u32 = 5;
 
 /// Channel manifest (the small JSON returned from the aka.ms URL).
 #[derive(Debug, Deserialize)]
@@ -120,47 +102,6 @@ pub fn fetch_vs_manifest(
     let vs: VsManifest = serde_json::from_str(&vs_text)
         .with_context(|| format!("parsing VS manifest from {}", vs_path.display()))?;
     Ok(vs)
-}
-
-/// Walk `roblabla/msvc-manifest-history` newest-first for a snapshot whose
-/// manifest still lists `msvc_version`. Workaround for issue #1: Microsoft
-/// only publishes the latest channel manifest, so older MSVC versions are
-/// otherwise unfetchable.
-pub fn find_msvc_manifest_in_history(
-    commits_url_template: &str,
-    raw_url_template: &str,
-    vs_channel: &str,
-    msvc_version: &str,
-    ctx: &InstallCtx,
-) -> Result<VsManifest> {
-    #[derive(Deserialize)]
-    struct Commit {
-        sha: String,
-    }
-    for page in 1..=HISTORY_MAX_PAGES {
-        let url = commits_url_template
-            .replace("{channel}", vs_channel)
-            .replace("{page}", &page.to_string());
-        let path = ctx.download(&url, None)?;
-        let commits: Vec<Commit> = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-        if commits.is_empty() {
-            break;
-        }
-        for c in &commits {
-            let url = raw_url_template.replace("{sha}", &c.sha);
-            let path = ctx.download(&url, None)?;
-            let m: VsManifest = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-            if m.find_msvc_candidates("x64", "x64")
-                .iter()
-                .any(|(v, _)| v == msvc_version)
-            {
-                return Ok(m);
-            }
-        }
-    }
-    bail!(
-        "no snapshot in roblabla/msvc-manifest-history lists MSVC {msvc_version} (vs_channel={vs_channel})"
-    )
 }
 
 /// Sort version strings as a list of dot-separated integer components, so
