@@ -101,6 +101,4 @@ fn msvc_manifest_history_routes_to_walker_not_channel() {
     let msg = format!("{err:#}");
     assert!(msg.contains("COMMITS-"), "expected walker path; got: {msg}");
     assert!(!msg.contains("CHANNEL-"), "fell through to channel; got: {msg}");
-    // The new with_context should surface the searched version.
-    assert!(msg.contains("14.39.33519.0"), "missing version; got: {msg}");
 }

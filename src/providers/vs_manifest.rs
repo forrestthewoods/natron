@@ -122,16 +122,16 @@ pub fn fetch_vs_manifest(
     Ok(vs)
 }
 
-/// Walk `roblabla/msvc-manifest-history` newest-first, returning the first
-/// historical manifest accepted by `is_match`. Workaround for issue #1:
-/// Microsoft only publishes the latest channel manifest, so older MSVC
-/// versions are otherwise unfetchable.
-pub fn find_vs_manifest_in_history(
+/// Walk `roblabla/msvc-manifest-history` newest-first for a snapshot whose
+/// manifest still lists `msvc_version`. Workaround for issue #1: Microsoft
+/// only publishes the latest channel manifest, so older MSVC versions are
+/// otherwise unfetchable.
+pub fn find_msvc_manifest_in_history(
     commits_url_template: &str,
     raw_url_template: &str,
     vs_channel: &str,
+    msvc_version: &str,
     ctx: &InstallCtx,
-    mut is_match: impl FnMut(&VsManifest) -> bool,
 ) -> Result<VsManifest> {
     #[derive(Deserialize)]
     struct Commit {
@@ -150,13 +150,16 @@ pub fn find_vs_manifest_in_history(
             let url = raw_url_template.replace("{sha}", &c.sha);
             let path = ctx.download(&url, None)?;
             let m: VsManifest = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-            if is_match(&m) {
+            if m.find_msvc_candidates("x64", "x64")
+                .iter()
+                .any(|(v, _)| v == msvc_version)
+            {
                 return Ok(m);
             }
         }
     }
     bail!(
-        "no matching manifest in roblabla/msvc-manifest-history for vs_channel={vs_channel}"
+        "no snapshot in roblabla/msvc-manifest-history lists MSVC {msvc_version} (vs_channel={vs_channel})"
     )
 }
 

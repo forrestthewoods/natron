@@ -157,15 +157,15 @@ fn find_in_history_walks_pages_until_match() {
     let ctx = InstallCtx::new(cache);
 
     let want = "14.42.34433.0";
-    let m = find_vs_manifest_in_history(
+    let m = find_msvc_manifest_in_history(
         &format!("{base}/commits/release-{{channel}}/page-{{page}}"),
         &format!("{base}/raw/{{sha}}/manifest.json"),
         "17",
+        want,
         &ctx,
-        |m| m.find_msvc_candidates("X64", "X64").iter().any(|(v, _)| v == want),
     )
     .unwrap();
-    assert_eq!(m.find_msvc_candidates("X64", "X64")[0].0, want);
+    assert_eq!(m.find_msvc_candidates("x64", "x64")[0].0, want);
 }
 
 #[test]

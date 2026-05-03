@@ -6,7 +6,7 @@
 //! SDK is a separate provider (`windows_sdk`). The two are logically
 //! independent.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 
 use super::vs_manifest::{self, VsManifest};
 use super::{InstallCtx, Installed, Provider};
@@ -85,12 +85,6 @@ impl Provider for MsvcProvider {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        if manifest_history && pinned_version.is_none() {
-            bail!(
-                "`msvc` provider: `manifest_history = true` requires `msvc_version` to be pinned"
-            );
-        }
-
         // Fast-path when version is pinned: deterministic fingerprint, no
         // network needed.
         if let Some(ver) = pinned_version {
@@ -110,19 +104,18 @@ impl Provider for MsvcProvider {
         // contains the requested version; otherwise fetch the live channel
         // manifest from aka.ms.
         let manifest = if manifest_history {
-            let want = pinned_version.expect("checked above");
-            vs_manifest::find_vs_manifest_in_history(
+            let want = pinned_version.ok_or_else(|| {
+                anyhow!(
+                    "`msvc` provider: `manifest_history = true` requires `msvc_version` to be pinned"
+                )
+            })?;
+            vs_manifest::find_msvc_manifest_in_history(
                 &self.history_commits_url_template,
                 &self.history_raw_url_template,
                 vs_channel,
+                want,
                 ctx,
-                |m| {
-                    m.find_msvc_candidates(HOST, TARGET)
-                        .iter()
-                        .any(|(v, _)| v == want)
-                },
-            )
-            .with_context(|| format!("looking up MSVC version {want} in manifest history"))?
+            )?
         } else {
             vs_manifest::fetch_vs_manifest(
                 &self.channel_url_template,
