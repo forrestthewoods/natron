@@ -100,17 +100,17 @@ block with distinct `name` and `deploy_dir`.
 - **`zig`**: look up `version` + `platform` in
   `https://ziglang.org/download/index.json`, sha-verified via the index.
 - **`msvc`**: extract MSVC compiler + CRT from a Visual Studio channel
-  manifest. Required `vs_channel`. Optional `msvc_version` (latest if
-  omitted). Optional `manifest_history = true` (requires a pinned
-  `msvc_version`): fetches the accumulated VS manifest from
-  [`roblabla/msvc-manifest-history`][mh]'s `release-<vs_channel>`
-  branch instead of `aka.ms`. The mirror's manifest lists every MSVC
-  build the channel has ever shipped, so older versions that
-  `aka.ms` no longer advertises remain installable.
-
-  [mh]: https://github.com/roblabla/msvc-manifest-history
+  manifest. Required `vs_channel`. Optional `msvc_version`; if omitted,
+  natron installs the latest MSVC toolset listed by Microsoft's live
+  channel manifest. If pinned, natron installs that exact toolset version
+  or fails. For older pinned versions no longer listed by Microsoft,
+  natron also checks the unofficial
+  [`roblabla/msvc-manifest-history`][mh] archive; pinned installs never
+  silently fall back to latest.
 - **`windows_sdk`**: extract Windows SDK headers + libs from a VS channel
   manifest. Required `vs_channel`. Optional `sdk_version`.
+
+[mh]: https://github.com/roblabla/msvc-manifest-history
 
 ## Deploy modes
 

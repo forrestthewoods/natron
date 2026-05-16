@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::cache::Cache;
+use crate::providers::InstallCtx;
 use tempfile::TempDir;
 
 #[test]
@@ -57,44 +58,132 @@ fn msvc_provider_pinned_version_fast_path_no_network() {
 }
 
 #[test]
-fn msvc_manifest_history_requires_pinned_version() {
+fn pinned_version_resolves_from_live_manifest_first() {
     let tmp = TempDir::new().unwrap();
+    let live_manifest = tmp.path().join("live.vsman");
+    write_msvc_manifest(&live_manifest, &["14.50.18.0", "14.39.33519.0"]);
+    let live_channel = tmp.path().join("channel.json");
+    write_channel_manifest(&live_channel, &live_manifest);
+
     let cache = Cache::at(tmp.path().join("c"));
     cache.ensure_layout().unwrap();
-    let mut ctx = InstallCtx::new(cache);
+    let ctx = InstallCtx::new(cache);
+    let provider = MsvcProvider::with_channel_url_template(file_url(&live_channel))
+        .with_archive_manifest_url_template("file:///archive/should/not/be/read.json");
 
-    let mut opts = toml::Table::new();
-    opts.insert("vs_channel".into(), toml::Value::String("17".into()));
-    opts.insert("manifest_history".into(), toml::Value::Boolean(true));
+    let (_, resolved, package_id) = provider
+        .resolve_manifest_and_candidate("17", Some("14.39.33519.0"), &ctx)
+        .unwrap();
 
-    let err = MsvcProvider::new().install(&opts, &mut ctx).unwrap_err();
-    assert!(err.to_string().contains("msvc_version"), "got: {err}");
+    assert_eq!(resolved, "14.39.33519.0");
+    assert!(package_id.contains("14.39.33519.0"));
 }
 
 #[test]
-fn msvc_manifest_history_routes_to_mirror_not_channel() {
-    // Hermetic regression test for the if/else in install(). Both URLs are
-    // pointed at distinguishable file:// paths that don't exist; whichever
-    // path the provider actually takes surfaces its template fragment in
-    // the error. Asserts we hit the history mirror, not aka.ms.
+fn pinned_version_falls_back_to_archive_manifest() {
     let tmp = TempDir::new().unwrap();
+    let live_manifest = tmp.path().join("live.vsman");
+    write_msvc_manifest(&live_manifest, &["14.50.18.0"]);
+    let live_channel = tmp.path().join("channel.json");
+    write_channel_manifest(&live_channel, &live_manifest);
+    let archive_manifest = tmp.path().join("archive.vsman");
+    write_msvc_manifest(&archive_manifest, &["14.39.33519.0"]);
+
     let cache = Cache::at(tmp.path().join("c"));
     cache.ensure_layout().unwrap();
-    let mut ctx = InstallCtx::new(cache);
+    let ctx = InstallCtx::new(cache);
+    let provider = MsvcProvider::with_channel_url_template(file_url(&live_channel))
+        .with_archive_manifest_url_template(file_url(&archive_manifest));
 
-    let mut opts = toml::Table::new();
-    opts.insert("vs_channel".into(), toml::Value::String("17".into()));
-    opts.insert(
-        "msvc_version".into(),
-        toml::Value::String("14.39.33519.0".into()),
-    );
-    opts.insert("manifest_history".into(), toml::Value::Boolean(true));
+    let (_, resolved, package_id) = provider
+        .resolve_manifest_and_candidate("17", Some("14.39.33519.0"), &ctx)
+        .unwrap();
 
-    let provider =
-        MsvcProvider::with_channel_url_template("file:///nope/CHANNEL-{channel}")
-            .with_history_url_template("file:///nope/MIRROR-{channel}.json");
-    let err = provider.install(&opts, &mut ctx).unwrap_err();
+    assert_eq!(resolved, "14.39.33519.0");
+    assert!(package_id.contains("14.39.33519.0"));
+}
+
+#[test]
+fn pinned_version_never_falls_back_to_latest() {
+    let tmp = TempDir::new().unwrap();
+    let live_manifest = tmp.path().join("live.vsman");
+    write_msvc_manifest(&live_manifest, &["14.50.18.0"]);
+    let live_channel = tmp.path().join("channel.json");
+    write_channel_manifest(&live_channel, &live_manifest);
+
+    let cache = Cache::at(tmp.path().join("c"));
+    cache.ensure_layout().unwrap();
+    let ctx = InstallCtx::new(cache);
+    let provider = MsvcProvider::with_channel_url_template(file_url(&live_channel))
+        .with_archive_manifest_url_template("file:///archive/missing.json");
+
+    let err = provider
+        .resolve_manifest_and_candidate("17", Some("14.39.33519.0"), &ctx)
+        .unwrap_err();
     let msg = format!("{err:#}");
-    assert!(msg.contains("MIRROR-"), "expected mirror path; got: {msg}");
-    assert!(!msg.contains("CHANNEL-"), "fell through to channel; got: {msg}");
+
+    assert!(msg.contains("14.39.33519.0"), "got: {msg}");
+    assert!(msg.contains("14.50.18.0"), "got: {msg}");
+    assert!(msg.contains("archived manifest failed"), "got: {msg}");
+}
+
+#[test]
+fn pinned_version_reports_both_searched_manifests() {
+    let tmp = TempDir::new().unwrap();
+    let live_manifest = tmp.path().join("live.vsman");
+    write_msvc_manifest(&live_manifest, &["14.50.18.0"]);
+    let live_channel = tmp.path().join("channel.json");
+    write_channel_manifest(&live_channel, &live_manifest);
+    let archive_manifest = tmp.path().join("archive.vsman");
+    write_msvc_manifest(&archive_manifest, &["14.38.33130.0"]);
+
+    let cache = Cache::at(tmp.path().join("c"));
+    cache.ensure_layout().unwrap();
+    let ctx = InstallCtx::new(cache);
+    let provider = MsvcProvider::with_channel_url_template(file_url(&live_channel))
+        .with_archive_manifest_url_template(file_url(&archive_manifest));
+
+    let err = provider
+        .resolve_manifest_and_candidate("17", Some("14.39.33519.0"), &ctx)
+        .unwrap_err();
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("Microsoft live manifest"), "got: {msg}");
+    assert!(msg.contains("archived manifest"), "got: {msg}");
+    assert!(msg.contains("14.50.18.0"), "got: {msg}");
+    assert!(msg.contains("14.38.33130.0"), "got: {msg}");
+}
+
+fn write_channel_manifest(path: &std::path::Path, vs_manifest_path: &std::path::Path) {
+    let vs_url = file_url(vs_manifest_path);
+    let json = format!(
+        r#"{{
+            "channelItems": [{{
+                "type": "Manifest",
+                "id": "Microsoft.VisualStudio.Manifests.VisualStudio",
+                "payloads": [{{ "url": "{vs_url}" }}]
+            }}]
+        }}"#
+    );
+    std::fs::write(path, json).unwrap();
+}
+
+fn write_msvc_manifest(path: &std::path::Path, versions: &[&str]) {
+    let packages = versions
+        .iter()
+        .map(|version| {
+            format!(
+                r#"{{
+                    "id": "Microsoft.VC.{version}.Tools.HostX64.TargetX64.base",
+                    "payloads": []
+                }}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    std::fs::write(path, format!(r#"{{ "packages": [{packages}] }}"#)).unwrap();
+}
+
+fn file_url(path: &std::path::Path) -> String {
+    url::Url::from_file_path(path).unwrap().to_string()
 }

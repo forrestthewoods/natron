@@ -6,7 +6,7 @@
 //! SDK is a separate provider (`windows_sdk`). The two are logically
 //! independent.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use super::vs_manifest::{self, VsManifest};
 use super::{InstallCtx, Installed, Provider};
@@ -18,26 +18,22 @@ pub const ID: &str = "msvc";
 const HOST: &str = "x64";
 const TARGET: &str = "x64";
 
-/// URL template for the `roblabla/msvc-manifest-history` mirror, our
-/// workaround for issue #1: aka.ms's channel manifest is a moving target
-/// that drops older MSVC versions over time, so it can't reliably resolve
-/// a pinned older version. The mirror's `release-<channel>` branch keeps
-/// a stable VS manifest whose package list spans every MSVC build the
-/// channel has ever shipped — one fetch, no commit walking. `{channel}`
-/// substitutes the VS channel.
-const HISTORY_MANIFEST_URL_TEMPLATE: &str =
+/// Archive mirror for old MSVC manifests. This is an implementation detail
+/// for pinned `msvc_version`: Microsoft live channel manifests are moving
+/// targets and may stop listing older toolsets.
+const ARCHIVE_MANIFEST_URL_TEMPLATE: &str =
     "https://raw.githubusercontent.com/roblabla/msvc-manifest-history/release-{channel}/manifest.json";
 
 pub struct MsvcProvider {
     channel_url_template: String,
-    history_manifest_url_template: String,
+    archive_manifest_url_template: String,
 }
 
 impl MsvcProvider {
     pub fn new() -> Self {
         Self {
             channel_url_template: vs_manifest::DEFAULT_CHANNEL_URL_TEMPLATE.to_string(),
-            history_manifest_url_template: HISTORY_MANIFEST_URL_TEMPLATE.to_string(),
+            archive_manifest_url_template: ARCHIVE_MANIFEST_URL_TEMPLATE.to_string(),
         }
     }
 
@@ -48,11 +44,9 @@ impl MsvcProvider {
         }
     }
 
-    /// Override the manifest-history URL template. Honors `{channel}`. Used
-    /// by tests to point at a `file://` fixture. Chainable so a test can
-    /// override both the channel URL and the history URL in one expression.
-    pub fn with_history_url_template(mut self, template: impl Into<String>) -> Self {
-        self.history_manifest_url_template = template.into();
+    #[cfg(test)]
+    fn with_archive_manifest_url_template(mut self, template: impl Into<String>) -> Self {
+        self.archive_manifest_url_template = template.into();
         self
     }
 }
@@ -80,10 +74,6 @@ impl Provider for MsvcProvider {
                 anyhow!("`msvc` provider requires options.vs_channel (string)")
             })?;
         let pinned_version = options.get("msvc_version").and_then(|v| v.as_str());
-        let manifest_history = options
-            .get("manifest_history")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
 
         // Fast-path when version is pinned: deterministic fingerprint, no
         // network needed.
@@ -99,49 +89,8 @@ impl Provider for MsvcProvider {
             }
         }
 
-        // Need the manifest. With manifest_history we fetch the
-        // accumulated VS manifest from roblabla/msvc-manifest-history (its
-        // package list spans every MSVC build the channel has ever shipped);
-        // otherwise fetch the live channel manifest from aka.ms.
-        let manifest = if manifest_history {
-            if pinned_version.is_none() {
-                bail!(
-                    "`msvc` provider: `manifest_history = true` requires `msvc_version` to be pinned"
-                );
-            }
-            let url = self
-                .history_manifest_url_template
-                .replace("{channel}", vs_channel);
-            let path = ctx.download(&url, None)?;
-            serde_json::from_str(&std::fs::read_to_string(&path)?)?
-        } else {
-            vs_manifest::fetch_vs_manifest(
-                &self.channel_url_template,
-                vs_channel,
-                ctx,
-            )?
-        };
-        let candidates = manifest.find_msvc_candidates(HOST, TARGET);
-        if candidates.is_empty() {
-            anyhow::bail!(
-                "no MSVC packages found in VS manifest for host={HOST} target={TARGET}"
-            );
-        }
-
-        let (resolved_ver, base_pkg_id) = match pinned_version {
-            Some(req) => candidates
-                .iter()
-                .find(|(v, _)| v == req)
-                .ok_or_else(|| {
-                    let avail: Vec<_> = candidates.iter().map(|(v, _)| v.as_str()).collect();
-                    anyhow!(
-                        "msvc_version='{req}' not in manifest; available: {:?}",
-                        avail
-                    )
-                })?
-                .clone(),
-            None => candidates[0].clone(),
-        };
+        let (manifest, resolved_ver, base_pkg_id) =
+            self.resolve_manifest_and_candidate(vs_channel, pinned_version, ctx)?;
 
         let fp = sanitize_fingerprint(&format!("msvc-{resolved_ver}-{vs_channel}"));
         if ctx.cache().install_present(&fp) {
@@ -183,6 +132,105 @@ impl Provider for MsvcProvider {
             options: resolved_options(options, &resolved_ver),
             freshly_extracted: true,
         })
+    }
+}
+
+impl MsvcProvider {
+    fn resolve_manifest_and_candidate(
+        &self,
+        vs_channel: &str,
+        pinned_version: Option<&str>,
+        ctx: &InstallCtx,
+    ) -> Result<(VsManifest, String, String)> {
+        let live = self.fetch_live_manifest(vs_channel, ctx);
+
+        let Some(requested) = pinned_version else {
+            let manifest = live?;
+            let (resolved_ver, base_pkg_id) = select_latest_candidate(&manifest)?;
+            return Ok((manifest, resolved_ver, base_pkg_id));
+        };
+
+        let mut notes = Vec::new();
+        match live {
+            Ok(manifest) => {
+                if let Some((resolved_ver, base_pkg_id)) =
+                    select_pinned_candidate(&manifest, requested)
+                {
+                    return Ok((manifest, resolved_ver, base_pkg_id));
+                }
+                notes.push(format!(
+                    "Microsoft live manifest did not contain {requested}; available versions: {}",
+                    format_available_versions(&manifest)
+                ));
+            }
+            Err(err) => notes.push(format!("Microsoft live manifest failed: {err:#}")),
+        }
+
+        match self.fetch_archive_manifest(vs_channel, ctx) {
+            Ok(manifest) => {
+                if let Some((resolved_ver, base_pkg_id)) =
+                    select_pinned_candidate(&manifest, requested)
+                {
+                    return Ok((manifest, resolved_ver, base_pkg_id));
+                }
+                notes.push(format!(
+                    "archived manifest did not contain {requested}; available versions: {}",
+                    format_available_versions(&manifest)
+                ));
+            }
+            Err(err) => notes.push(format!("archived manifest failed: {err:#}")),
+        }
+
+        bail!(
+            "could not resolve pinned msvc_version='{requested}' for vs_channel='{vs_channel}'; {}",
+            notes.join("; ")
+        )
+    }
+
+    fn fetch_live_manifest(&self, vs_channel: &str, ctx: &InstallCtx) -> Result<VsManifest> {
+        vs_manifest::fetch_vs_manifest(&self.channel_url_template, vs_channel, ctx)
+            .with_context(|| format!("resolving Microsoft live VS manifest for channel {vs_channel}"))
+    }
+
+    fn fetch_archive_manifest(&self, vs_channel: &str, ctx: &InstallCtx) -> Result<VsManifest> {
+        let url = self
+            .archive_manifest_url_template
+            .replace("{channel}", vs_channel);
+        let path = ctx
+            .download(&url, None)
+            .with_context(|| format!("fetching archived VS manifest from {url}"))?;
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading archived VS manifest {}", path.display()))?;
+        serde_json::from_str(&text)
+            .with_context(|| format!("parsing archived VS manifest {}", path.display()))
+    }
+}
+
+fn select_latest_candidate(manifest: &VsManifest) -> Result<(String, String)> {
+    let candidates = manifest.find_msvc_candidates(HOST, TARGET);
+    if candidates.is_empty() {
+        bail!("no MSVC packages found in VS manifest for host={HOST} target={TARGET}");
+    }
+    Ok(candidates[0].clone())
+}
+
+fn select_pinned_candidate(manifest: &VsManifest, requested: &str) -> Option<(String, String)> {
+    manifest
+        .find_msvc_candidates(HOST, TARGET)
+        .into_iter()
+        .find(|(version, _)| version == requested)
+}
+
+fn format_available_versions(manifest: &VsManifest) -> String {
+    let versions: Vec<_> = manifest
+        .find_msvc_candidates(HOST, TARGET)
+        .into_iter()
+        .map(|(version, _)| version)
+        .collect();
+    if versions.is_empty() {
+        "<none>".to_string()
+    } else {
+        versions.join(", ")
     }
 }
 
