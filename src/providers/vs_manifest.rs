@@ -47,6 +47,11 @@ pub struct VsManifest {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Package {
     pub id: String,
+    /// Visual Studio's package version. For MSVC this is the exact compiler
+    /// toolset version, while the package id may use a shorter family segment
+    /// such as `Microsoft.VC.14.51...`.
+    #[serde(default)]
+    pub version: Option<String>,
     #[serde(default)]
     pub payloads: Vec<Payload>,
     /// Many VS packages exist in multiple variants distinguished only by
@@ -60,6 +65,13 @@ pub struct Package {
     /// inspect.
     #[serde(default)]
     pub dependencies: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MsvcCandidate {
+    pub package_id_version: String,
+    pub package_version: String,
+    pub package_id: String,
 }
 
 /// Fetch the channel manifest, follow it to the VS manifest, and return the
@@ -142,10 +154,11 @@ impl VsManifest {
         Some(matches[0])
     }
 
-    /// Find every MSVC compiler+CRT package matching `microsoft.vc.{ver}.tools.host{host}.target{target}.base`.
-    /// Returns `(version_string, package_id)` pairs, sorted descending by
-    /// version. "Premium" variants are excluded (we want the base toolchain).
-    pub fn find_msvc_candidates(&self, host: &str, target: &str) -> Vec<(String, String)> {
+    /// Find every MSVC compiler package matching
+    /// `microsoft.vc.{id_version}.tools.host{host}.target{target}.base`.
+    /// Returns candidates sorted descending by package version. "Premium"
+    /// variants are excluded (we want the base toolchain).
+    pub fn find_msvc_candidates(&self, host: &str, target: &str) -> Vec<MsvcCandidate> {
         let host = host.to_lowercase();
         let target = target.to_lowercase();
         let needle = format!(".tools.host{host}.target{target}.base");
@@ -166,10 +179,20 @@ impl VsManifest {
             let Some(end) = after.to_lowercase().find(".tools.") else {
                 continue;
             };
-            let version = &after[..end];
-            out.push((version.to_string(), pkg.id.clone()));
+            let package_id_version = &after[..end];
+            let package_version = pkg
+                .version
+                .clone()
+                .unwrap_or_else(|| package_id_version.to_string());
+            out.push(MsvcCandidate {
+                package_id_version: package_id_version.to_string(),
+                package_version,
+                package_id: pkg.id.clone(),
+            });
         }
-        out.sort_by(|a, b| version_key(&b.0).cmp(&version_key(&a.0)));
+        out.sort_by(|a, b| {
+            version_key(&b.package_version).cmp(&version_key(&a.package_version))
+        });
         out
     }
 

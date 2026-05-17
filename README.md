@@ -76,7 +76,7 @@ deploy_dir  = "msvc"
 provider    = "msvc"
 [toolchain.options]
 vs_channel   = "18"            # required; e.g. "17" for VS 2022
-msvc_version = "14.50.18.0"    # optional; latest if omitted
+msvc_version = "14.51.36243"    # optional exact compiler package version
 
 [[toolchain]]
 name        = "windows_sdk"
@@ -99,12 +99,14 @@ block with distinct `name` and `deploy_dir`.
   `asset`. Optional `version` (display), `sha256`, `archive`, `strip_prefix`.
 - **`zig`**: look up `version` + `platform` in
   `https://ziglang.org/download/index.json`, sha-verified via the index.
-- **`msvc`**: extract MSVC compiler + CRT from a Visual Studio channel
-  manifest. Required `vs_channel`. Optional `msvc_version`; if omitted,
-  natron installs the latest MSVC toolset listed by Microsoft's live
-  channel manifest. If pinned, natron installs that exact toolset version
-  or fails. For older pinned versions no longer listed by Microsoft,
-  natron also checks the unofficial
+- **`msvc`**: extract a minimal x64 MSVC compiler + CRT toolchain from a
+  Visual Studio channel manifest. Required `vs_channel`. Optional
+  `msvc_version`; if omitted, natron installs the latest MSVC toolset
+  listed by Microsoft's live channel manifest. If pinned, `msvc_version`
+  is the exact Visual Studio compiler package version, such as
+  `14.51.36243`, and natron installs that compiler package version or
+  fails. For older pinned versions no longer listed by Microsoft, natron
+  also checks the unofficial
   [`roblabla/msvc-manifest-history`][mh] archive; pinned installs never
   silently fall back to latest.
 - **`windows_sdk`**: extract Windows SDK headers + libs from a VS channel

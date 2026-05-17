@@ -10,6 +10,7 @@ fn sample_manifest() -> VsManifest {
         "packages": [
             {
                 "id": "Microsoft.VC.14.50.18.0.Tools.HostX64.TargetX64.base",
+                "version": "14.50.35731",
                 "payloads": [
                     {"url": "https://example.com/vc-14.50.18.0.vsix",
                      "sha256": "aaaa",
@@ -18,10 +19,12 @@ fn sample_manifest() -> VsManifest {
             },
             {
                 "id": "Microsoft.VC.14.49.99.0.Tools.HostX64.TargetX64.base",
+                "version": "14.49.34567",
                 "payloads": []
             },
             {
                 "id": "Microsoft.VC.14.50.18.0.Tools.HostX64.TargetX64.Premium.base",
+                "version": "14.50.35731",
                 "payloads": []
             },
             {
@@ -55,11 +58,15 @@ fn parses_packages() {
 fn find_msvc_candidates_picks_base_only_and_sorts_descending() {
     let m = sample_manifest();
     let cands = m.find_msvc_candidates("X64", "X64");
-    let versions: Vec<_> = cands.iter().map(|(v, _)| v.as_str()).collect();
-    assert_eq!(versions, vec!["14.50.18.0", "14.49.99.0"]);
+    let versions: Vec<_> = cands
+        .iter()
+        .map(|candidate| candidate.package_version.as_str())
+        .collect();
+    assert_eq!(versions, vec!["14.50.35731", "14.49.34567"]);
+    assert_eq!(cands[0].package_id_version, "14.50.18.0");
     // Premium variant is excluded.
-    for (_, id) in &cands {
-        assert!(!id.to_lowercase().contains(".premium."));
+    for candidate in &cands {
+        assert!(!candidate.package_id.to_lowercase().contains(".premium."));
     }
 }
 

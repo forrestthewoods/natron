@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::vs_manifest::{self, VsManifest};
+use super::vs_manifest::{self, MsvcCandidate, VsManifest};
 use super::{InstallCtx, Installed, Provider};
 use crate::cache::sanitize_fingerprint;
 use crate::extract;
@@ -27,6 +27,14 @@ const ARCHIVE_MANIFEST_URL_TEMPLATE: &str =
 pub struct MsvcProvider {
     channel_url_template: String,
     archive_manifest_url_template: String,
+}
+
+#[derive(Debug)]
+struct ResolvedMsvcToolset {
+    manifest: VsManifest,
+    package_version: String,
+    package_id_version: String,
+    base_package_id: String,
 }
 
 impl MsvcProvider {
@@ -89,35 +97,23 @@ impl Provider for MsvcProvider {
             }
         }
 
-        let (manifest, resolved_ver, base_pkg_id) =
-            self.resolve_manifest_and_candidate(vs_channel, pinned_version, ctx)?;
+        let resolved = self.resolve_toolset(vs_channel, pinned_version, ctx)?;
 
-        let fp = sanitize_fingerprint(&format!("msvc-{resolved_ver}-{vs_channel}"));
+        let fp = sanitize_fingerprint(&format!(
+            "msvc-{}-{vs_channel}",
+            resolved.package_version
+        ));
         if ctx.cache().install_present(&fp) {
             return Ok(Installed {
                 fingerprint: fp,
-                display: format!("msvc {resolved_ver} (vs{vs_channel})"),
-                options: resolved_options(options, &resolved_ver),
+                display: format!("msvc {} (vs{vs_channel})", resolved.package_version),
+                options: resolved_options(options, &resolved.package_version),
                 freshly_extracted: false,
             });
         }
 
-        // Collect all payloads from MSVC base + companion packages.
-        // The Res.base package carries language resource DLLs (clui.dll
-        // etc.) that cl.exe needs to even start up.
-        let host_lower = HOST.to_lowercase();
-        let target_lower = TARGET.to_lowercase();
-        let companion_ids = vec![
-            base_pkg_id,
-            format!(
-                "Microsoft.VC.{resolved_ver}.Tools.Host{host_lower}.Target{target_lower}.Res.base"
-            ),
-            format!("Microsoft.VC.{resolved_ver}.CRT.Headers.base"),
-            format!("Microsoft.VC.{resolved_ver}.CRT.{target_lower}.Desktop.base"),
-            format!("Microsoft.VC.{resolved_ver}.CRT.{target_lower}.Store.base"),
-        ];
-
-        let payloads = collect_payloads(&manifest, &companion_ids)?;
+        let package_ids = required_msvc_package_ids(&resolved)?;
+        let payloads = collect_payloads(&resolved.manifest, &package_ids)?;
 
         // Download + extract into staging.
         let staging_raw = ctx.staging_dir()?;
@@ -128,35 +124,33 @@ impl Provider for MsvcProvider {
 
         Ok(Installed {
             fingerprint: fp,
-            display: format!("msvc {resolved_ver} (vs{vs_channel})"),
-            options: resolved_options(options, &resolved_ver),
+            display: format!("msvc {} (vs{vs_channel})", resolved.package_version),
+            options: resolved_options(options, &resolved.package_version),
             freshly_extracted: true,
         })
     }
 }
 
 impl MsvcProvider {
-    fn resolve_manifest_and_candidate(
+    fn resolve_toolset(
         &self,
         vs_channel: &str,
         pinned_version: Option<&str>,
         ctx: &InstallCtx,
-    ) -> Result<(VsManifest, String, String)> {
+    ) -> Result<ResolvedMsvcToolset> {
         let live = self.fetch_live_manifest(vs_channel, ctx);
 
         let Some(requested) = pinned_version else {
             let manifest = live?;
-            let (resolved_ver, base_pkg_id) = select_latest_candidate(&manifest)?;
-            return Ok((manifest, resolved_ver, base_pkg_id));
+            let candidate = select_latest_candidate(&manifest)?;
+            return Ok(resolved_toolset(manifest, candidate));
         };
 
         let mut notes = Vec::new();
         match live {
             Ok(manifest) => {
-                if let Some((resolved_ver, base_pkg_id)) =
-                    select_pinned_candidate(&manifest, requested)
-                {
-                    return Ok((manifest, resolved_ver, base_pkg_id));
+                if let Some(candidate) = select_pinned_candidate(&manifest, requested) {
+                    return Ok(resolved_toolset(manifest, candidate));
                 }
                 notes.push(format!(
                     "Microsoft live manifest did not contain {requested}; available versions: {}",
@@ -168,10 +162,8 @@ impl MsvcProvider {
 
         match self.fetch_archive_manifest(vs_channel, ctx) {
             Ok(manifest) => {
-                if let Some((resolved_ver, base_pkg_id)) =
-                    select_pinned_candidate(&manifest, requested)
-                {
-                    return Ok((manifest, resolved_ver, base_pkg_id));
+                if let Some(candidate) = select_pinned_candidate(&manifest, requested) {
+                    return Ok(resolved_toolset(manifest, candidate));
                 }
                 notes.push(format!(
                     "archived manifest did not contain {requested}; available versions: {}",
@@ -206,7 +198,7 @@ impl MsvcProvider {
     }
 }
 
-fn select_latest_candidate(manifest: &VsManifest) -> Result<(String, String)> {
+fn select_latest_candidate(manifest: &VsManifest) -> Result<MsvcCandidate> {
     let candidates = manifest.find_msvc_candidates(HOST, TARGET);
     if candidates.is_empty() {
         bail!("no MSVC packages found in VS manifest for host={HOST} target={TARGET}");
@@ -214,24 +206,71 @@ fn select_latest_candidate(manifest: &VsManifest) -> Result<(String, String)> {
     Ok(candidates[0].clone())
 }
 
-fn select_pinned_candidate(manifest: &VsManifest, requested: &str) -> Option<(String, String)> {
+fn select_pinned_candidate(manifest: &VsManifest, requested: &str) -> Option<MsvcCandidate> {
     manifest
         .find_msvc_candidates(HOST, TARGET)
         .into_iter()
-        .find(|(version, _)| version == requested)
+        .find(|candidate| candidate.package_version == requested)
 }
 
 fn format_available_versions(manifest: &VsManifest) -> String {
     let versions: Vec<_> = manifest
         .find_msvc_candidates(HOST, TARGET)
         .into_iter()
-        .map(|(version, _)| version)
+        .map(|candidate| candidate.package_version)
         .collect();
     if versions.is_empty() {
         "<none>".to_string()
     } else {
         versions.join(", ")
     }
+}
+
+fn resolved_toolset(manifest: VsManifest, candidate: MsvcCandidate) -> ResolvedMsvcToolset {
+    ResolvedMsvcToolset {
+        manifest,
+        package_version: candidate.package_version,
+        package_id_version: candidate.package_id_version,
+        base_package_id: candidate.package_id,
+    }
+}
+
+fn required_msvc_package_ids(resolved: &ResolvedMsvcToolset) -> Result<Vec<String>> {
+    let base_pkg = resolved
+        .manifest
+        .find_package(&resolved.base_package_id)
+        .ok_or_else(|| anyhow!("package not found in manifest: {}", resolved.base_package_id))?;
+    let resource_pkg_id = base_pkg
+        .dependencies
+        .keys()
+        .find(|id| {
+            let lower = id.to_lowercase();
+            lower.starts_with("microsoft.vc.")
+                && lower.ends_with(".res.base")
+                && lower.contains(".tools.host")
+        })
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "MSVC package {} has no resource package dependency",
+                resolved.base_package_id
+            )
+        })?;
+
+    let target_lower = TARGET.to_lowercase();
+    Ok(vec![
+        resolved.base_package_id.clone(),
+        resource_pkg_id,
+        format!("Microsoft.VC.{}.CRT.Headers.base", resolved.package_id_version),
+        format!(
+            "Microsoft.VC.{}.CRT.{target_lower}.Desktop.base",
+            resolved.package_id_version
+        ),
+        format!(
+            "Microsoft.VC.{}.CRT.{target_lower}.Store.base",
+            resolved.package_id_version
+        ),
+    ])
 }
 
 /// Look up each package id in the manifest and gather all its payloads.

@@ -59,7 +59,7 @@ deploy_dir  = "msvc"
 provider    = "msvc"
 [toolchain.options]
 vs_channel   = "18"
-msvc_version = "14.51"
+msvc_version = "14.51.36243"
 
 # === Windows SDK ===
 [[toolchain]]
