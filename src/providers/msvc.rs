@@ -23,6 +23,8 @@ const COMPILER_PACKAGE_SUFFIX_LOWER: &str = ".tools.hostx64.targetx64.base";
 
 const STANDARD_PATTERNS: &[&str] = &[
     "Tools.HostX64.TargetX64.base",
+    // Compiler resource packages are tiny, so standard installs every
+    // manifest locale instead of requiring a locale-selection option.
     "Tools.HostX64.TargetX64.Res*",
     "CRT.Headers.base",
     "CRT.x64.Desktop.base",
@@ -113,9 +115,22 @@ impl Provider for MsvcProvider {
     fn install(&self, options: &toml::Table, ctx: &mut InstallCtx) -> Result<Installed> {
         let selection = MsvcSelection::from_options(options)?;
         let pinned_version = options.get("msvc_version").and_then(|v| v.as_str());
+
+        if let Some(version) = pinned_version {
+            let fp = msvc_fingerprint(version, &selection);
+            if ctx.cache().install_present(&fp) {
+                return Ok(Installed {
+                    fingerprint: fp,
+                    display: format!("msvc {version} ({})", selection.vs.as_str()),
+                    options: resolved_options(options, version, &selection),
+                    freshly_extracted: false,
+                });
+            }
+        }
+
         let resolved = self.resolve_toolset(selection.vs.channel(), pinned_version, ctx)?;
         let packages = select_msvc_packages(&resolved, &selection)?;
-        let fp = msvc_fingerprint(&resolved.package_version, selection.vs, &packages);
+        let fp = msvc_fingerprint(&resolved.package_version, &selection);
 
         if ctx.cache().install_present(&fp) {
             return Ok(Installed {
@@ -430,7 +445,7 @@ fn add_pattern_matches(
         bail!("msvc package patterns may not be empty");
     }
 
-    let raw_pattern = pattern.starts_with("Microsoft.");
+    let raw_pattern = starts_with_ignore_ascii_case(pattern, "Microsoft.");
     let mut matched = 0usize;
     for pkg in &resolved.manifest.packages {
         if !is_resolved_package(pkg, resolved) {
@@ -575,10 +590,10 @@ fn find_requested_package<'a>(
 
 fn request_matches_package(request: &PackageRequest, pkg: &vs_manifest::Package) -> bool {
     pkg.id.eq_ignore_ascii_case(&request.id)
-        && request
-            .version
-            .as_deref()
-            .map_or(true, |version| pkg.version.as_deref() == Some(version))
+        && match request.version.as_deref() {
+            Some(version) => pkg.version.as_deref() == Some(version),
+            None => true,
+        }
 }
 
 fn is_metadata_dependency(dep_lower: &str) -> bool {
@@ -691,24 +706,33 @@ fn insert_string_array(options: &mut toml::Table, key: &str, values: &[String]) 
     );
 }
 
-fn msvc_fingerprint(version: &str, vs: VsVersion, packages: &[PackageRequest]) -> String {
-    let mut package_key = String::new();
-    for package in packages {
-        package_key.push_str(&package.id);
-        package_key.push('\t');
-        if let Some(version) = &package.version {
-            package_key.push_str(version);
-        }
-        package_key.push('\t');
-        if let Some(language) = &package.language {
-            package_key.push_str(language);
-        }
-        package_key.push('\n');
+fn msvc_fingerprint(version: &str, selection: &MsvcSelection) -> String {
+    let mut selection_key = String::new();
+    selection_key.push_str(selection.vs.as_str());
+    selection_key.push('\n');
+    selection_key.push_str(selection.profile.as_str());
+    selection_key.push('\n');
+
+    let mut include = selection.include.clone();
+    include.sort_by_key(|value| value.to_ascii_lowercase());
+    for pattern in include {
+        selection_key.push_str("include\t");
+        selection_key.push_str(&pattern.to_ascii_lowercase());
+        selection_key.push('\n');
     }
-    let package_hash = xxh3_64(package_key.as_bytes());
+
+    let mut extras = selection.extras.clone();
+    extras.sort_by_key(|value| value.to_ascii_lowercase());
+    for pattern in extras {
+        selection_key.push_str("extras\t");
+        selection_key.push_str(&pattern.to_ascii_lowercase());
+        selection_key.push('\n');
+    }
+
+    let selection_hash = xxh3_64(selection_key.as_bytes());
     sanitize_fingerprint(&format!(
-        "msvc-{version}-{}-{package_hash:016x}",
-        vs.as_str()
+        "msvc-{version}-{}-{selection_hash:016x}",
+        selection.vs.as_str()
     ))
 }
 

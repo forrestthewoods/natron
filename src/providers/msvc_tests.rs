@@ -204,7 +204,7 @@ fn selection_respects_resolved_exact_package_version() {
 }
 
 #[test]
-fn standard_selects_builtin_patterns() {
+fn standard_selects_builtin_patterns_and_all_resource_locales() {
     let resolved = standard_resolved_toolset();
     let selection = MsvcSelection::from_options(&opts_with_vs()).unwrap();
 
@@ -243,6 +243,20 @@ fn raw_patterns_match_raw_ids_in_exact_version() {
     let resolved = standard_resolved_toolset();
     let mut opts = opts_with_vs();
     opts.insert("extras".into(), toml_array(&["Microsoft.VC.Preview.DIA.*"]));
+    let selection = MsvcSelection::from_options(&opts).unwrap();
+
+    let selected = select_msvc_packages(&resolved, &selection).unwrap();
+    let ids = package_ids(&selected);
+
+    assert!(ids.contains(&"Microsoft.VC.Preview.DIA.SDK".to_string()));
+    assert!(!ids.contains(&"Microsoft.VC.Preview.DIA.Old".to_string()));
+}
+
+#[test]
+fn raw_pattern_prefix_is_case_insensitive() {
+    let resolved = standard_resolved_toolset();
+    let mut opts = opts_with_vs();
+    opts.insert("extras".into(), toml_array(&["microsoft.vc.preview.dia.*"]));
     let selection = MsvcSelection::from_options(&opts).unwrap();
 
     let selected = select_msvc_packages(&resolved, &selection).unwrap();
@@ -325,20 +339,50 @@ fn dependency_closure_adds_resource_props_and_servicing() {
 }
 
 #[test]
-fn fingerprint_changes_when_selected_package_set_changes() {
-    let resolved = standard_resolved_toolset();
+fn fingerprint_changes_when_normalized_selection_changes() {
     let standard = MsvcSelection::from_options(&opts_with_vs()).unwrap();
     let mut extra_opts = opts_with_vs();
     extra_opts.insert("extras".into(), toml_array(&["ATL.X64.base"]));
     let with_extra = MsvcSelection::from_options(&extra_opts).unwrap();
 
-    let standard_packages = select_msvc_packages(&resolved, &standard).unwrap();
-    let extra_packages = select_msvc_packages(&resolved, &with_extra).unwrap();
-
     assert_ne!(
-        msvc_fingerprint("14.52.36328", VsVersion::Vs2026, &standard_packages),
-        msvc_fingerprint("14.52.36328", VsVersion::Vs2026, &extra_packages)
+        msvc_fingerprint("14.52.36328", &standard),
+        msvc_fingerprint("14.52.36328", &with_extra)
     );
+}
+
+#[test]
+fn pinned_version_cache_hit_short_circuits_before_manifest_fetch() {
+    let tmp = TempDir::new().unwrap();
+    let cache = Cache::at(tmp.path().join("c"));
+    cache.ensure_layout().unwrap();
+
+    let mut opts = opts_with_vs();
+    opts.insert(
+        "msvc_version".into(),
+        toml::Value::String("14.51.36243".into()),
+    );
+    let selection = MsvcSelection::from_options(&opts).unwrap();
+    let fp = msvc_fingerprint("14.51.36243", &selection);
+    let install_dir = cache.install_dir(&fp);
+    std::fs::create_dir_all(install_dir.join("tree")).unwrap();
+    let md = crate::cache::InstallMetadata::new(
+        "msvc",
+        fp.clone(),
+        "msvc 14.51.36243 (vs2026)",
+        resolved_options(&opts, "14.51.36243", &selection),
+    );
+    md.write(&cache.install_metadata_path(&fp)).unwrap();
+
+    let mut ctx = InstallCtx::new(cache);
+    let provider = MsvcProvider::with_channel_url_template("file:///never/exists/{channel}")
+        .with_archive_manifest_url_template("file:///archive/also/missing.json");
+
+    let installed = provider.install(&opts, &mut ctx).unwrap();
+
+    assert!(!installed.freshly_extracted);
+    assert_eq!(installed.fingerprint, fp);
+    assert!(ctx.staging_root().is_none());
 }
 
 #[test]

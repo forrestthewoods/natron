@@ -133,9 +133,9 @@ profile      = "standard"
 Profiles:
 
 - `standard`: normal native C/C++ developer toolchain. Installs compiler
-  tools for x64-host/x64-target, compiler resources, CRT headers, desktop +
-  store CRT libs, CRT redist DLLs, and tiny declared resource / props /
-  servicing metadata dependencies.
+  tools for x64-host/x64-target, tiny compiler resources for all manifest
+  locales, CRT headers, desktop + store CRT libs, CRT redist DLLs, and tiny
+  declared resource / props / servicing metadata dependencies.
 - `custom`: only the package patterns listed in `include`.
 - `full`: every `Microsoft.VC.<resolved-family>.*` package in the exact
   resolved MSVC family. This is large; for MSVC `14.52` it is about 11 GiB
