@@ -1,13 +1,13 @@
-//! `msvc` provider: downloads the MSVC compiler + CRT packages from a
-//! Visual Studio channel manifest. Windows-specific install (uses
-//! `msiexec.exe` / VSIX zip extraction).
+//! `msvc` provider: downloads MSVC packages from a Visual Studio channel
+//! manifest. Windows-specific install uses `msiexec.exe` / VSIX zip
+//! extraction.
 //!
-//! NOTE: this provider produces ONLY the compiler + CRT tree. The Windows
-//! SDK is a separate provider (`windows_sdk`). The two are logically
-//! independent.
+//! NOTE: this provider produces ONLY the MSVC tree. The Windows SDK is a
+//! separate provider (`windows_sdk`). The two are logically independent.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeSet;
+use xxhash_rust::xxh3::xxh3_64;
 
 use super::vs_manifest::{self, MsvcCandidate, VsManifest};
 use super::{InstallCtx, Installed, Provider};
@@ -18,7 +18,17 @@ pub const ID: &str = "msvc";
 
 const HOST: &str = "x64";
 const TARGET: &str = "x64";
-const DEFAULT_LOCALE: &str = "en-US";
+const COMPILER_PACKAGE_SUFFIX: &str = ".Tools.HostX64.TargetX64.base";
+const COMPILER_PACKAGE_SUFFIX_LOWER: &str = ".tools.hostx64.targetx64.base";
+
+const STANDARD_PATTERNS: &[&str] = &[
+    "Tools.HostX64.TargetX64.base",
+    "Tools.HostX64.TargetX64.Res*",
+    "CRT.Headers.base",
+    "CRT.x64.Desktop.base",
+    "CRT.x64.Store.base",
+    "CRT.Redist.X64.base",
+];
 
 /// Archive mirror for old MSVC manifests. This is an implementation detail
 /// for pinned `msvc_version`: Microsoft live channel manifests are moving
@@ -35,18 +45,22 @@ pub struct MsvcProvider {
 struct ResolvedMsvcToolset {
     manifest: VsManifest,
     package_version: String,
-    package_id_version: String,
+    family_prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MsvcSelection {
+    vs: VsVersion,
     profile: MsvcProfile,
-    hosts: Vec<String>,
-    targets: Vec<String>,
-    locales: LocaleSelection,
-    crt_libs: Vec<String>,
-    runtimes: Vec<String>,
-    features: Vec<String>,
+    include: Vec<String>,
+    extras: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsVersion {
+    Vs2019,
+    Vs2022,
+    Vs2026,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,15 +70,10 @@ enum MsvcProfile {
     Full,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LocaleSelection {
-    All,
-    Some(Vec<String>),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PackageRequest {
     id: String,
+    version: Option<String>,
     language: Option<String>,
 }
 
@@ -102,43 +111,27 @@ impl Provider for MsvcProvider {
     }
 
     fn install(&self, options: &toml::Table, ctx: &mut InstallCtx) -> Result<Installed> {
-        let vs_channel = options
-            .get("vs_channel")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("`msvc` provider requires options.vs_channel (string)"))?;
-        let pinned_version = options.get("msvc_version").and_then(|v| v.as_str());
         let selection = MsvcSelection::from_options(options)?;
+        let pinned_version = options.get("msvc_version").and_then(|v| v.as_str());
+        let resolved = self.resolve_toolset(selection.vs.channel(), pinned_version, ctx)?;
+        let packages = select_msvc_packages(&resolved, &selection)?;
+        let fp = msvc_fingerprint(&resolved.package_version, selection.vs, &packages);
 
-        // Fast-path when version is pinned: deterministic fingerprint, no
-        // network needed.
-        if let Some(ver) = pinned_version {
-            let fp = msvc_fingerprint(ver, vs_channel, &selection);
-            if ctx.cache().install_present(&fp) {
-                return Ok(Installed {
-                    fingerprint: fp,
-                    display: format!("msvc {ver} (vs{vs_channel})"),
-                    options: resolved_options(options, ver, &selection),
-                    freshly_extracted: false,
-                });
-            }
-        }
-
-        let resolved = self.resolve_toolset(vs_channel, pinned_version, ctx)?;
-
-        let fp = msvc_fingerprint(&resolved.package_version, vs_channel, &selection);
         if ctx.cache().install_present(&fp) {
             return Ok(Installed {
                 fingerprint: fp,
-                display: format!("msvc {} (vs{vs_channel})", resolved.package_version),
+                display: format!(
+                    "msvc {} ({})",
+                    resolved.package_version,
+                    selection.vs.as_str()
+                ),
                 options: resolved_options(options, &resolved.package_version, &selection),
                 freshly_extracted: false,
             });
         }
 
-        let packages = select_msvc_packages(&resolved, &selection)?;
         let payloads = collect_payloads(&resolved.manifest, &packages)?;
 
-        // Download + extract into staging.
         let staging_raw = ctx.staging_dir()?;
         for (url, sha, filename) in &payloads {
             let archive_path = ctx.download(url, sha.as_deref())?;
@@ -147,7 +140,11 @@ impl Provider for MsvcProvider {
 
         Ok(Installed {
             fingerprint: fp,
-            display: format!("msvc {} (vs{vs_channel})", resolved.package_version),
+            display: format!(
+                "msvc {} ({})",
+                resolved.package_version,
+                selection.vs.as_str()
+            ),
             options: resolved_options(options, &resolved.package_version, &selection),
             freshly_extracted: true,
         })
@@ -166,14 +163,14 @@ impl MsvcProvider {
         let Some(requested) = pinned_version else {
             let manifest = live?;
             let candidate = select_latest_candidate(&manifest)?;
-            return Ok(resolved_toolset(manifest, candidate));
+            return resolved_toolset(manifest, candidate);
         };
 
         let mut notes = Vec::new();
         match live {
             Ok(manifest) => {
                 if let Some(candidate) = select_pinned_candidate(&manifest, requested) {
-                    return Ok(resolved_toolset(manifest, candidate));
+                    return resolved_toolset(manifest, candidate);
                 }
                 notes.push(format!(
                     "Microsoft live manifest did not contain {requested}; available versions: {}",
@@ -186,7 +183,7 @@ impl MsvcProvider {
         match self.fetch_archive_manifest(vs_channel, ctx) {
             Ok(manifest) => {
                 if let Some(candidate) = select_pinned_candidate(&manifest, requested) {
-                    return Ok(resolved_toolset(manifest, candidate));
+                    return resolved_toolset(manifest, candidate);
                 }
                 notes.push(format!(
                     "archived manifest did not contain {requested}; available versions: {}",
@@ -197,7 +194,7 @@ impl MsvcProvider {
         }
 
         bail!(
-            "could not resolve pinned msvc_version='{requested}' for vs_channel='{vs_channel}'; {}",
+            "could not resolve pinned msvc_version='{requested}' for vs channel '{vs_channel}'; {}",
             notes.join("; ")
         )
     }
@@ -250,16 +247,27 @@ fn format_available_versions(manifest: &VsManifest) -> String {
     }
 }
 
-fn resolved_toolset(manifest: VsManifest, candidate: MsvcCandidate) -> ResolvedMsvcToolset {
-    ResolvedMsvcToolset {
+fn resolved_toolset(manifest: VsManifest, candidate: MsvcCandidate) -> Result<ResolvedMsvcToolset> {
+    let family_prefix = family_prefix_from_compiler_package(&candidate.package_id)?;
+    Ok(ResolvedMsvcToolset {
         manifest,
         package_version: candidate.package_version,
-        package_id_version: candidate.package_id_version,
-    }
+        family_prefix,
+    })
 }
 
 impl MsvcSelection {
     fn from_options(options: &toml::Table) -> Result<Self> {
+        let vs = options
+            .get("vs")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                anyhow!("`msvc` provider requires options.vs (vs2019, vs2022, or vs2026)")
+            })
+            .and_then(VsVersion::parse)?;
+
+        reject_removed_options(options)?;
+
         let profile = match option_str(options, "profile")?.unwrap_or("standard") {
             "standard" => MsvcProfile::Standard,
             "custom" => MsvcProfile::Custom,
@@ -269,97 +277,44 @@ impl MsvcSelection {
             }
         };
 
-        let hosts = option_string_list(options, "hosts", &["x64"])?;
-        let targets = option_string_list(options, "targets", &["x64"])?;
-        if hosts.is_empty() {
-            bail!("msvc option 'hosts' must contain at least one host architecture");
-        }
-        if targets.is_empty() {
-            bail!("msvc option 'targets' must contain at least one target architecture");
-        }
-        validate_values("hosts", &hosts, &["x64", "x86", "arm64"])?;
-        validate_values("targets", &targets, &["x64", "x86", "arm64"])?;
+        let include = option_string_list(options, "include", &[])?;
+        let extras = option_string_list(options, "extras", &[])?;
 
-        let locale_values = option_string_list(options, "locales", &[DEFAULT_LOCALE])?;
-        if locale_values.is_empty() {
-            bail!("msvc option 'locales' must contain at least one locale or \"all\"");
-        }
-        let locales = if locale_values.iter().any(|value| value == "all") {
-            if locale_values.len() != 1 {
-                bail!("msvc locales may be [\"all\"] or a list of concrete locales, not both");
+        match profile {
+            MsvcProfile::Standard => {
+                if options.contains_key("include") {
+                    bail!("msvc profile 'standard' uses built-in patterns plus optional 'extras'; remove 'include' or use profile='custom'");
+                }
             }
-            LocaleSelection::All
-        } else {
-            LocaleSelection::Some(locale_values)
-        };
-
-        let (default_crt_libs, default_runtimes, default_features): (&[&str], &[&str], &[&str]) =
-            match profile {
-                MsvcProfile::Standard => (&["desktop", "store"], &["crt"], &[]),
-                MsvcProfile::Custom => (&[], &[], &[]),
-                MsvcProfile::Full => (&[], &[], &[]),
-            };
-        let crt_libs = option_string_list(options, "crt_libs", default_crt_libs)?;
-        let runtimes = option_string_list(options, "runtimes", default_runtimes)?;
-        let features = option_string_list(options, "features", default_features)?;
-
-        validate_values(
-            "crt_libs",
-            &crt_libs,
-            &["desktop", "store", "onecore", "spectre", "debug"],
-        )?;
-        validate_values(
-            "runtimes",
-            &runtimes,
-            &["crt", "crt_spectre", "mfc", "mfc_spectre"],
-        )?;
-        validate_values(
-            "features",
-            &features,
-            &[
-                "atl",
-                "atl_spectre",
-                "mfc",
-                "mfc_spectre",
-                "mfc_mbcs",
-                "asan",
-                "pgo",
-                "cli",
-                "code_analysis",
-                "dia_sdk",
-                "source",
-            ],
-        )?;
+            MsvcProfile::Custom => {
+                if include.is_empty() {
+                    bail!("msvc profile 'custom' requires a non-empty 'include' pattern list");
+                }
+                if options.contains_key("extras") {
+                    bail!("msvc profile 'custom' uses 'include'; 'extras' only applies to profile='standard'");
+                }
+            }
+            MsvcProfile::Full => {
+                if options.contains_key("include") || options.contains_key("extras") {
+                    bail!("msvc profile 'full' selects every package in the resolved family and does not accept 'include' or 'extras'");
+                }
+            }
+        }
 
         Ok(Self {
+            vs,
             profile,
-            hosts,
-            targets,
-            locales,
-            crt_libs,
-            runtimes,
-            features,
+            include,
+            extras,
         })
-    }
-
-    fn normalized_key(&self) -> String {
-        if self.profile == MsvcProfile::Full {
-            return "profile=full".to_string();
-        }
-        format!(
-            "profile={};hosts={};targets={};locales={};crt_libs={};runtimes={};features={}",
-            self.profile.as_str(),
-            self.hosts.join(","),
-            self.targets.join(","),
-            self.locales.as_key(),
-            self.crt_libs.join(","),
-            self.runtimes.join(","),
-            self.features.join(",")
-        )
     }
 
     fn resolved_options(&self, options: &toml::Table, resolved_ver: &str) -> toml::Table {
         let mut o = options.clone();
+        o.insert(
+            "vs".into(),
+            toml::Value::String(self.vs.as_str().to_string()),
+        );
         o.insert(
             "msvc_version".into(),
             toml::Value::String(resolved_ver.to_string()),
@@ -368,19 +323,43 @@ impl MsvcSelection {
             "profile".into(),
             toml::Value::String(self.profile.as_str().to_string()),
         );
-        if self.profile == MsvcProfile::Full {
-            return o;
+        match self.profile {
+            MsvcProfile::Standard => {
+                if !self.extras.is_empty() {
+                    insert_string_array(&mut o, "extras", &self.extras);
+                }
+            }
+            MsvcProfile::Custom => insert_string_array(&mut o, "include", &self.include),
+            MsvcProfile::Full => {}
         }
-        insert_string_array(&mut o, "hosts", &self.hosts);
-        insert_string_array(&mut o, "targets", &self.targets);
-        match &self.locales {
-            LocaleSelection::All => insert_string_array(&mut o, "locales", &["all".to_string()]),
-            LocaleSelection::Some(locales) => insert_string_array(&mut o, "locales", locales),
-        }
-        insert_string_array(&mut o, "crt_libs", &self.crt_libs);
-        insert_string_array(&mut o, "runtimes", &self.runtimes);
-        insert_string_array(&mut o, "features", &self.features);
         o
+    }
+}
+
+impl VsVersion {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "vs2019" => Ok(Self::Vs2019),
+            "vs2022" => Ok(Self::Vs2022),
+            "vs2026" => Ok(Self::Vs2026),
+            other => bail!("invalid msvc vs value '{other}'; valid values: vs2019, vs2022, vs2026"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Vs2019 => "vs2019",
+            Self::Vs2022 => "vs2022",
+            Self::Vs2026 => "vs2026",
+        }
+    }
+
+    fn channel(self) -> &'static str {
+        match self {
+            Self::Vs2019 => "16",
+            Self::Vs2022 => "17",
+            Self::Vs2026 => "18",
+        }
     }
 }
 
@@ -394,294 +373,99 @@ impl MsvcProfile {
     }
 }
 
-impl LocaleSelection {
-    fn as_key(&self) -> String {
-        match self {
-            LocaleSelection::All => "all".to_string(),
-            LocaleSelection::Some(locales) => locales.join(","),
-        }
-    }
-
-    fn package_languages(
-        &self,
-        manifest: &VsManifest,
-        package_id: &str,
-    ) -> Result<Vec<Option<String>>> {
-        match self {
-            LocaleSelection::All => {
-                let mut languages = manifest
-                    .packages
-                    .iter()
-                    .filter(|pkg| pkg.id.eq_ignore_ascii_case(package_id))
-                    .map(|pkg| pkg.language.clone())
-                    .collect::<Vec<_>>();
-                languages.sort();
-                languages.dedup();
-                if languages.is_empty() {
-                    bail!("package not found in manifest: {package_id}");
-                }
-                Ok(languages)
-            }
-            LocaleSelection::Some(locales) => {
-                let mut languages = Vec::new();
-                for locale in locales {
-                    if manifest.packages.iter().any(|pkg| {
-                        pkg.id.eq_ignore_ascii_case(package_id)
-                            && pkg.language.as_deref() == Some(locale.as_str())
-                    }) {
-                        languages.push(Some(locale.clone()));
-                    } else if manifest.packages.iter().any(|pkg| {
-                        pkg.id.eq_ignore_ascii_case(package_id) && pkg.language.is_none()
-                    }) {
-                        languages.push(None);
-                    } else {
-                        languages.push(Some(locale.clone()));
-                    }
-                }
-                Ok(languages)
-            }
-        }
-    }
-}
-
 fn select_msvc_packages(
     resolved: &ResolvedMsvcToolset,
     selection: &MsvcSelection,
 ) -> Result<Vec<PackageRequest>> {
-    if selection.profile == MsvcProfile::Full {
-        return select_full_family_packages(resolved);
-    }
-
     let mut selected = BTreeSet::new();
-    add_standard_packages(&mut selected, resolved, selection)?;
-    add_custom_packages(&mut selected, resolved, selection)?;
-    include_declared_metadata_dependencies(&mut selected, resolved, selection)?;
-    Ok(selected.into_iter().collect())
-}
 
-fn select_full_family_packages(resolved: &ResolvedMsvcToolset) -> Result<Vec<PackageRequest>> {
-    let prefix = format!("Microsoft.VC.{}.", resolved.package_id_version).to_lowercase();
-    let selected: BTreeSet<_> = resolved
-        .manifest
-        .packages
-        .iter()
-        .filter(|pkg| pkg.id.to_lowercase().starts_with(&prefix))
-        .map(|pkg| PackageRequest {
-            id: pkg.id.clone(),
-            language: pkg.language.clone(),
-        })
-        .collect();
-    if selected.is_empty() {
-        bail!(
-            "no MSVC packages found for package family {}",
-            resolved.package_id_version
-        );
+    match selection.profile {
+        MsvcProfile::Standard => {
+            for pattern in STANDARD_PATTERNS {
+                add_pattern_matches(&mut selected, resolved, pattern)?;
+            }
+            for pattern in &selection.extras {
+                add_pattern_matches(&mut selected, resolved, pattern)?;
+            }
+        }
+        MsvcProfile::Custom => {
+            for pattern in &selection.include {
+                add_pattern_matches(&mut selected, resolved, pattern)?;
+            }
+        }
+        MsvcProfile::Full => add_full_family_matches(&mut selected, resolved)?,
     }
+
+    include_declared_metadata_dependencies(&mut selected, resolved)?;
     Ok(selected.into_iter().collect())
 }
 
-fn add_standard_packages(
+fn add_full_family_matches(
     selected: &mut BTreeSet<PackageRequest>,
     resolved: &ResolvedMsvcToolset,
-    selection: &MsvcSelection,
 ) -> Result<()> {
-    let ver = &resolved.package_id_version;
-    add_package(selected, format!("Microsoft.VC.{ver}.CRT.Headers.base"));
-    for host in &selection.hosts {
-        for target in &selection.targets {
-            add_package(
-                selected,
-                format!(
-                    "Microsoft.VC.{ver}.Tools.Host{}.Target{}.base",
-                    tool_arch(host),
-                    tool_arch(target)
-                ),
-            );
+    let before = selected.len();
+    for pkg in &resolved.manifest.packages {
+        if is_resolved_package(pkg, resolved)
+            && starts_with_ignore_ascii_case(&pkg.id, &resolved.family_prefix)
+        {
+            selected.insert(package_request(pkg));
         }
     }
-    for target in &selection.targets {
-        let arch = crt_arch(target);
-        for crt_lib in &selection.crt_libs {
-            match crt_lib.as_str() {
-                "desktop" => add_package(
-                    selected,
-                    format!("Microsoft.VC.{ver}.CRT.{arch}.Desktop.base"),
-                ),
-                "store" => add_package(
-                    selected,
-                    format!("Microsoft.VC.{ver}.CRT.{arch}.Store.base"),
-                ),
-                "onecore" => add_package(
-                    selected,
-                    format!("Microsoft.VC.{ver}.CRT.{arch}.OneCore.Desktop.base"),
-                ),
-                "spectre" => add_package(
-                    selected,
-                    format!("Microsoft.VC.{ver}.CRT.{arch}.Desktop.spectre.base"),
-                ),
-                "debug" => add_package(
-                    selected,
-                    format!("Microsoft.VC.{ver}.CRT.{arch}.Desktop.debug.base"),
-                ),
-                _ => unreachable!("validated crt_lib"),
-            }
-        }
-        for runtime in &selection.runtimes {
-            let redist_arch = redist_arch(target);
-            match runtime.as_str() {
-                "crt" => add_package(
-                    selected,
-                    format!("Microsoft.VC.{ver}.CRT.Redist.{redist_arch}.base"),
-                ),
-                "crt_spectre" => add_package(
-                    selected,
-                    format!("Microsoft.VC.{ver}.CRT.Redist.{redist_arch}.spectre.base"),
-                ),
-                "mfc" => add_package(
-                    selected,
-                    format!("Microsoft.VC.{ver}.MFC.Redist.{redist_arch}.base"),
-                ),
-                "mfc_spectre" => add_package(
-                    selected,
-                    format!("Microsoft.VC.{ver}.MFC.Redist.{redist_arch}.Spectre.base"),
-                ),
-                _ => unreachable!("validated runtime"),
-            }
-        }
+    if selected.len() == before {
+        bail!(
+            "no MSVC packages found for package family prefix {}",
+            resolved.family_prefix
+        );
     }
     Ok(())
 }
 
-fn add_custom_packages(
+fn add_pattern_matches(
     selected: &mut BTreeSet<PackageRequest>,
     resolved: &ResolvedMsvcToolset,
-    selection: &MsvcSelection,
+    pattern: &str,
 ) -> Result<()> {
-    let ver = &resolved.package_id_version;
-    for feature in &selection.features {
-        match feature.as_str() {
-            "atl" => {
-                add_package(selected, format!("Microsoft.VC.{ver}.ATL.Headers.base"));
-                for target in &selection.targets {
-                    add_package(
-                        selected,
-                        format!("Microsoft.VC.{ver}.ATL.{}.base", library_arch(target)),
-                    );
-                }
-            }
-            "atl_spectre" => {
-                add_package(selected, format!("Microsoft.VC.{ver}.ATL.Headers.base"));
-                for target in &selection.targets {
-                    add_package(
-                        selected,
-                        format!(
-                            "Microsoft.VC.{ver}.ATL.{}.Spectre.base",
-                            library_arch(target)
-                        ),
-                    );
-                }
-            }
-            "mfc" => {
-                add_package(selected, format!("Microsoft.VC.{ver}.MFC.Headers.base"));
-                for target in &selection.targets {
-                    add_package(
-                        selected,
-                        format!("Microsoft.VC.{ver}.MFC.{}.base", library_arch(target)),
-                    );
-                }
-            }
-            "mfc_spectre" => {
-                add_package(selected, format!("Microsoft.VC.{ver}.MFC.Headers.base"));
-                for target in &selection.targets {
-                    add_package(
-                        selected,
-                        format!(
-                            "Microsoft.VC.{ver}.MFC.{}.Spectre.base",
-                            library_arch(target)
-                        ),
-                    );
-                }
-            }
-            "mfc_mbcs" => {
-                add_package(selected, format!("Microsoft.VC.{ver}.MFC.MBCS.base"));
-                for target in &selection.targets {
-                    add_package(
-                        selected,
-                        format!("Microsoft.VC.{ver}.MFC.MBCS.{}.base", library_arch(target)),
-                    );
-                }
-            }
-            "asan" => {
-                add_package(selected, format!("Microsoft.VC.{ver}.ASAN.Headers.base"));
-                for target in &selection.targets {
-                    add_package(
-                        selected,
-                        format!("Microsoft.VC.{ver}.ASAN.{}.base", library_arch(target)),
-                    );
-                }
-            }
-            "pgo" => {
-                add_package(selected, format!("Microsoft.VC.{ver}.PGO.Headers.base"));
-                for target in &selection.targets {
-                    add_package(
-                        selected,
-                        format!("Microsoft.VC.{ver}.PGO.{}.base", library_arch(target)),
-                    );
-                }
-                for host in &selection.hosts {
-                    for target in &selection.targets {
-                        add_package(
-                            selected,
-                            format!(
-                                "Microsoft.VC.{ver}.Premium.Tools.Host{}.Target{}.base",
-                                tool_arch(host),
-                                tool_arch(target)
-                            ),
-                        );
-                    }
-                }
-            }
-            "cli" => {
-                add_package(selected, format!("Microsoft.VC.{ver}.CLI.Source.base"));
-                for target in &selection.targets {
-                    add_package(
-                        selected,
-                        format!("Microsoft.VC.{ver}.CLI.{}.base", library_arch(target)),
-                    );
-                }
-            }
-            "code_analysis" => {
-                add_package(selected, format!("Microsoft.VC.{ver}.CA.Rulesets.base"));
-                for host in &selection.hosts {
-                    for target in &selection.targets {
-                        add_package(
-                            selected,
-                            format!(
-                                "Microsoft.VC.{ver}.CA.Ext.Host{}.Target{}.base",
-                                tool_arch(host),
-                                tool_arch(target)
-                            ),
-                        );
-                    }
-                }
-            }
-            "dia_sdk" => add_package(selected, format!("Microsoft.VC.{ver}.DIA.SDK")),
-            "source" => {
-                add_package(selected, format!("Microsoft.VC.{ver}.CRT.Source.base"));
-                add_package(selected, format!("Microsoft.VC.{ver}.ATL.Source.base"));
-                add_package(selected, format!("Microsoft.VC.{ver}.MFC.Source.base"));
-                add_package(selected, format!("Microsoft.VC.{ver}.CLI.Source.base"));
-            }
-            _ => unreachable!("validated feature"),
+    if pattern.is_empty() {
+        bail!("msvc package patterns may not be empty");
+    }
+
+    let raw_pattern = pattern.starts_with("Microsoft.");
+    let mut matched = 0usize;
+    for pkg in &resolved.manifest.packages {
+        if !is_resolved_package(pkg, resolved) {
+            continue;
+        }
+
+        let matches = if raw_pattern {
+            glob_matches(pattern, &pkg.id)
+        } else if starts_with_ignore_ascii_case(&pkg.id, &resolved.family_prefix) {
+            let key = &pkg.id[resolved.family_prefix.len()..];
+            glob_matches(pattern, key)
+        } else {
+            false
+        };
+
+        if matches {
+            matched += 1;
+            selected.insert(package_request(pkg));
         }
     }
+
+    if matched == 0 {
+        bail!(
+            "msvc package pattern '{pattern}' matched no packages for resolved family {} ({})",
+            resolved.family_prefix,
+            resolved.package_version
+        );
+    }
+
     Ok(())
 }
 
 fn include_declared_metadata_dependencies(
     selected: &mut BTreeSet<PackageRequest>,
     resolved: &ResolvedMsvcToolset,
-    selection: &MsvcSelection,
 ) -> Result<()> {
     loop {
         let current: Vec<_> = selected.iter().cloned().collect();
@@ -690,32 +474,11 @@ fn include_declared_metadata_dependencies(
             let Some(pkg) = find_requested_package(&resolved.manifest, &request)? else {
                 bail!("package not found in manifest: {}", request.id);
             };
-            let mut has_resource_dependency = false;
             for dep_id in pkg.dependencies.keys() {
                 let dep_lower = dep_id.to_lowercase();
-                if is_resource_dependency(&dep_lower) {
-                    has_resource_dependency = true;
-                    for language in selection
-                        .locales
-                        .package_languages(&resolved.manifest, dep_id)?
-                    {
-                        changed |= selected.insert(PackageRequest {
-                            id: dep_id.clone(),
-                            language,
-                        });
-                    }
-                } else if is_metadata_dependency(&dep_lower) {
-                    changed |= selected.insert(PackageRequest {
-                        id: dep_id.clone(),
-                        language: None,
-                    });
+                if is_metadata_dependency(&dep_lower) {
+                    changed |= add_exact_manifest_id(selected, resolved, dep_id)?;
                 }
-            }
-            if is_compiler_tools_package(&request.id) && !has_resource_dependency {
-                bail!(
-                    "MSVC package {} has no resource package dependency",
-                    request.id
-                );
             }
         }
         if !changed {
@@ -725,8 +488,35 @@ fn include_declared_metadata_dependencies(
     Ok(())
 }
 
-fn add_package(selected: &mut BTreeSet<PackageRequest>, id: String) {
-    selected.insert(PackageRequest { id, language: None });
+fn add_exact_manifest_id(
+    selected: &mut BTreeSet<PackageRequest>,
+    resolved: &ResolvedMsvcToolset,
+    id: &str,
+) -> Result<bool> {
+    let mut found = false;
+    let mut changed = false;
+    for pkg in &resolved.manifest.packages {
+        if is_resolved_package(pkg, resolved) && pkg.id.eq_ignore_ascii_case(id) {
+            found = true;
+            changed |= selected.insert(package_request(pkg));
+        }
+    }
+    if !found {
+        bail!("declared MSVC metadata dependency not found in manifest: {id}");
+    }
+    Ok(changed)
+}
+
+fn package_request(pkg: &vs_manifest::Package) -> PackageRequest {
+    PackageRequest {
+        id: pkg.id.clone(),
+        version: pkg.version.clone(),
+        language: pkg.language.clone(),
+    }
+}
+
+fn is_resolved_package(pkg: &vs_manifest::Package, resolved: &ResolvedMsvcToolset) -> bool {
+    pkg.version.as_deref() == Some(resolved.package_version.as_str())
 }
 
 /// Look up each package id in the manifest and gather all its payloads.
@@ -767,36 +557,75 @@ fn find_requested_package<'a>(
             .packages
             .iter()
             .find(|pkg| {
-                pkg.id.eq_ignore_ascii_case(&request.id)
+                request_matches_package(request, pkg)
                     && pkg.language.as_deref() == Some(language.as_str())
             })
             .or_else(|| {
                 manifest
                     .packages
                     .iter()
-                    .find(|pkg| pkg.id.eq_ignore_ascii_case(&request.id) && pkg.language.is_none())
+                    .find(|pkg| request_matches_package(request, pkg) && pkg.language.is_none())
             }));
     }
-    Ok(manifest.find_package(&request.id))
+    Ok(manifest
+        .packages
+        .iter()
+        .find(|pkg| request_matches_package(request, pkg)))
 }
 
-fn is_resource_dependency(dep_lower: &str) -> bool {
-    dep_lower.starts_with("microsoft.vc.")
-        && (dep_lower.contains(".res.") || dep_lower.contains(".resources"))
-}
-
-fn is_compiler_tools_package(package_id: &str) -> bool {
-    let lower = package_id.to_lowercase();
-    lower.starts_with("microsoft.vc.")
-        && lower.contains(".tools.host")
-        && lower.ends_with(".base")
-        && !lower.contains(".premium.tools.")
-        && !lower.contains(".res.")
+fn request_matches_package(request: &PackageRequest, pkg: &vs_manifest::Package) -> bool {
+    pkg.id.eq_ignore_ascii_case(&request.id)
+        && request
+            .version
+            .as_deref()
+            .map_or(true, |version| pkg.version.as_deref() == Some(version))
 }
 
 fn is_metadata_dependency(dep_lower: &str) -> bool {
     dep_lower.starts_with("microsoft.vc.")
-        && (dep_lower.contains(".props") || dep_lower.contains(".servicing"))
+        && (dep_lower.contains(".res.")
+            || dep_lower.contains(".resources")
+            || dep_lower.contains(".props")
+            || dep_lower.contains(".servicing"))
+}
+
+fn family_prefix_from_compiler_package(package_id: &str) -> Result<String> {
+    let lower = package_id.to_lowercase();
+    if !lower.starts_with("microsoft.vc.") || !lower.ends_with(COMPILER_PACKAGE_SUFFIX_LOWER) {
+        bail!(
+            "unsupported MSVC compiler package id '{package_id}'; expected Microsoft.VC.<family>{COMPILER_PACKAGE_SUFFIX}"
+        );
+    }
+    let family = &package_id[..package_id.len() - COMPILER_PACKAGE_SUFFIX.len()];
+    Ok(format!("{family}."))
+}
+
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value.len() >= prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let text = text.to_ascii_lowercase();
+    let p = pattern.as_bytes();
+    let t = text.as_bytes();
+    let mut dp = vec![vec![false; t.len() + 1]; p.len() + 1];
+    dp[0][0] = true;
+    for i in 1..=p.len() {
+        if p[i - 1] == b'*' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+    for i in 1..=p.len() {
+        for j in 1..=t.len() {
+            dp[i][j] = match p[i - 1] {
+                b'*' => dp[i - 1][j] || dp[i][j - 1],
+                b'?' => dp[i - 1][j - 1],
+                literal => literal == t[j - 1] && dp[i - 1][j - 1],
+            };
+        }
+    }
+    dp[p.len()][t.len()]
 }
 
 fn option_str<'a>(options: &'a toml::Table, key: &str) -> Result<Option<&'a str>> {
@@ -831,12 +660,19 @@ fn option_string_list(options: &toml::Table, key: &str, default: &[&str]) -> Res
     Ok(out)
 }
 
-fn validate_values(key: &str, values: &[String], valid: &[&str]) -> Result<()> {
-    for value in values {
-        if !valid.contains(&value.as_str()) {
+fn reject_removed_options(options: &toml::Table) -> Result<()> {
+    for key in [
+        "vs_channel",
+        "hosts",
+        "targets",
+        "locales",
+        "crt_libs",
+        "runtimes",
+        "features",
+    ] {
+        if options.contains_key(key) {
             bail!(
-                "invalid msvc {key} value '{value}'; valid values: {}",
-                valid.join(", ")
+                "msvc option '{key}' is not supported; use profile='standard' with 'extras', profile='custom' with 'include', or profile='full'"
             );
         }
     }
@@ -855,46 +691,24 @@ fn insert_string_array(options: &mut toml::Table, key: &str, values: &[String]) 
     );
 }
 
-fn tool_arch(arch: &str) -> &'static str {
-    match arch {
-        "x64" => "X64",
-        "x86" => "X86",
-        "arm64" => "ARM64",
-        _ => unreachable!("validated architecture"),
+fn msvc_fingerprint(version: &str, vs: VsVersion, packages: &[PackageRequest]) -> String {
+    let mut package_key = String::new();
+    for package in packages {
+        package_key.push_str(&package.id);
+        package_key.push('\t');
+        if let Some(version) = &package.version {
+            package_key.push_str(version);
+        }
+        package_key.push('\t');
+        if let Some(language) = &package.language {
+            package_key.push_str(language);
+        }
+        package_key.push('\n');
     }
-}
-
-fn crt_arch(arch: &str) -> &'static str {
-    match arch {
-        "x64" => "x64",
-        "x86" => "x86",
-        "arm64" => "ARM64",
-        _ => unreachable!("validated architecture"),
-    }
-}
-
-fn library_arch(arch: &str) -> &'static str {
-    match arch {
-        "x64" => "X64",
-        "x86" => "X86",
-        "arm64" => "ARM64",
-        _ => unreachable!("validated architecture"),
-    }
-}
-
-fn redist_arch(arch: &str) -> &'static str {
-    match arch {
-        "x64" => "X64",
-        "x86" => "X86",
-        "arm64" => "ARM64",
-        _ => unreachable!("validated architecture"),
-    }
-}
-
-fn msvc_fingerprint(version: &str, vs_channel: &str, selection: &MsvcSelection) -> String {
+    let package_hash = xxh3_64(package_key.as_bytes());
     sanitize_fingerprint(&format!(
-        "msvc-{version}-{vs_channel}-{}",
-        selection.normalized_key()
+        "msvc-{version}-{}-{package_hash:016x}",
+        vs.as_str()
     ))
 }
 
@@ -923,6 +737,7 @@ fn resolved_options(
 ) -> toml::Table {
     selection.resolved_options(options, resolved_ver)
 }
+
 #[cfg(test)]
 #[path = "msvc_tests.rs"]
 mod tests;

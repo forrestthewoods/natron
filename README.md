@@ -75,12 +75,9 @@ name        = "msvc"
 deploy_dir  = "msvc"
 provider    = "msvc"
 [toolchain.options]
-vs_channel   = "18"            # required; e.g. "17" for VS 2022
+vs            = "vs2026"        # required; vs2019, vs2022, or vs2026
 msvc_version = "14.51.36243"    # optional exact compiler package version
 profile      = "standard"
-hosts        = ["x64"]
-targets      = ["x64"]
-locales      = ["en-US"]
 
 [[toolchain]]
 name        = "windows_sdk"
@@ -105,7 +102,8 @@ block with distinct `name` and `deploy_dir`.
   `https://ziglang.org/download/index.json`, sha-verified via the index.
 - **`msvc`**: extract MSVC compiler, CRT, redistributable runtime, and
   optional native C++ feature packages from a Visual Studio channel
-  manifest. Required `vs_channel`. Optional `msvc_version`; if omitted,
+  manifest. Required `vs` (`vs2019`, `vs2022`, or `vs2026`). Optional
+  `msvc_version`; if omitted,
   natron installs the latest MSVC toolset listed by Microsoft's live
   channel manifest. If pinned, `msvc_version` is the exact Visual Studio
   compiler package version, such as `14.51.36243`, and natron installs
@@ -121,80 +119,82 @@ block with distinct `name` and `deploy_dir`.
 ### MSVC package selection
 
 MSVC's Visual Studio manifest contains hundreds of internal packages for
-one toolset family. natron exposes stable developer-level options instead
-of requiring raw Microsoft package IDs.
+one toolset family. natron resolves the exact compiler package first, derives
+that package family's `Microsoft.VC.<family>.` prefix, then selects real
+manifest packages with simple glob patterns.
 
 ```toml
 [toolchain.options]
-vs_channel   = "18"
+vs           = "vs2026"
 msvc_version = "14.52.36328"
-
-profile = "standard"
-hosts   = ["x64"]
-targets = ["x64"]
-locales = ["en-US"]
+profile      = "standard"
 ```
 
 Profiles:
 
 - `standard`: normal native C/C++ developer toolchain. Installs compiler
-  tools for each host/target pair, selected compiler resources, CRT
-  headers, desktop + store CRT libs, CRT redist DLLs, and tiny declared
-  `Props.*` / `Servicing.*` metadata dependencies.
-- `custom`: same host/target/locales model, but `crt_libs`, `runtimes`,
-  and `features` are explicit.
+  tools for x64-host/x64-target, compiler resources, CRT headers, desktop +
+  store CRT libs, CRT redist DLLs, and tiny declared resource / props /
+  servicing metadata dependencies.
+- `custom`: only the package patterns listed in `include`.
 - `full`: every `Microsoft.VC.<resolved-family>.*` package in the exact
   resolved MSVC family. This is large; for MSVC `14.52` it is about 11 GiB
   deployed.
 
-Custom selection example:
+Standard with extras:
 
 ```toml
 [toolchain.options]
-vs_channel   = "18"
+vs           = "vs2026"
 msvc_version = "14.52.36328"
+profile      = "standard"
 
-profile = "custom"
-hosts   = ["x64", "arm64"]
-targets = ["x64", "arm64"]
-locales = ["en-US"]
+# Patterns without a Microsoft.* prefix match after stripping the resolved
+# family prefix. For 14.52, "ATL.*.base" matches Microsoft.VC.14.52.ATL.*.base.
+extras = [
+  "ATL.*.base",
+  "MFC.*.base",
+  "ASAN.*.base",
+]
+```
 
-crt_libs = ["desktop", "store"]
-runtimes = ["crt"]
-features = ["atl", "mfc", "asan", "pgo", "code_analysis"]
+Custom exact selection:
+
+```toml
+[toolchain.options]
+vs           = "vs2026"
+msvc_version = "14.52.36328"
+profile      = "custom"
+
+include = [
+  "Tools.HostX64.TargetX64.base",
+  "Tools.HostX64.TargetX64.Res*",
+  "CRT.Headers.base",
+  "CRT.x64.Desktop.base",
+  "CRT.Redist.X64.base",
+  "ATL.X64.base",
+]
 ```
 
 Full family mirror:
 
 ```toml
 [toolchain.options]
-vs_channel   = "18"
+vs           = "vs2026"
 msvc_version = "14.52.36328"
 profile      = "full"
 ```
 
-Supported values:
+Pattern rules:
 
-- `hosts`: `x64`, `x86`, `arm64`.
-- `targets`: `x64`, `x86`, `arm64`.
-- `locales`: concrete VS locales like `en-US`, or `["all"]`.
-- `crt_libs`: `desktop`, `store`, `onecore`, `spectre`, `debug`.
-- `runtimes`: `crt`, `crt_spectre`, `mfc`, `mfc_spectre`.
-- `features`: `atl`, `atl_spectre`, `mfc`, `mfc_spectre`, `mfc_mbcs`,
-  `asan`, `pgo`, `cli`, `code_analysis`, `dia_sdk`, `source`.
-
-Feature notes:
-
-- `atl`: Active Template Library support, mostly for COM-heavy Windows C++.
-- `mfc`: Microsoft Foundation Classes, the classic Win32 C++ app framework.
-- `asan`: AddressSanitizer runtime/support for memory bug detection.
-- `pgo`: profile-guided optimization tools and support files, including
-  Microsoft packages named `Premium.Tools.*` internally.
-- `cli`: C++/CLI support for `/clr` native/.NET interop, not command-line
-  tools.
-- `code_analysis`: MSVC `/analyze` static analysis engine and rulesets.
-- `dia_sdk`: Debug Interface Access SDK.
-- `source`: Microsoft source payloads for CRT/ATL/MFC/CLI when available.
+- `*` matches any characters; `?` matches one character.
+- Matching is case-insensitive.
+- Patterns starting with `Microsoft.` match raw full package IDs for the
+  resolved exact package version. This is an escape hatch for packages outside
+  the resolved `Microsoft.VC.<family>.` prefix, such as
+  `Microsoft.VC.Preview.DIA.*`.
+- Every user-supplied pattern must match at least one package, otherwise the
+  install fails instead of silently producing a partial toolchain.
 
 ## Deploy modes
 
