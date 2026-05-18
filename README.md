@@ -77,6 +77,10 @@ provider    = "msvc"
 [toolchain.options]
 vs_channel   = "18"            # required; e.g. "17" for VS 2022
 msvc_version = "14.51.36243"    # optional exact compiler package version
+profile      = "standard"
+hosts        = ["x64"]
+targets      = ["x64"]
+locales      = ["en-US"]
 
 [[toolchain]]
 name        = "windows_sdk"
@@ -99,20 +103,98 @@ block with distinct `name` and `deploy_dir`.
   `asset`. Optional `version` (display), `sha256`, `archive`, `strip_prefix`.
 - **`zig`**: look up `version` + `platform` in
   `https://ziglang.org/download/index.json`, sha-verified via the index.
-- **`msvc`**: extract a minimal x64 MSVC compiler + CRT toolchain from a
-  Visual Studio channel manifest. Required `vs_channel`. Optional
-  `msvc_version`; if omitted, natron installs the latest MSVC toolset
-  listed by Microsoft's live channel manifest. If pinned, `msvc_version`
-  is the exact Visual Studio compiler package version, such as
-  `14.51.36243`, and natron installs that compiler package version or
-  fails. For older pinned versions no longer listed by Microsoft, natron
-  also checks the unofficial
+- **`msvc`**: extract MSVC compiler, CRT, redistributable runtime, and
+  optional native C++ feature packages from a Visual Studio channel
+  manifest. Required `vs_channel`. Optional `msvc_version`; if omitted,
+  natron installs the latest MSVC toolset listed by Microsoft's live
+  channel manifest. If pinned, `msvc_version` is the exact Visual Studio
+  compiler package version, such as `14.51.36243`, and natron installs
+  that compiler package version or fails. For older pinned versions no
+  longer listed by Microsoft, natron also checks the unofficial
   [`roblabla/msvc-manifest-history`][mh] archive; pinned installs never
   silently fall back to latest.
 - **`windows_sdk`**: extract Windows SDK headers + libs from a VS channel
   manifest. Required `vs_channel`. Optional `sdk_version`.
 
 [mh]: https://github.com/roblabla/msvc-manifest-history
+
+### MSVC package selection
+
+MSVC's Visual Studio manifest contains hundreds of internal packages for
+one toolset family. natron exposes stable developer-level options instead
+of requiring raw Microsoft package IDs.
+
+```toml
+[toolchain.options]
+vs_channel   = "18"
+msvc_version = "14.52.36328"
+
+profile = "standard"
+hosts   = ["x64"]
+targets = ["x64"]
+locales = ["en-US"]
+```
+
+Profiles:
+
+- `standard`: normal native C/C++ developer toolchain. Installs compiler
+  tools for each host/target pair, selected compiler resources, CRT
+  headers, desktop + store CRT libs, CRT redist DLLs, and tiny declared
+  `Props.*` / `Servicing.*` metadata dependencies.
+- `custom`: same host/target/locales model, but `crt_libs`, `runtimes`,
+  and `features` are explicit.
+- `full`: every `Microsoft.VC.<resolved-family>.*` package in the exact
+  resolved MSVC family. This is large; for MSVC `14.52` it is about 11 GiB
+  deployed.
+
+Custom selection example:
+
+```toml
+[toolchain.options]
+vs_channel   = "18"
+msvc_version = "14.52.36328"
+
+profile = "custom"
+hosts   = ["x64", "arm64"]
+targets = ["x64", "arm64"]
+locales = ["en-US"]
+
+crt_libs = ["desktop", "store"]
+runtimes = ["crt"]
+features = ["atl", "mfc", "asan", "pgo", "code_analysis"]
+```
+
+Full family mirror:
+
+```toml
+[toolchain.options]
+vs_channel   = "18"
+msvc_version = "14.52.36328"
+profile      = "full"
+```
+
+Supported values:
+
+- `hosts`: `x64`, `x86`, `arm64`.
+- `targets`: `x64`, `x86`, `arm64`.
+- `locales`: concrete VS locales like `en-US`, or `["all"]`.
+- `crt_libs`: `desktop`, `store`, `onecore`, `spectre`, `debug`.
+- `runtimes`: `crt`, `crt_spectre`, `mfc`, `mfc_spectre`.
+- `features`: `atl`, `atl_spectre`, `mfc`, `mfc_spectre`, `mfc_mbcs`,
+  `asan`, `pgo`, `cli`, `code_analysis`, `dia_sdk`, `source`.
+
+Feature notes:
+
+- `atl`: Active Template Library support, mostly for COM-heavy Windows C++.
+- `mfc`: Microsoft Foundation Classes, the classic Win32 C++ app framework.
+- `asan`: AddressSanitizer runtime/support for memory bug detection.
+- `pgo`: profile-guided optimization tools and support files, including
+  Microsoft packages named `Premium.Tools.*` internally.
+- `cli`: C++/CLI support for `/clr` native/.NET interop, not command-line
+  tools.
+- `code_analysis`: MSVC `/analyze` static analysis engine and rulesets.
+- `dia_sdk`: Debug Interface Access SDK.
+- `source`: Microsoft source payloads for CRT/ATL/MFC/CLI when available.
 
 ## Deploy modes
 

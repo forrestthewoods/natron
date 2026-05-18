@@ -30,7 +30,14 @@ fn msvc_provider_pinned_version_fast_path_no_network() {
     let tmp = TempDir::new().unwrap();
     let cache = Cache::at(tmp.path().join("c"));
     cache.ensure_layout().unwrap();
-    let fp = sanitize_fingerprint("msvc-14.50.35731-18");
+    let mut opts = toml::Table::new();
+    opts.insert("vs_channel".into(), toml::Value::String("18".into()));
+    opts.insert(
+        "msvc_version".into(),
+        toml::Value::String("14.50.35731".into()),
+    );
+    let selection = MsvcSelection::from_options(&opts).unwrap();
+    let fp = msvc_fingerprint("14.50.35731", "18", &selection);
     let install_dir = cache.install_dir(&fp);
     std::fs::create_dir_all(install_dir.join("tree")).unwrap();
     let md = crate::cache::InstallMetadata::new(
@@ -42,17 +49,10 @@ fn msvc_provider_pinned_version_fast_path_no_network() {
     md.write(&cache.install_metadata_path(&fp)).unwrap();
 
     let mut ctx = InstallCtx::new(cache);
-    let mut opts = toml::Table::new();
-    opts.insert("vs_channel".into(), toml::Value::String("18".into()));
-    opts.insert(
-        "msvc_version".into(),
-        toml::Value::String("14.50.35731".into()),
-    );
 
     // Use a deliberately invalid template — if the provider tries to
     // hit it, we'll see the failure.
-    let provider =
-        MsvcProvider::with_channel_url_template("file:///never/exists/{channel}");
+    let provider = MsvcProvider::with_channel_url_template("file:///never/exists/{channel}");
     let installed = provider.install(&opts, &mut ctx).unwrap();
     assert!(!installed.freshly_extracted);
     assert_eq!(installed.fingerprint, fp);
@@ -81,7 +81,6 @@ fn pinned_version_resolves_from_live_manifest_first() {
 
     assert_eq!(resolved.package_version, "14.39.33523");
     assert_eq!(resolved.package_id_version, "14.39.17.9");
-    assert!(resolved.base_package_id.contains("14.39.17.9"));
 }
 
 #[test]
@@ -106,7 +105,6 @@ fn pinned_version_falls_back_to_archive_manifest() {
 
     assert_eq!(resolved.package_version, "14.39.33523");
     assert_eq!(resolved.package_id_version, "14.39.17.9");
-    assert!(resolved.base_package_id.contains("14.39.17.9"));
 }
 
 #[test]
@@ -174,7 +172,9 @@ fn pinned_version_matches_package_version_not_package_id_version() {
     let provider = MsvcProvider::with_channel_url_template(file_url(&live_channel))
         .with_archive_manifest_url_template("file:///archive/missing.json");
 
-    let err = provider.resolve_toolset("18", Some("14.51"), &ctx).unwrap_err();
+    let err = provider
+        .resolve_toolset("18", Some("14.51"), &ctx)
+        .unwrap_err();
     let msg = format!("{err:#}");
 
     assert!(msg.contains("14.51"), "got: {msg}");
@@ -191,8 +191,46 @@ fn required_packages_use_resource_dependency_from_manifest() {
                     "version": "14.51.36243",
                     "payloads": [],
                     "dependencies": {
-                        "Microsoft.VC.14.51.Tools.HostX64.TargetX64.Res.base": "14.51.36243"
+                        "Microsoft.VC.14.51.Tools.HostX64.TargetX64.Res.base": "14.51.36243",
+                        "Microsoft.VC.14.51.Props.x64": "14.51.36243",
+                        "Microsoft.VC.14.51.Servicing.Compilers": "14.51.36243"
                     }
+                },
+                {
+                    "id": "Microsoft.VC.14.51.Tools.HostX64.TargetX64.Res.base",
+                    "version": "14.51.36243",
+                    "language": "en-US",
+                    "payloads": []
+                },
+                {
+                    "id": "Microsoft.VC.14.51.CRT.Headers.base",
+                    "version": "14.51.36243",
+                    "payloads": []
+                },
+                {
+                    "id": "Microsoft.VC.14.51.CRT.x64.Desktop.base",
+                    "version": "14.51.36243",
+                    "payloads": []
+                },
+                {
+                    "id": "Microsoft.VC.14.51.CRT.x64.Store.base",
+                    "version": "14.51.36243",
+                    "payloads": []
+                },
+                {
+                    "id": "Microsoft.VC.14.51.CRT.Redist.X64.base",
+                    "version": "14.51.36243",
+                    "payloads": []
+                },
+                {
+                    "id": "Microsoft.VC.14.51.Props.x64",
+                    "version": "14.51.36243",
+                    "payloads": []
+                },
+                {
+                    "id": "Microsoft.VC.14.51.Servicing.Compilers",
+                    "version": "14.51.36243",
+                    "payloads": []
                 }
             ]
         }"#,
@@ -201,19 +239,32 @@ fn required_packages_use_resource_dependency_from_manifest() {
         manifest,
         package_version: "14.51.36243".into(),
         package_id_version: "14.51".into(),
-        base_package_id: "Microsoft.VC.14.51.Tools.HostX64.TargetX64.base".into(),
     };
+    let selection = MsvcSelection::from_options(&toml::Table::new()).unwrap();
 
-    let ids = required_msvc_package_ids(&resolved).unwrap();
+    let ids = select_msvc_packages(&resolved, &selection)
+        .unwrap()
+        .into_iter()
+        .map(|request| (request.id, request.language))
+        .collect::<Vec<_>>();
 
     assert_eq!(
         ids,
         vec![
-            "Microsoft.VC.14.51.Tools.HostX64.TargetX64.base",
-            "Microsoft.VC.14.51.Tools.HostX64.TargetX64.Res.base",
-            "Microsoft.VC.14.51.CRT.Headers.base",
-            "Microsoft.VC.14.51.CRT.x64.Desktop.base",
-            "Microsoft.VC.14.51.CRT.x64.Store.base",
+            ("Microsoft.VC.14.51.CRT.Headers.base".into(), None),
+            ("Microsoft.VC.14.51.CRT.Redist.X64.base".into(), None),
+            ("Microsoft.VC.14.51.CRT.x64.Desktop.base".into(), None),
+            ("Microsoft.VC.14.51.CRT.x64.Store.base".into(), None),
+            ("Microsoft.VC.14.51.Props.x64".into(), None),
+            ("Microsoft.VC.14.51.Servicing.Compilers".into(), None),
+            (
+                "Microsoft.VC.14.51.Tools.HostX64.TargetX64.Res.base".into(),
+                Some("en-US".into()),
+            ),
+            (
+                "Microsoft.VC.14.51.Tools.HostX64.TargetX64.base".into(),
+                None,
+            ),
         ]
     );
 }
@@ -226,6 +277,26 @@ fn missing_resource_dependency_is_clear_error() {
                 "id": "Microsoft.VC.14.51.Tools.HostX64.TargetX64.base",
                 "version": "14.51.36243",
                 "payloads": []
+            },
+            {
+                "id": "Microsoft.VC.14.51.CRT.Headers.base",
+                "version": "14.51.36243",
+                "payloads": []
+            },
+            {
+                "id": "Microsoft.VC.14.51.CRT.x64.Desktop.base",
+                "version": "14.51.36243",
+                "payloads": []
+            },
+            {
+                "id": "Microsoft.VC.14.51.CRT.x64.Store.base",
+                "version": "14.51.36243",
+                "payloads": []
+            },
+            {
+                "id": "Microsoft.VC.14.51.CRT.Redist.X64.base",
+                "version": "14.51.36243",
+                "payloads": []
             }]
         }"#,
     );
@@ -233,14 +304,125 @@ fn missing_resource_dependency_is_clear_error() {
         manifest,
         package_version: "14.51.36243".into(),
         package_id_version: "14.51".into(),
-        base_package_id: "Microsoft.VC.14.51.Tools.HostX64.TargetX64.base".into(),
     };
+    let selection = MsvcSelection::from_options(&toml::Table::new()).unwrap();
 
-    let err = required_msvc_package_ids(&resolved).unwrap_err();
+    let err = select_msvc_packages(&resolved, &selection).unwrap_err();
     assert!(
         err.to_string().contains("resource package dependency"),
         "got: {err:#}"
     );
+}
+
+#[test]
+fn invalid_msvc_feature_is_clear_error() {
+    let mut opts = toml::Table::new();
+    opts.insert("features".into(), toml_array(&["premium_tools"]));
+
+    let err = MsvcSelection::from_options(&opts).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("premium_tools"), "got: {msg}");
+    assert!(msg.contains("pgo"), "got: {msg}");
+}
+
+#[test]
+fn full_profile_selects_every_package_in_resolved_family() {
+    let manifest = parse_msvc_manifest(
+        r#"{
+            "packages": [
+                {"id": "Microsoft.VC.14.52.Tools.HostX64.TargetX64.base", "version": "14.52.36328", "payloads": []},
+                {"id": "Microsoft.VC.14.52.CRT.Headers.Resources.base", "version": "14.52.36328", "language": "en-US", "payloads": []},
+                {"id": "Microsoft.VC.14.52.CRT.Headers.Resources.base", "version": "14.52.36328", "language": "ja-JP", "payloads": []},
+                {"id": "Microsoft.VC.14.51.Tools.HostX64.TargetX64.base", "version": "14.51.36243", "payloads": []},
+                {"id": "Microsoft.VisualStudio.Component.VC.14.52.x86.x64", "payloads": []}
+            ]
+        }"#,
+    );
+    let resolved = ResolvedMsvcToolset {
+        manifest,
+        package_version: "14.52.36328".into(),
+        package_id_version: "14.52".into(),
+    };
+    let mut opts = toml::Table::new();
+    opts.insert("profile".into(), toml::Value::String("full".into()));
+    let selection = MsvcSelection::from_options(&opts).unwrap();
+
+    let selected = select_msvc_packages(&resolved, &selection).unwrap();
+    let ids = selected
+        .iter()
+        .map(|request| (request.id.as_str(), request.language.as_deref()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        ids,
+        vec![
+            (
+                "Microsoft.VC.14.52.CRT.Headers.Resources.base",
+                Some("en-US")
+            ),
+            (
+                "Microsoft.VC.14.52.CRT.Headers.Resources.base",
+                Some("ja-JP")
+            ),
+            ("Microsoft.VC.14.52.Tools.HostX64.TargetX64.base", None),
+        ]
+    );
+}
+
+#[test]
+fn custom_profile_maps_features_to_expected_packages() {
+    let manifest = parse_msvc_manifest(
+        r#"{
+            "packages": [
+                {
+                    "id": "Microsoft.VC.14.52.Tools.HostX64.TargetX64.base",
+                    "version": "14.52.36328",
+                    "payloads": [],
+                    "dependencies": {
+                        "Microsoft.VC.14.52.Tools.HostX64.TargetX64.Res.base": "14.52.36328"
+                    }
+                },
+                {"id": "Microsoft.VC.14.52.Tools.HostX64.TargetX64.Res.base", "version": "14.52.36328", "language": "en-US", "payloads": []},
+                {"id": "Microsoft.VC.14.52.CRT.Headers.base", "version": "14.52.36328", "payloads": []},
+                {"id": "Microsoft.VC.14.52.CRT.x64.Desktop.base", "version": "14.52.36328", "payloads": []},
+                {"id": "Microsoft.VC.14.52.CRT.Redist.X64.base", "version": "14.52.36328", "payloads": []},
+                {"id": "Microsoft.VC.14.52.ATL.Headers.base", "version": "14.52.36328", "payloads": []},
+                {"id": "Microsoft.VC.14.52.ATL.X64.base", "version": "14.52.36328", "payloads": []},
+                {"id": "Microsoft.VC.14.52.PGO.Headers.base", "version": "14.52.36328", "payloads": []},
+                {"id": "Microsoft.VC.14.52.PGO.X64.base", "version": "14.52.36328", "payloads": []},
+                {"id": "Microsoft.VC.14.52.Premium.Tools.HostX64.TargetX64.base", "version": "14.52.36328", "payloads": []},
+                {"id": "Microsoft.VC.14.52.CLI.Source.base", "version": "14.52.36328", "payloads": []},
+                {"id": "Microsoft.VC.14.52.CLI.X64.base", "version": "14.52.36328", "payloads": []},
+                {"id": "Microsoft.VC.14.52.CA.Rulesets.base", "version": "14.52.36328", "payloads": []},
+                {"id": "Microsoft.VC.14.52.CA.Ext.HostX64.TargetX64.base", "version": "14.52.36328", "payloads": []}
+            ]
+        }"#,
+    );
+    let resolved = ResolvedMsvcToolset {
+        manifest,
+        package_version: "14.52.36328".into(),
+        package_id_version: "14.52".into(),
+    };
+    let mut opts = toml::Table::new();
+    opts.insert("profile".into(), toml::Value::String("custom".into()));
+    opts.insert("crt_libs".into(), toml_array(&["desktop"]));
+    opts.insert("runtimes".into(), toml_array(&["crt"]));
+    opts.insert(
+        "features".into(),
+        toml_array(&["atl", "pgo", "cli", "code_analysis"]),
+    );
+    let selection = MsvcSelection::from_options(&opts).unwrap();
+
+    let selected = select_msvc_packages(&resolved, &selection).unwrap();
+    let ids = selected
+        .iter()
+        .map(|request| request.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(ids.contains(&"Microsoft.VC.14.52.ATL.X64.base"));
+    assert!(ids.contains(&"Microsoft.VC.14.52.Premium.Tools.HostX64.TargetX64.base"));
+    assert!(ids.contains(&"Microsoft.VC.14.52.CLI.X64.base"));
+    assert!(ids.contains(&"Microsoft.VC.14.52.CA.Ext.HostX64.TargetX64.base"));
 }
 
 #[test]
@@ -271,7 +453,11 @@ fn pinned_archive_fallback_full_install_extracts_payloads() {
     let installed = provider.install(&opts, &mut ctx).unwrap();
 
     assert!(installed.freshly_extracted);
-    assert_eq!(installed.fingerprint, sanitize_fingerprint("msvc-14.51.36243-18"));
+    let selection = MsvcSelection::from_options(&opts).unwrap();
+    assert_eq!(
+        installed.fingerprint,
+        msvc_fingerprint("14.51.36243", "18", &selection)
+    );
     assert_eq!(
         installed
             .options
@@ -280,11 +466,24 @@ fn pinned_archive_fallback_full_install_extracts_payloads() {
         Some("14.51.36243")
     );
     let raw = ctx.staging_dir().unwrap();
-    assert!(raw.join("VC/Tools/MSVC/14.51.36243/bin/Hostx64/x64/cl.exe").is_file());
-    assert!(raw.join("VC/Tools/MSVC/14.51.36243/bin/Hostx64/x64/clui.dll").is_file());
-    assert!(raw.join("VC/Tools/MSVC/14.51.36243/include/vcruntime.h").is_file());
-    assert!(raw.join("VC/Tools/MSVC/14.51.36243/lib/x64/vcruntime.lib").is_file());
-    assert!(raw.join("VC/Tools/MSVC/14.51.36243/lib/x64/store/store.lib").is_file());
+    assert!(raw
+        .join("VC/Tools/MSVC/14.51.36243/bin/Hostx64/x64/cl.exe")
+        .is_file());
+    assert!(raw
+        .join("VC/Tools/MSVC/14.51.36243/bin/Hostx64/x64/clui.dll")
+        .is_file());
+    assert!(raw
+        .join("VC/Tools/MSVC/14.51.36243/include/vcruntime.h")
+        .is_file());
+    assert!(raw
+        .join("VC/Tools/MSVC/14.51.36243/lib/x64/vcruntime.lib")
+        .is_file());
+    assert!(raw
+        .join("VC/Tools/MSVC/14.51.36243/lib/x64/store/store.lib")
+        .is_file());
+    assert!(raw
+        .join("VC/Redist/MSVC/14.51.36243/x64/Microsoft.VC145.CRT/vcruntime140.dll")
+        .is_file());
 }
 
 fn write_channel_manifest(path: &std::path::Path, vs_manifest_path: &std::path::Path) {
@@ -353,6 +552,11 @@ fn write_installable_msvc_manifest(
             "crt-store.vsix",
             format!("VC/Tools/MSVC/{package_version}/lib/x64/store/store.lib"),
         ),
+        (
+            format!("Microsoft.VC.{id_version}.CRT.Redist.X64.base"),
+            "crt-redist.vsix",
+            format!("VC/Redist/MSVC/{package_version}/x64/Microsoft.VC145.CRT/vcruntime140.dll"),
+        ),
     ];
 
     let json_packages = packages
@@ -401,6 +605,15 @@ fn build_vsix(path: &std::path::Path, entries: &[(&str, &[u8])]) {
 
 fn parse_msvc_manifest(json: &str) -> VsManifest {
     serde_json::from_str(json).unwrap()
+}
+
+fn toml_array(values: &[&str]) -> toml::Value {
+    toml::Value::Array(
+        values
+            .iter()
+            .map(|value| toml::Value::String((*value).to_string()))
+            .collect(),
+    )
 }
 
 fn file_url(path: &std::path::Path) -> String {
