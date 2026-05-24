@@ -30,6 +30,9 @@ natron list                  # show what's deployed in this project
 natron list --cache          # show every install in the global cache
 natron clean --downloads     # empty <cache>/downloads/
 natron clean --all --yes     # nuke the whole cache
+natron msvc versions         # see what MSVC versions exist (live + archive)
+natron msvc packages --vs vs2026 --version 14.51.36223
+natron msvc extract --vs vs2026 --version 14.51.36223 --out C:\temp\msvc
 ```
 
 `natron` with no subcommand defaults to `install`.
@@ -196,6 +199,33 @@ Pattern rules:
   `Microsoft.VC.Preview.DIA.*`.
 - Every user-supplied pattern must match at least one package, otherwise the
   install fails instead of silently producing a partial toolchain.
+
+### MSVC debug commands
+
+MSVC versioning and the per-version package set are awkward enough that
+natron ships dedicated `msvc` subcommands for exploration. None of these
+write to the cache's `installs/` or to project state — they're pure
+discovery.
+
+```bash
+# What MSVC toolset versions are reachable, live + via the archive mirror?
+natron msvc versions
+natron msvc versions --vs vs2026
+
+# Every package in the resolved family at this version, grouped:
+# in-family first, other Microsoft.VC.* at the same version second.
+natron msvc packages --vs vs2026 --version 14.51.36223
+
+# Download + extract every package at a version into one subdirectory per
+# package. Then browse with Explorer, ripgrep, etc. to figure out which
+# package contains the file you're hunting. You manage cleanup.
+natron msvc extract --vs vs2026 --version 14.51.36223 --out C:\temp\msvc
+```
+
+`versions` is non-fatal if either source is unreachable: it prints what it
+got and an error for the missing side. `extract` reuses the global download
+cache, so the bytes are not re-downloaded between runs; re-running into an
+existing `--out` skips packages already present.
 
 ## Deploy modes
 

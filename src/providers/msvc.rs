@@ -32,10 +32,11 @@ const STANDARD_PATTERNS: &[&str] = &[
     "CRT.Redist.X64.base",
 ];
 
-/// Archive mirror for old MSVC manifests. This is an implementation detail
-/// for pinned `msvc_version`: Microsoft live channel manifests are moving
-/// targets and may stop listing older toolsets.
-const ARCHIVE_MANIFEST_URL_TEMPLATE: &str =
+/// Archive mirror for old MSVC manifests. Microsoft live channel manifests
+/// are moving targets and may stop listing older toolsets; pinned
+/// `msvc_version` falls back to this mirror. Also used by the `msvc`
+/// debug CLI to enumerate historical versions.
+pub const ARCHIVE_MANIFEST_URL_TEMPLATE: &str =
     "https://raw.githubusercontent.com/roblabla/msvc-manifest-history/release-{channel}/manifest.json";
 
 pub struct MsvcProvider {
@@ -214,16 +215,7 @@ impl MsvcProvider {
     }
 
     fn fetch_archive_manifest(&self, vs_channel: &str, ctx: &InstallCtx) -> Result<VsManifest> {
-        let url = self
-            .archive_manifest_url_template
-            .replace("{channel}", vs_channel);
-        let path = ctx
-            .download(&url, None)
-            .with_context(|| format!("fetching archived VS manifest from {url}"))?;
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading archived VS manifest {}", path.display()))?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("parsing archived VS manifest {}", path.display()))
+        vs_manifest::fetch_archive_manifest(&self.archive_manifest_url_template, vs_channel, ctx)
     }
 }
 
@@ -594,7 +586,7 @@ fn is_metadata_dependency(dep_lower: &str) -> bool {
             || dep_lower.contains(".servicing"))
 }
 
-fn family_prefix_from_compiler_package(package_id: &str) -> Result<String> {
+pub fn family_prefix_from_compiler_package(package_id: &str) -> Result<String> {
     let lower = package_id.to_lowercase();
     if !lower.starts_with("microsoft.vc.") || !lower.ends_with(COMPILER_PACKAGE_SUFFIX_LOWER) {
         bail!(

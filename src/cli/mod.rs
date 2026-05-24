@@ -9,6 +9,7 @@ use crate::config::DeployMode;
 pub mod clean;
 pub mod install;
 pub mod list;
+pub mod msvc;
 
 #[derive(Debug, Parser)]
 #[command(name = "natron", version, about = "Vendor compiler toolchains into source-controlled projects")]
@@ -37,6 +38,8 @@ pub enum Command {
     List(ListArgs),
     /// Clean cached files.
     Clean(CleanArgs),
+    /// MSVC debug + discovery tooling.
+    Msvc(msvc::MsvcArgs),
 }
 
 #[derive(Debug, Args)]
@@ -141,6 +144,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Install(args) => install::run(&cli.config, &cli.cache_dir, args),
         Command::List(args) => list::run(&cli.config, &cli.cache_dir, args),
         Command::Clean(args) => clean::run(&cli.config, &cli.cache_dir, args),
+        Command::Msvc(args) => msvc::run(&cli.config, &cli.cache_dir, args),
     }
 }
 

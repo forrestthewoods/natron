@@ -110,6 +110,25 @@ pub struct MsvcCandidate {
     pub package_id: String,
 }
 
+/// Fetch a single archived VS manifest. The mirror at
+/// `roblabla/msvc-manifest-history` hosts one manifest.json per branch, which
+/// is a `VsManifest` shape directly (no channel-manifest indirection). The
+/// `url_template` must contain `{channel}` for substitution.
+pub fn fetch_archive_manifest(
+    url_template: &str,
+    vs_channel: &str,
+    ctx: &InstallCtx,
+) -> Result<VsManifest> {
+    let url = url_template.replace("{channel}", vs_channel);
+    let path = ctx
+        .download(&url, None)
+        .with_context(|| format!("fetching archived VS manifest from {url}"))?;
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading archived VS manifest {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("parsing archived VS manifest {}", path.display()))
+}
+
 /// Fetch the channel manifest, follow it to the VS manifest, and return the
 /// fully parsed package list.
 pub fn fetch_vs_manifest(
