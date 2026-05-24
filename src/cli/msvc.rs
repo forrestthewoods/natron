@@ -14,14 +14,22 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Subcommand};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::mpsc;
 
 use crate::cli::resolve_config_path;
+use crate::download;
 use crate::extract;
 use crate::providers::msvc;
 use crate::providers::vs_manifest::{
     self, BuildIndexEntry, MirrorUrls, Package, VsVersion,
 };
 use crate::providers::InstallCtx;
+
+/// Worker pool size for parallel package extraction. Each worker
+/// downloads + unzips one package at a time. 16 matches the rest of
+/// the codebase (vs_manifest::PARALLEL_FETCH_LIMIT).
+const EXTRACT_PARALLELISM: usize = 16;
 
 #[derive(Debug, Args)]
 pub struct MsvcArgs {
@@ -247,35 +255,103 @@ fn run_extract(
         args.out.display(),
     )?;
 
-    let mut extracted = 0usize;
+    // Skip-vs-work partition runs sequentially (just stat()s) so the
+    // skip lines stay grouped at the top in stable order. Work goes to
+    // the parallel pool.
     let mut skipped = 0usize;
+    let mut work: Vec<(String, PathBuf, &Package)> = Vec::new();
     for pkg in to_extract {
         let dir_name = per_package_dir_name(&pkg.id, pkg.language.as_deref());
         let dest = args.out.join(&dir_name);
         if dir_has_content(&dest) {
             writeln!(out, "  skip   {dir_name} (already populated)")?;
             skipped += 1;
-            continue;
+        } else {
+            work.push((dir_name, dest, pkg));
         }
-        std::fs::create_dir_all(&dest)
-            .with_context(|| format!("creating {}", dest.display()))?;
-        for payload in &pkg.payloads {
-            let filename = payload_filename(payload);
-            let archive = ctx
-                .download(&payload.url, payload.sha256.as_deref())
-                .with_context(|| format!("downloading {filename} for {}", pkg.id))?;
-            extract_payload(&archive, &filename, &dest)
-                .with_context(|| format!("extracting {filename} for {}", pkg.id))?;
-        }
-        writeln!(out, "  ok     {dir_name}")?;
-        extracted += 1;
     }
+
+    let extracted = extract_in_parallel(out, &work, &ctx.cache().downloads)?;
 
     writeln!(
         out,
         "\ndone: {extracted} extracted, {skipped} already present\noutput: {}",
         args.out.display(),
     )?;
+    Ok(())
+}
+
+/// Run downloads + extractions across [`EXTRACT_PARALLELISM`] worker
+/// threads. Workers pull job indices off a shared queue, do the
+/// download + extract, and report completion (or the first error) via
+/// an mpsc channel. The main thread drains the channel, printing each
+/// `  ok` line as it arrives so progress is live, and bails on the
+/// first error.
+fn extract_in_parallel(
+    out: &mut dyn std::io::Write,
+    work: &[(String, PathBuf, &Package)],
+    downloads: &Path,
+) -> Result<usize> {
+    let queue: Mutex<Vec<usize>> = Mutex::new((0..work.len()).rev().collect());
+    let (tx, rx) = mpsc::channel::<Result<String>>();
+    let worker_count = EXTRACT_PARALLELISM.min(work.len());
+
+    std::thread::scope(|s| -> Result<usize> {
+        for _ in 0..worker_count {
+            let tx = tx.clone();
+            // Rebind queue as a reference so the `move` closure captures
+            // `&Mutex<_>` by Copy instead of trying to move the Mutex
+            // itself (which would also conflict with cancel() below).
+            let queue = &queue;
+            s.spawn(move || loop {
+                let idx = match queue.lock().unwrap().pop() {
+                    Some(i) => i,
+                    None => return,
+                };
+                let (dir_name, dest, pkg) = &work[idx];
+                let result = extract_one(pkg, dest, downloads).map(|_| dir_name.clone());
+                if tx.send(result).is_err() {
+                    return;
+                }
+            });
+        }
+        drop(tx); // close the sender side so rx ends when workers finish
+
+        // Cancel = drain the queue so in-flight workers exit after their
+        // current task instead of grinding through every remaining job
+        // before scope() can join.
+        let cancel = || queue.lock().unwrap().clear();
+
+        let mut count = 0usize;
+        for msg in rx {
+            match msg {
+                Ok(name) => {
+                    if let Err(e) = writeln!(out, "  ok     {name}") {
+                        cancel();
+                        return Err(e.into());
+                    }
+                    count += 1;
+                }
+                Err(e) => {
+                    cancel();
+                    return Err(e);
+                }
+            }
+        }
+        Ok(count)
+    })
+}
+
+fn extract_one(pkg: &Package, dest: &Path, downloads: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
+    for payload in &pkg.payloads {
+        let filename = payload_filename(payload);
+        let archive = download::fetch(&payload.url, payload.sha256.as_deref(), downloads)
+            .with_context(|| format!("downloading {filename} for {}", pkg.id))?;
+        extract_payload(&archive, &filename, dest)
+            .with_context(|| format!("extracting {filename} for {}", pkg.id))?;
+    }
     Ok(())
 }
 

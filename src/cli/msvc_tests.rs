@@ -374,6 +374,68 @@ fn extract_writes_per_package_dirs_idempotently() {
 }
 
 #[test]
+fn extract_propagates_worker_error() {
+    // The parallel extract pool sends per-worker results through an
+    // mpsc channel. A failing worker must surface its error all the
+    // way out of `run_extract` rather than being silently dropped on
+    // the floor — if the rx loop ever started swallowing Err arms,
+    // the function would return Ok despite a real download/extract
+    // failure. This pins that propagation contract.
+    let tmp = TempDir::new().unwrap();
+    let fixtures = tmp.path().join("vsix");
+    std::fs::create_dir_all(&fixtures).unwrap();
+
+    let id_good = "Microsoft.VC.14.52.18.5.Tools.HostX64.TargetX64.base";
+    let arch_good = fixtures.join("good.vsix");
+    build_vsix(&arch_good, &[("good.bin", id_good.as_bytes())]);
+
+    let id_bad = "Microsoft.VC.14.52.18.5.CRT.Headers.base";
+    // Points at a path we never create — download must fail.
+    let bad_url = file_url(&fixtures.join("does_not_exist.vsix"));
+
+    let pkgs = format!(
+        "{a},{b}",
+        a = pkg_with_payload(id_good, "14.52.36328", &file_url(&arch_good), "good.vsix"),
+        b = pkg_with_payload(id_bad, "14.52.36328", &bad_url, "missing.vsix"),
+    );
+
+    let fx = MirrorFixture::build(
+        tmp.path(),
+        &[(
+            VsVersion::Vs2026,
+            &[FxSnapshot {
+                sha: "abc",
+                date: "2026-05-01T00:00:00Z",
+                build_version: "18.6.11819.183",
+                display_version: "18.6.1",
+                product_line_version: "18",
+                manifest_packages_json: pkgs,
+            }],
+        )],
+    );
+
+    let out_dir = tmp.path().join("out");
+    let ctx = test_ctx(&tmp);
+    let mut buf = Vec::new();
+    let err = run_extract(
+        &ctx,
+        &fx.urls,
+        ExtractArgs {
+            build_version: "18.6.11819.183".into(),
+            out: out_dir,
+        },
+        &mut buf,
+    )
+    .expect_err("missing payload must surface as an error");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("missing.vsix") || msg.contains(id_bad),
+        "expected error to mention the failing payload, got:\n{msg}"
+    );
+}
+
+#[test]
 fn per_package_dir_name_suffixes_language() {
     assert_eq!(
         per_package_dir_name("Microsoft.VC.14.52.Tools.base", None),
