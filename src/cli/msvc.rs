@@ -1,12 +1,15 @@
-//! `natron msvc` — debug + discovery tooling for the MSVC provider.
+//! `natron msvc` — discovery + debug tooling for the MSVC provider.
 //!
-//! Three verbs:
-//! - `versions`: list MSVC toolset versions across VS series (live + archive).
-//! - `packages`: list every package at a given MSVC version.
-//! - `extract`:  download + extract every package at a version into its own
-//!   subdirectory on disk, for browsing with external tools.
+//! Three verbs, all backed by the same roblabla-mirror data path the
+//! provider uses:
 //!
-//! None of these mutate `<cache>/installs/` or the project's state.
+//! - `versions [--vs ...]` — list every Microsoft VS build the mirror has,
+//!   newest-first per series.
+//! - `packages --build-version V` — list every package at one build.
+//! - `extract  --build-version V --out PATH` — download + extract every
+//!   package at one build into its own subdirectory, for grep/Explorer/etc.
+//!
+//! None of these write to `<cache>/installs/` or modify project state.
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Subcommand};
@@ -14,11 +17,11 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::resolve_config_path;
 use crate::extract;
-use crate::providers::vs_manifest::{self, Package, VsManifest, VsVersion};
-use crate::providers::{InstallCtx, msvc};
-
-const HOST: &str = "x64";
-const TARGET: &str = "x64";
+use crate::providers::msvc;
+use crate::providers::vs_manifest::{
+    self, BuildIndexEntry, MirrorUrls, Package, VsVersion,
+};
+use crate::providers::InstallCtx;
 
 #[derive(Debug, Args)]
 pub struct MsvcArgs {
@@ -28,42 +31,35 @@ pub struct MsvcArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum MsvcVerb {
-    /// List MSVC toolset versions across live + archived manifests.
+    /// List Microsoft VS builds available on the mirror.
     Versions(VersionsArgs),
-    /// List every package at a specific MSVC version.
+    /// List every package in one VS build's snapshot manifest.
     Packages(PackagesArgs),
-    /// Download + extract every package at a version into per-package dirs.
+    /// Download + extract every package at one VS build into per-package dirs.
     Extract(ExtractArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct VersionsArgs {
-    /// Limit to one VS series (vs2019, vs2022, or vs2026). Default: all three.
+    /// Limit to one VS series. Default: all three.
     #[arg(long)]
     pub vs: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct PackagesArgs {
-    /// VS series (vs2019, vs2022, or vs2026).
-    #[arg(long)]
-    pub vs: String,
-    /// Exact MSVC package version (e.g. 14.51.36243). Default: latest in
-    /// the live manifest.
-    #[arg(long)]
-    pub version: Option<String>,
+    /// Exact Microsoft VS build_version (e.g. 18.6.11819.183).
+    #[arg(long = "build-version")]
+    pub build_version: String,
 }
 
 #[derive(Debug, Args)]
 pub struct ExtractArgs {
-    /// VS series (vs2019, vs2022, or vs2026).
-    #[arg(long)]
-    pub vs: String,
-    /// Exact MSVC package version (e.g. 14.51.36243).
-    #[arg(long)]
-    pub version: String,
-    /// Output directory. Each package extracts into a subdirectory here.
-    /// The user owns cleanup.
+    /// Exact Microsoft VS build_version.
+    #[arg(long = "build-version")]
+    pub build_version: String,
+    /// Output directory. Each package extracts into its own subdirectory.
+    /// You manage cleanup.
     #[arg(long, value_name = "PATH")]
     pub out: PathBuf,
 }
@@ -74,7 +70,7 @@ pub fn run(
     args: MsvcArgs,
 ) -> Result<()> {
     let ctx = build_ctx(config, cache_dir_override)?;
-    let urls = ChannelUrls::default();
+    let urls = MirrorUrls::default();
     match args.verb {
         MsvcVerb::Versions(a) => run_versions(&ctx, &urls, a, &mut std::io::stdout()),
         MsvcVerb::Packages(a) => run_packages(&ctx, &urls, a, &mut std::io::stdout()),
@@ -82,24 +78,6 @@ pub fn run(
     }
 }
 
-/// Pair of URL templates for the live channel + archive mirror. Pulled into a
-/// struct so tests can swap both at once with `file://` fixtures.
-#[derive(Debug, Clone)]
-struct ChannelUrls {
-    live: String,
-    archive: String,
-}
-
-impl Default for ChannelUrls {
-    fn default() -> Self {
-        Self {
-            live: vs_manifest::DEFAULT_CHANNEL_URL_TEMPLATE.to_string(),
-            archive: msvc::ARCHIVE_MANIFEST_URL_TEMPLATE.to_string(),
-        }
-    }
-}
-
-/// Cache + InstallCtx wiring shared by all three verbs.
 fn build_ctx(
     config: &Option<PathBuf>,
     cache_dir_override: &Option<PathBuf>,
@@ -120,17 +98,17 @@ fn parse_vs(value: &str) -> Result<VsVersion> {
     VsVersion::parse(value).map_err(|e| anyhow!("{e}"))
 }
 
-// ---- versions ---------------------------------------------------------------
+// ---- versions --------------------------------------------------------------
 
 fn run_versions(
     ctx: &InstallCtx,
-    urls: &ChannelUrls,
+    urls: &MirrorUrls,
     args: VersionsArgs,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
     let series: Vec<VsVersion> = match args.vs.as_deref() {
         Some(v) => vec![parse_vs(v)?],
-        None => vec![VsVersion::Vs2019, VsVersion::Vs2022, VsVersion::Vs2026],
+        None => VsVersion::all().to_vec(),
     };
 
     let mut first = true;
@@ -141,181 +119,113 @@ fn run_versions(
         first = false;
         writeln!(out, "{} (channel {})", vs.as_str(), vs.channel())?;
 
-        let live_versions = match vs_manifest::fetch_vs_manifest(&urls.live, vs.channel(), ctx) {
-            Ok(m) => candidate_versions(&m),
-            Err(err) => {
-                writeln!(out, "  live: <error: {err:#}>")?;
-                Vec::new()
-            }
-        };
-        let archive_versions =
-            match vs_manifest::fetch_archive_manifest(&urls.archive, vs.channel(), ctx) {
-                Ok(m) => candidate_versions(&m),
-                Err(err) => {
-                    writeln!(out, "  archive: <error: {err:#}>")?;
-                    Vec::new()
-                }
-            };
-
-        let mut merged: Vec<(String, bool, bool)> = Vec::new();
-        for v in &live_versions {
-            merged.push((v.clone(), true, archive_versions.contains(v)));
+        let entries = vs_manifest::build_index(urls, &[vs], ctx)?;
+        if entries.is_empty() {
+            writeln!(out, "  (no builds found on mirror)")?;
+            continue;
         }
-        for v in &archive_versions {
-            if !live_versions.contains(v) {
-                merged.push((v.clone(), false, true));
-            }
-        }
-        merged.sort_by(|a, b| version_key(&b.0).cmp(&version_key(&a.0)));
-
-        if merged.is_empty() {
-            writeln!(out, "  (no versions discovered)")?;
-        } else {
-            for (ver, in_live, in_archive) in merged {
-                let tag = match (in_live, in_archive) {
-                    (true, true) => "live, archive",
-                    (true, false) => "live",
-                    (false, true) => "archive-only",
-                    (false, false) => unreachable!(),
-                };
-                writeln!(out, "  {ver:20} {tag}")?;
-            }
+        for entry in entries {
+            writeln!(
+                out,
+                "  {bv:20}  VS {display:12}  ({date})",
+                bv = entry.info.build_version,
+                display = entry.info.product_display_version,
+                date = entry.commit.date,
+            )?;
         }
     }
     Ok(())
 }
 
-fn candidate_versions(manifest: &VsManifest) -> Vec<String> {
-    manifest
-        .find_msvc_candidates(HOST, TARGET)
-        .into_iter()
-        .map(|c| c.package_version)
-        .collect()
-}
-
-fn version_key(v: &str) -> Vec<u64> {
-    v.split('.')
-        .map(|s| s.parse::<u64>().unwrap_or(0))
-        .collect()
-}
-
-// ---- packages ---------------------------------------------------------------
+// ---- packages --------------------------------------------------------------
 
 fn run_packages(
     ctx: &InstallCtx,
-    urls: &ChannelUrls,
+    urls: &MirrorUrls,
     args: PackagesArgs,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
-    let vs = parse_vs(&args.vs)?;
-    let resolved = resolve_version_and_family(ctx, urls, vs, args.version.as_deref())?;
+    let (entry, manifest) = resolve_and_load(ctx, urls, &args.build_version)?;
+    let compiler = msvc::find_primary_compiler(&manifest, entry.vs)?;
+    let family = msvc::family_prefix(&compiler.id)?;
 
     let mut in_family: Vec<&Package> = Vec::new();
     let mut out_of_family: Vec<&Package> = Vec::new();
-    for pkg in &resolved.manifest.packages {
-        if pkg.version.as_deref() != Some(resolved.package_version.as_str()) {
-            continue;
-        }
-        if starts_with_ignore_ascii_case(&pkg.id, &resolved.family_prefix) {
+    for pkg in &manifest.packages {
+        if starts_with_ignore_ascii_case(&pkg.id, &family) {
             in_family.push(pkg);
         } else {
             out_of_family.push(pkg);
         }
     }
-    in_family.sort_by(|a, b| {
-        a.id.to_ascii_lowercase()
-            .cmp(&b.id.to_ascii_lowercase())
-            .then_with(|| a.language.cmp(&b.language))
-    });
-    out_of_family.sort_by(|a, b| {
-        a.id.to_ascii_lowercase()
-            .cmp(&b.id.to_ascii_lowercase())
-            .then_with(|| a.language.cmp(&b.language))
-    });
+    in_family.sort_by_key(|p| sort_key(p));
+    out_of_family.sort_by_key(|p| sort_key(p));
 
     writeln!(
         out,
-        "{} ({}) — resolved {} packages in family {}, {} outside",
-        vs.as_str(),
-        resolved.package_version,
+        "{} build {} (VS {}) — {} in family {}, {} outside",
+        entry.vs.as_str(),
+        entry.info.build_version,
+        entry.info.product_display_version,
         in_family.len(),
-        resolved.family_prefix.trim_end_matches('.'),
-        out_of_family.len()
+        family.trim_end_matches('.'),
+        out_of_family.len(),
     )?;
     writeln!(out)?;
     writeln!(out, "== family ==")?;
-    if in_family.is_empty() {
-        writeln!(out, "  (none)")?;
-    } else {
-        for pkg in &in_family {
-            print_package(out, pkg)?;
-        }
-    }
+    print_packages(out, &in_family)?;
     writeln!(out)?;
-    writeln!(out, "== other Microsoft.VC.* at same version ==")?;
-    if out_of_family.is_empty() {
+    writeln!(out, "== other in snapshot ==")?;
+    print_packages(out, &out_of_family)?;
+    Ok(())
+}
+
+fn print_packages(out: &mut dyn std::io::Write, packages: &[&Package]) -> Result<()> {
+    if packages.is_empty() {
         writeln!(out, "  (none)")?;
-    } else {
-        for pkg in &out_of_family {
-            print_package(out, pkg)?;
-        }
+        return Ok(());
+    }
+    for pkg in packages {
+        let lang = pkg
+            .language
+            .as_deref()
+            .map(|l| format!(" [{l}]"))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "  {}{}  ({} payload{})",
+            pkg.id,
+            lang,
+            pkg.payloads.len(),
+            if pkg.payloads.len() == 1 { "" } else { "s" }
+        )?;
     }
     Ok(())
 }
 
-fn print_package(out: &mut dyn std::io::Write, pkg: &Package) -> Result<()> {
-    let lang = pkg
-        .language
-        .as_deref()
-        .map(|l| format!(" [{l}]"))
-        .unwrap_or_default();
-    writeln!(
-        out,
-        "  {}{}  ({} payload{})",
-        pkg.id,
-        lang,
-        pkg.payloads.len(),
-        if pkg.payloads.len() == 1 { "" } else { "s" }
-    )?;
-    Ok(())
-}
-
-fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
-    value.len() >= prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix)
-}
-
-// ---- extract ----------------------------------------------------------------
+// ---- extract ---------------------------------------------------------------
 
 fn run_extract(
     ctx: &InstallCtx,
-    urls: &ChannelUrls,
+    urls: &MirrorUrls,
     args: ExtractArgs,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
-    let vs = parse_vs(&args.vs)?;
-    let resolved = resolve_version_and_family(ctx, urls, vs, Some(&args.version))?;
+    let (entry, manifest) = resolve_and_load(ctx, urls, &args.build_version)?;
     std::fs::create_dir_all(&args.out)
         .with_context(|| format!("creating {}", args.out.display()))?;
 
-    let mut to_extract: Vec<&Package> = resolved
-        .manifest
-        .packages
-        .iter()
-        .filter(|p| p.version.as_deref() == Some(resolved.package_version.as_str()))
-        .collect();
-    to_extract.sort_by(|a, b| {
-        a.id.to_ascii_lowercase()
-            .cmp(&b.id.to_ascii_lowercase())
-            .then_with(|| a.language.cmp(&b.language))
-    });
+    let mut to_extract: Vec<&Package> = manifest.packages.iter().collect();
+    to_extract.sort_by_key(|p| sort_key(p));
 
     writeln!(
         out,
-        "extracting {} packages from msvc {} ({}) -> {}",
+        "extracting {} packages from {} build {} (VS {}) -> {}",
         to_extract.len(),
-        resolved.package_version,
-        vs.as_str(),
-        args.out.display()
+        entry.vs.as_str(),
+        entry.info.build_version,
+        entry.info.product_display_version,
+        args.out.display(),
     )?;
 
     let mut extracted = 0usize;
@@ -331,11 +241,7 @@ fn run_extract(
         std::fs::create_dir_all(&dest)
             .with_context(|| format!("creating {}", dest.display()))?;
         for payload in &pkg.payloads {
-            let filename = payload
-                .file_name
-                .clone()
-                .or_else(|| filename_from_url(&payload.url))
-                .unwrap_or_else(|| "unknown.bin".to_string());
+            let filename = payload_filename(payload);
             let archive = ctx
                 .download(&payload.url, payload.sha256.as_deref())
                 .with_context(|| format!("downloading {filename} for {}", pkg.id))?;
@@ -349,9 +255,25 @@ fn run_extract(
     writeln!(
         out,
         "\ndone: {extracted} extracted, {skipped} already present\noutput: {}",
-        args.out.display()
+        args.out.display(),
     )?;
     Ok(())
+}
+
+// ---- shared helpers --------------------------------------------------------
+
+fn resolve_and_load(
+    ctx: &InstallCtx,
+    urls: &MirrorUrls,
+    build_version: &str,
+) -> Result<(BuildIndexEntry, vs_manifest::VsManifest)> {
+    let entry = vs_manifest::resolve_build_version(urls, build_version, ctx)?;
+    let manifest = vs_manifest::fetch_manifest_at(&urls.raw_base, &entry.commit.sha, ctx)?;
+    Ok((entry, manifest))
+}
+
+fn sort_key(p: &Package) -> (String, Option<String>) {
+    (p.id.to_ascii_lowercase(), p.language.clone())
 }
 
 fn per_package_dir_name(id: &str, language: Option<&str>) -> String {
@@ -368,6 +290,20 @@ fn dir_has_content(p: &Path) -> bool {
     }
 }
 
+fn payload_filename(payload: &vs_manifest::Payload) -> String {
+    if let Some(name) = &payload.file_name {
+        return name.clone();
+    }
+    if let Ok(parsed) = url::Url::parse(&payload.url) {
+        if let Some(seg) = parsed.path_segments().and_then(|mut s| s.next_back()) {
+            if !seg.is_empty() {
+                return seg.to_string();
+            }
+        }
+    }
+    "unknown.bin".to_string()
+}
+
 fn extract_payload(archive: &Path, filename: &str, dest: &Path) -> Result<()> {
     let lower = filename.to_lowercase();
     if lower.ends_with(".vsix") || lower.ends_with(".zip") {
@@ -380,114 +316,8 @@ fn extract_payload(archive: &Path, filename: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn filename_from_url(url: &str) -> Option<String> {
-    let parsed = url::Url::parse(url).ok()?;
-    parsed
-        .path_segments()
-        .and_then(|mut s| s.next_back())
-        .map(|s| s.to_string())
-}
-
-// ---- shared resolution ------------------------------------------------------
-
-/// Mirror of msvc::ResolvedMsvcToolset, kept private to the CLI so the
-/// provider doesn't have to expose its internal shape.
-struct CliResolvedToolset {
-    manifest: VsManifest,
-    package_version: String,
-    family_prefix: String,
-}
-
-/// Resolve a VS channel + optional pinned version to a concrete toolset.
-/// Tries live first, then archive, matching the production provider's order.
-fn resolve_version_and_family(
-    ctx: &InstallCtx,
-    urls: &ChannelUrls,
-    vs: VsVersion,
-    pinned: Option<&str>,
-) -> Result<CliResolvedToolset> {
-    let live = vs_manifest::fetch_vs_manifest(&urls.live, vs.channel(), ctx);
-    let archive = || vs_manifest::fetch_archive_manifest(&urls.archive, vs.channel(), ctx);
-
-    // Try live first.
-    if let Ok(manifest) = live.as_ref() {
-        if let Some(candidate) = pick_candidate(manifest, pinned) {
-            return Ok(CliResolvedToolset {
-                family_prefix: msvc::family_prefix_from_compiler_package(&candidate.package_id)?,
-                package_version: candidate.package_version,
-                manifest: clone_manifest(manifest),
-            });
-        }
-    }
-
-    // Fall back to archive.
-    match archive() {
-        Ok(manifest) => {
-            if let Some(candidate) = pick_candidate(&manifest, pinned) {
-                return Ok(CliResolvedToolset {
-                    family_prefix: msvc::family_prefix_from_compiler_package(
-                        &candidate.package_id,
-                    )?,
-                    package_version: candidate.package_version,
-                    manifest,
-                });
-            }
-            let pinned_disp = pinned.unwrap_or("<latest>");
-            let live_versions = live
-                .as_ref()
-                .map(|m| candidate_versions(m).join(", "))
-                .unwrap_or_else(|err| format!("<error: {err:#}>"));
-            let archive_versions = candidate_versions(&manifest).join(", ");
-            anyhow::bail!(
-                "could not resolve msvc version='{pinned_disp}' for {} (channel {}); live versions: {live_versions}; archive versions: {archive_versions}",
-                vs.as_str(),
-                vs.channel(),
-            );
-        }
-        Err(archive_err) => {
-            let live_err = live.err().map(|e| format!("{e:#}")).unwrap_or_default();
-            anyhow::bail!(
-                "could not resolve msvc version for {} (channel {}); live: {live_err}; archive: {archive_err:#}",
-                vs.as_str(),
-                vs.channel(),
-            );
-        }
-    }
-}
-
-fn pick_candidate(
-    manifest: &VsManifest,
-    pinned: Option<&str>,
-) -> Option<vs_manifest::MsvcCandidate> {
-    let candidates = manifest.find_msvc_candidates(HOST, TARGET);
-    match pinned {
-        Some(req) => candidates
-            .into_iter()
-            .find(|c| c.package_version == req),
-        None => candidates.into_iter().next(),
-    }
-}
-
-/// VsManifest doesn't derive Clone (and serde's Value inside dependencies
-/// would make it expensive). Re-serialize/deserialize for the rare case
-/// the live resolution succeeded but we still want the manifest after the
-/// borrow ends.
-fn clone_manifest(m: &VsManifest) -> VsManifest {
-    // Cheaper alternative: just refetch. The live fetch is already cached
-    // in <cache>/downloads/ via the staging URL, so the disk + parse cost
-    // is what we pay. For now, refetch by clone of packages.
-    let packages = m
-        .packages
-        .iter()
-        .map(|p| Package {
-            id: p.id.clone(),
-            version: p.version.clone(),
-            payloads: p.payloads.clone(),
-            language: p.language.clone(),
-            dependencies: p.dependencies.clone(),
-        })
-        .collect();
-    VsManifest { packages }
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value.len() >= prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 #[cfg(test)]

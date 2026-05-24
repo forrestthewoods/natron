@@ -1,18 +1,27 @@
-//! Internal helper for fetching + parsing the Visual Studio channel manifest.
-//! Shared between the `msvc` and `windows_sdk` providers.
+//! Source of truth for both `msvc` and `windows_sdk` providers.
+//!
+//! All data comes from the `roblabla/msvc-manifest-history` GitHub mirror.
+//! Each commit on a `release-{16,17,18}` branch is one Microsoft VS release
+//! snapshot, uniquely identified by `info.buildVersion` in its small
+//! `channel.json` header (~130 KB). The full package list lives in the
+//! per-commit `manifest.json` (~15-25 MB).
+//!
+//! Pinning a `buildVersion` resolves to one commit_sha → one immutable
+//! manifest → one fixed set of CDN payload URLs. That's the only string
+//! that guarantees a reproducible install.
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 use super::InstallCtx;
 
-/// Default URL template for the channel manifest. `{channel}` is substituted
-/// with the user-provided VS channel (e.g. "18" for VS 2026, "17" for VS 2022).
-pub const DEFAULT_CHANNEL_URL_TEMPLATE: &str = "https://aka.ms/vs/{channel}/stable/channel";
+const MIRROR_OWNER: &str = "roblabla";
+const MIRROR_REPO: &str = "msvc-manifest-history";
+const USER_AGENT: &str = concat!("natron/", env!("CARGO_PKG_VERSION"));
 
-/// User-facing VS product version. Maps to Microsoft's internal channel
-/// number. Shared by every provider that resolves packages from a VS
-/// channel manifest (`msvc`, `windows_sdk`).
+// ---- types -----------------------------------------------------------------
+
+/// User-facing VS product line. Maps 1-1 to a release branch on the mirror.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VsVersion {
     Vs2019,
@@ -26,7 +35,7 @@ impl VsVersion {
             "vs2019" => Ok(Self::Vs2019),
             "vs2022" => Ok(Self::Vs2022),
             "vs2026" => Ok(Self::Vs2026),
-            other => bail!("invalid vs value '{other}'; valid values: vs2019, vs2022, vs2026"),
+            other => bail!("invalid vs value '{other}'; valid: vs2019, vs2022, vs2026"),
         }
     }
 
@@ -38,31 +47,77 @@ impl VsVersion {
         }
     }
 
-    pub fn channel(self) -> &'static str {
+    pub fn channel(self) -> u8 {
         match self {
-            Self::Vs2019 => "16",
-            Self::Vs2022 => "17",
-            Self::Vs2026 => "18",
+            Self::Vs2019 => 16,
+            Self::Vs2022 => 17,
+            Self::Vs2026 => 18,
+        }
+    }
+
+    pub fn all() -> [Self; 3] {
+        [Self::Vs2019, Self::Vs2022, Self::Vs2026]
+    }
+
+    /// Map a `buildVersion`'s major component (16/17/18) back to the VS series.
+    pub fn from_channel(major: u8) -> Result<Self> {
+        match major {
+            16 => Ok(Self::Vs2019),
+            17 => Ok(Self::Vs2022),
+            18 => Ok(Self::Vs2026),
+            other => bail!(
+                "buildVersion major '{other}' has no matching VS series (expected 16, 17, or 18)"
+            ),
         }
     }
 }
 
-/// Channel manifest (the small JSON returned from the aka.ms URL).
-#[derive(Debug, Deserialize)]
-pub struct ChannelManifest {
-    #[serde(default, rename = "channelItems")]
-    pub channel_items: Vec<ChannelItem>,
+/// Parsed `info` block from a `channel.json` snapshot.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelInfo {
+    pub build_version: String,
+    pub product_display_version: String,
+    pub product_line_version: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct CommitRef {
+    pub sha: String,
+    pub date: String,
+}
+
+/// One Microsoft snapshot paired with the mirror commit that hosts it.
+#[derive(Debug, Clone)]
+pub struct BuildIndexEntry {
+    pub vs: VsVersion,
+    pub info: ChannelInfo,
+    pub commit: CommitRef,
+}
+
+/// Subset of the full VS manifest we deserialize.
 #[derive(Debug, Deserialize)]
-pub struct ChannelItem {
+pub struct VsManifest {
     #[serde(default)]
-    #[serde(rename = "type")]
-    pub kind: Option<String>,
+    pub packages: Vec<Package>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Package {
+    pub id: String,
+    /// Microsoft's package version (for MSVC, the toolset version like
+    /// `14.52.36328`).
     #[serde(default)]
-    pub id: Option<String>,
+    pub version: Option<String>,
     #[serde(default)]
     pub payloads: Vec<Payload>,
+    /// Many packages exist in per-language variants (en-US, ja-JP, ...).
+    /// Compiler-base packages are languageless.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Declared dependency ids. Values are version constraints we don't read.
+    #[serde(default)]
+    pub dependencies: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -74,217 +129,255 @@ pub struct Payload {
     pub file_name: Option<String>,
 }
 
-/// Full VS manifest (the much larger JSON the channel manifest points at).
-#[derive(Debug, Deserialize)]
-pub struct VsManifest {
-    #[serde(default)]
-    pub packages: Vec<Package>,
+// ---- URL builders ----------------------------------------------------------
+
+/// raw.githubusercontent.com URL pattern. The mirror parameter exists for
+/// test fixtures (`file://` URLs); production uses [`default_raw_base`].
+pub fn raw_url(base: &str, sha_or_branch: &str, filename: &str) -> String {
+    format!("{base}/{sha_or_branch}/{filename}")
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct Package {
-    pub id: String,
-    /// Visual Studio's package version. For MSVC this is the exact compiler
-    /// toolset version, while the package id may use a shorter family segment
-    /// such as `Microsoft.VC.14.51...`.
-    #[serde(default)]
-    pub version: Option<String>,
-    #[serde(default)]
-    pub payloads: Vec<Payload>,
-    /// Many VS packages exist in multiple variants distinguished only by
-    /// `language` (e.g. en-US, cs-CZ, ja-JP). When picking by id alone we
-    /// must filter by language or we'll get the first one alphabetically
-    /// (cs-CZ).
-    #[serde(default)]
-    pub language: Option<String>,
-    /// VS package dependencies. The KEYS of this map are the dependent
-    /// package ids; the VALUES are version constraints we don't currently
-    /// inspect.
-    #[serde(default)]
-    pub dependencies: std::collections::HashMap<String, serde_json::Value>,
+pub fn default_raw_base() -> String {
+    format!("https://raw.githubusercontent.com/{MIRROR_OWNER}/{MIRROR_REPO}")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MsvcCandidate {
-    pub package_version: String,
-    pub package_id: String,
+/// GitHub commits API for one release branch. Test fixtures override the
+/// base to point at a local `commits.json` file via `{branch}`.
+pub fn commits_url(base: &str, vs: VsVersion, page: u32) -> String {
+    base.replace("{branch}", &format!("release-{}", vs.channel()))
+        .replace("{page}", &page.to_string())
 }
 
-/// Fetch a single archived VS manifest. The mirror at
-/// `roblabla/msvc-manifest-history` hosts one manifest.json per branch, which
-/// is a `VsManifest` shape directly (no channel-manifest indirection). The
-/// `url_template` must contain `{channel}` for substitution.
-pub fn fetch_archive_manifest(
-    url_template: &str,
-    vs_channel: &str,
-    ctx: &InstallCtx,
-) -> Result<VsManifest> {
-    let url = url_template.replace("{channel}", vs_channel);
-    let path = ctx
-        .download(&url, None)
-        .with_context(|| format!("fetching archived VS manifest from {url}"))?;
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading archived VS manifest {}", path.display()))?;
-    serde_json::from_str(&text)
-        .with_context(|| format!("parsing archived VS manifest {}", path.display()))
+pub fn default_commits_base() -> String {
+    format!(
+        "https://api.github.com/repos/{MIRROR_OWNER}/{MIRROR_REPO}/commits?sha={{branch}}&per_page=100&page={{page}}"
+    )
 }
 
-/// Fetch the channel manifest, follow it to the VS manifest, and return the
-/// fully parsed package list.
-pub fn fetch_vs_manifest(
-    channel_url_template: &str,
-    vs_channel: &str,
-    ctx: &InstallCtx,
-) -> Result<VsManifest> {
-    let channel_url = channel_url_template.replace("{channel}", vs_channel);
-    let channel_path = ctx
-        .download(&channel_url, None)
-        .with_context(|| format!("fetching VS channel manifest from {channel_url}"))?;
-    let channel_text = std::fs::read_to_string(&channel_path)
-        .with_context(|| format!("reading {}", channel_path.display()))?;
-    let channel: ChannelManifest = serde_json::from_str(&channel_text)
-        .with_context(|| format!("parsing channel manifest from {}", channel_path.display()))?;
+// ---- fetchers --------------------------------------------------------------
 
-    // Find the VS manifest URL.
-    let vs_url = channel
-        .channel_items
-        .iter()
-        .find(|item| {
-            item.kind.as_deref() == Some("Manifest")
-                && item.id.as_deref()
-                    == Some("Microsoft.VisualStudio.Manifests.VisualStudio")
-        })
-        .ok_or_else(|| anyhow!("VS channel manifest has no VS manifest item"))?
-        .payloads
-        .first()
-        .ok_or_else(|| anyhow!("VS channel manifest item has no payloads"))?
-        .url
-        .clone();
-
-    let vs_path = ctx
-        .download(&vs_url, None)
-        .with_context(|| format!("fetching VS manifest from {vs_url}"))?;
-    let vs_text = std::fs::read_to_string(&vs_path)
-        .with_context(|| format!("reading {}", vs_path.display()))?;
-    let vs: VsManifest = serde_json::from_str(&vs_text)
-        .with_context(|| format!("parsing VS manifest from {}", vs_path.display()))?;
-    Ok(vs)
-}
-
-/// Sort version strings as a list of dot-separated integer components, so
-/// "14.50.18" > "14.49.99". Falls back to lexicographic for non-numeric.
-fn version_key(v: &str) -> Vec<u64> {
-    v.split('.')
-        .map(|s| s.parse::<u64>().unwrap_or(0))
-        .collect()
-}
-
-impl VsManifest {
-    /// Find a package by exact id (case-insensitive). When multiple variants
-    /// exist (different `language` attribute), prefer en-US, then no
-    /// language at all, then any.
-    pub fn find_package(&self, id: &str) -> Option<&Package> {
-        let lower = id.to_lowercase();
-        let matches: Vec<&Package> = self
-            .packages
-            .iter()
-            .filter(|p| p.id.to_lowercase() == lower)
-            .collect();
-        if matches.is_empty() {
-            return None;
+/// Enumerate every commit on one release branch via the GitHub commits API.
+/// NOT cached — the response is tiny (~10 KB/page) and freshness matters
+/// when a new Microsoft release has just shipped.
+pub fn fetch_commits(commits_base: &str, vs: VsVersion) -> Result<Vec<CommitRef>> {
+    let mut out = Vec::new();
+    for page in 1u32.. {
+        let url = commits_url(commits_base, vs, page);
+        let body = http_get(&url)
+            .with_context(|| format!("fetching commits page {page} for {}", vs.as_str()))?;
+        let page_commits: Vec<GhCommit> = serde_json::from_str(&body)
+            .with_context(|| format!("parsing commits page {page} for {}", vs.as_str()))?;
+        if page_commits.is_empty() {
+            break;
         }
-        // Prefer en-US.
-        if let Some(p) = matches
-            .iter()
-            .copied()
-            .find(|p| p.language.as_deref() == Some("en-US"))
-        {
-            return Some(p);
-        }
-        // Then language-less.
-        if let Some(p) = matches.iter().copied().find(|p| p.language.is_none()) {
-            return Some(p);
-        }
-        // Fall back to first match.
-        Some(matches[0])
-    }
-
-    /// Find every MSVC compiler package matching
-    /// `microsoft.vc.{id_version}.tools.host{host}.target{target}.base`.
-    /// Returns candidates sorted descending by package version. "Premium"
-    /// variants are excluded (we want the base toolchain).
-    pub fn find_msvc_candidates(&self, host: &str, target: &str) -> Vec<MsvcCandidate> {
-        let host = host.to_lowercase();
-        let target = target.to_lowercase();
-        let needle = format!(".tools.host{host}.target{target}.base");
-        let mut out = Vec::new();
-        for pkg in &self.packages {
-            let id_lower = pkg.id.to_lowercase();
-            if !id_lower.starts_with("microsoft.vc.") {
-                continue;
-            }
-            if !id_lower.contains(&needle) {
-                continue;
-            }
-            if id_lower.contains(".premium.") {
-                continue;
-            }
-            // Extract version: between "microsoft.vc." and ".tools."
-            let after = &pkg.id["microsoft.vc.".len()..];
-            let Some(end) = after.to_lowercase().find(".tools.") else {
-                continue;
-            };
-            let id_version = &after[..end];
-            let package_version = pkg
-                .version
-                .clone()
-                .unwrap_or_else(|| id_version.to_string());
-            out.push(MsvcCandidate {
-                package_version,
-                package_id: pkg.id.clone(),
+        let was_full = page_commits.len() == 100;
+        for c in page_commits {
+            out.push(CommitRef {
+                sha: c.sha,
+                date: c.commit.author.date,
             });
         }
-        out.sort_by(|a, b| {
-            version_key(&b.package_version).cmp(&version_key(&a.package_version))
-        });
-        out
-    }
-
-    /// Find every Windows SDK component package matching
-    /// `Microsoft.VisualStudio.Component.Windows{10|11}SDK.{numeric_version}`.
-    pub fn find_sdk_candidates(&self) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        for pkg in &self.packages {
-            for prefix in [
-                "Microsoft.VisualStudio.Component.Windows10SDK.",
-                "Microsoft.VisualStudio.Component.Windows11SDK.",
-            ] {
-                if let Some(rest) = pkg.id.strip_prefix(prefix) {
-                    if !rest.is_empty()
-                        && rest.chars().all(|c| c.is_ascii_digit() || c == '.')
-                    {
-                        out.push((rest.to_string(), pkg.id.clone()));
-                    }
-                }
-            }
+        if !was_full {
+            break;
         }
-        out.sort_by(|a, b| version_key(&b.0).cmp(&version_key(&a.0)));
-        out
     }
+    Ok(out)
+}
 
-    /// Find a payload by exact filename within a package id.
-    #[allow(dead_code)]
-    pub fn find_payload<'a>(
-        &'a self,
-        package_id: &str,
-        file_name: &str,
-    ) -> Option<&'a Payload> {
-        self.find_package(package_id)?
-            .payloads
-            .iter()
-            .find(|p| p.file_name.as_deref() == Some(file_name))
+#[derive(Deserialize)]
+struct GhCommit {
+    sha: String,
+    commit: GhCommitInner,
+}
+
+#[derive(Deserialize)]
+struct GhCommitInner {
+    author: GhAuthor,
+}
+
+#[derive(Deserialize)]
+struct GhAuthor {
+    date: String,
+}
+
+/// Fetch + parse `channel.json` at a specific commit. Cached forever via
+/// the download layer (commit-sha-keyed URLs are immutable).
+pub fn fetch_channel_info(
+    raw_base: &str,
+    sha_or_branch: &str,
+    ctx: &InstallCtx,
+) -> Result<ChannelInfo> {
+    let url = raw_url(raw_base, sha_or_branch, "channel.json");
+    let path = ctx
+        .download(&url, None)
+        .with_context(|| format!("fetching channel.json at {sha_or_branch}"))?;
+    #[derive(Deserialize)]
+    struct Wrapper {
+        info: ChannelInfo,
+    }
+    parse_json_or_evict::<Wrapper>(&path, "channel.json").map(|w| w.info)
+}
+
+/// Fetch + parse `manifest.json` at a specific commit. Cached forever.
+pub fn fetch_manifest_at(
+    raw_base: &str,
+    sha_or_branch: &str,
+    ctx: &InstallCtx,
+) -> Result<VsManifest> {
+    let url = raw_url(raw_base, sha_or_branch, "manifest.json");
+    let path = ctx
+        .download(&url, None)
+        .with_context(|| format!("fetching manifest.json at {sha_or_branch}"))?;
+    parse_json_or_evict(&path, "manifest.json")
+}
+
+/// Read a JSON file from disk and parse it. On parse failure, delete the
+/// cached file so the next call re-fetches (defensive against upstream
+/// briefly serving HTML or a truncated response that the download layer
+/// happened to cache).
+fn parse_json_or_evict<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+    label: &str,
+) -> Result<T> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {label} at {}", path.display()))?;
+    match serde_json::from_str(&text) {
+        Ok(v) => Ok(v),
+        Err(err) => {
+            let _ = std::fs::remove_file(path);
+            Err(anyhow!(
+                "parsing {label} at {} (cached file deleted; re-run will refetch): {err}",
+                path.display(),
+            ))
+        }
     }
 }
+
+// ---- index builder ---------------------------------------------------------
+
+/// Configuration for the fetchers — bundled so tests can swap both URL
+/// bases at once.
+#[derive(Debug, Clone)]
+pub struct MirrorUrls {
+    pub raw_base: String,
+    pub commits_base: String,
+}
+
+impl Default for MirrorUrls {
+    fn default() -> Self {
+        Self {
+            raw_base: default_raw_base(),
+            commits_base: default_commits_base(),
+        }
+    }
+}
+
+/// Build the in-memory index across the requested VS series. For each
+/// series: list commits, fetch every commit's channel.json (cached after
+/// first run). Sorted descending by commit date within each VS series.
+pub fn build_index(
+    urls: &MirrorUrls,
+    series: &[VsVersion],
+    ctx: &InstallCtx,
+) -> Result<Vec<BuildIndexEntry>> {
+    let mut out = Vec::new();
+    for vs in series {
+        let mut commits = fetch_commits(&urls.commits_base, *vs)?;
+        commits.sort_by(|a, b| b.date.cmp(&a.date));
+        for commit in commits {
+            match fetch_channel_info(&urls.raw_base, &commit.sha, ctx) {
+                Ok(info) => out.push(BuildIndexEntry {
+                    vs: *vs,
+                    info,
+                    commit,
+                }),
+                Err(err) => tracing::warn!(
+                    "skipping commit {} on {}: {err:#}",
+                    &commit.sha[..commit.sha.len().min(7)],
+                    vs.as_str(),
+                ),
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve a buildVersion to its mirror entry. Auto-detects the VS series
+/// from the version's major component. On miss, surfaces a few of the
+/// nearest available buildVersions for context.
+pub fn resolve_build_version(
+    urls: &MirrorUrls,
+    build_version: &str,
+    ctx: &InstallCtx,
+) -> Result<BuildIndexEntry> {
+    let major = build_version_major(build_version)?;
+    let vs = VsVersion::from_channel(major)?;
+    let entries = build_index(urls, &[vs], ctx)?;
+    if let Some(hit) = entries
+        .iter()
+        .find(|e| e.info.build_version == build_version)
+    {
+        return Ok(hit.clone());
+    }
+    let mut available: Vec<&str> = entries
+        .iter()
+        .map(|e| e.info.build_version.as_str())
+        .collect();
+    available.sort();
+    // Show 5 nearest (lex-closest) so the error fits on a terminal.
+    let suggestions: Vec<&&str> = available
+        .iter()
+        .filter(|v| v.starts_with(&format!("{major}.")))
+        .take(5)
+        .collect();
+    bail!(
+        "buildVersion '{build_version}' not found on {} (release-{major}); {} available; nearest: {}",
+        vs.as_str(),
+        available.len(),
+        if suggestions.is_empty() {
+            "(none)".to_string()
+        } else {
+            suggestions
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    )
+}
+
+/// Parse the major component (first dot-segment) of a buildVersion.
+pub fn build_version_major(build_version: &str) -> Result<u8> {
+    let head = build_version
+        .split('.')
+        .next()
+        .ok_or_else(|| anyhow!("buildVersion '{build_version}' is empty"))?;
+    head.parse::<u8>()
+        .map_err(|e| anyhow!("buildVersion '{build_version}' major is not numeric: {e}"))
+}
+
+// ---- HTTP helper -----------------------------------------------------------
+
+/// Plain GET. Used for the GitHub commits API — small JSON, no caching,
+/// must set a User-Agent (GitHub requires it).
+pub fn http_get(url: &str) -> Result<String> {
+    if let Some(rest) = url.strip_prefix("file://") {
+        // For test fixtures.
+        let p = url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.to_file_path().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from(rest));
+        return std::fs::read_to_string(&p)
+            .with_context(|| format!("reading file URL {}", p.display()));
+    }
+    let resp = ureq::get(url)
+        .header("User-Agent", USER_AGENT)
+        .header("Accept", "application/json")
+        .call()
+        .with_context(|| format!("GET {url}"))?;
+    Ok(resp.into_body().read_to_string()?)
+}
+
 #[cfg(test)]
 #[path = "vs_manifest_tests.rs"]
-mod tests;
+pub(crate) mod tests;

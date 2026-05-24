@@ -30,9 +30,9 @@ natron list                  # show what's deployed in this project
 natron list --cache          # show every install in the global cache
 natron clean --downloads     # empty <cache>/downloads/
 natron clean --all --yes     # nuke the whole cache
-natron msvc versions         # see what MSVC versions exist (live + archive)
-natron msvc packages --vs vs2026 --version 14.51.36223
-natron msvc extract --vs vs2026 --version 14.51.36223 --out C:\temp\msvc
+natron msvc versions         # list Microsoft VS builds available on the mirror
+natron msvc packages --build-version 18.6.11819.183
+natron msvc extract  --build-version 18.6.11819.183 --out C:\temp\msvc
 ```
 
 `natron` with no subcommand defaults to `install`.
@@ -78,17 +78,15 @@ name        = "msvc"
 deploy_dir  = "msvc"
 provider    = "msvc"
 [toolchain.options]
-vs            = "vs2026"        # required; vs2019, vs2022, or vs2026
-msvc_version = "14.51.36243"    # optional exact compiler package version
-profile      = "standard"
+build_version = "18.6.11819.183"   # required: exact Microsoft VS build (see `natron msvc versions`)
 
 [[toolchain]]
 name        = "windows_sdk"
 deploy_dir  = "windows_sdk"
 provider    = "windows_sdk"
 [toolchain.options]
-vs          = "vs2026"
-sdk_version = "26100"
+build_version = "18.6.11819.183"
+sdk_version   = "26100"
 ```
 
 Multiple toolchains of the same provider type are first-class. Vendor
@@ -103,129 +101,92 @@ block with distinct `name` and `deploy_dir`.
   `asset`. Optional `version` (display), `sha256`, `archive`, `strip_prefix`.
 - **`zig`**: look up `version` + `platform` in
   `https://ziglang.org/download/index.json`, sha-verified via the index.
-- **`msvc`**: extract MSVC compiler, CRT, redistributable runtime, and
-  optional native C++ feature packages from a Visual Studio channel
-  manifest. Required `vs` (`vs2019`, `vs2022`, or `vs2026`). Optional
-  `msvc_version`; if omitted,
-  natron installs the latest MSVC toolset listed by Microsoft's live
-  channel manifest. If pinned, `msvc_version` is the exact Visual Studio
-  compiler package version, such as `14.51.36243`, and natron installs
-  that compiler package version or fails. For older pinned versions no
-  longer listed by Microsoft, natron also checks the unofficial
-  [`roblabla/msvc-manifest-history`][mh] archive; pinned installs never
-  silently fall back to latest.
-- **`windows_sdk`**: extract Windows SDK headers + libs from a VS channel
-  manifest. Required `vs` (`vs2019`, `vs2022`, or `vs2026`). Optional
-  `sdk_version`.
+- **`msvc`**: install MSVC compiler + CRT + redist from one exact
+  Microsoft VS build. Required `build_version` (e.g.
+  `18.6.11819.183`); its major (16/17/18) selects the VS series.
+  Optional `base_install` (`none` | `default` | `full`, default
+  `default`) and `extras` (list of glob patterns added on top of the
+  base set). See "MSVC package selection" below.
+- **`windows_sdk`**: install Windows SDK headers + libs from the same
+  snapshot. Required `build_version`. Optional `sdk_version` (defaults
+  to the highest SDK in that snapshot).
+
+Both providers source manifests from the
+[`roblabla/msvc-manifest-history`][mh] community mirror, which snapshots
+Microsoft's per-VS-release `channel.json` and `manifest.json` files on
+`release-{16,17,18}` branches. Pinning a `build_version` resolves to one
+mirror commit → one immutable manifest → fixed CDN payload URLs. That's
+the only string Microsoft guarantees identifies an exact build, so it's
+the only string that gives 100%-reproducible installs.
+
+If the mirror goes away, MSVC and SDK installs break. That's a known
+tradeoff — preferable to losing historical-version reproducibility.
 
 [mh]: https://github.com/roblabla/msvc-manifest-history
 
 ### MSVC package selection
 
-MSVC's Visual Studio manifest contains hundreds of internal packages for
-one toolset family. natron resolves the exact compiler package first, derives
-that package family's `Microsoft.VC.<family>.` prefix, then selects real
-manifest packages with simple glob patterns.
+`base_install` chooses the starting set; `extras` adds more on top.
+
+- `default` (the default): compiler + locale resources + CRT headers +
+  desktop CRT + store CRT + redist. Roughly the minimum useful native
+  C/C++ toolchain.
+- `full`: every package in the snapshot (including legacy compat
+  toolsets Microsoft re-ships in every VS installer). ~10 GB.
+  Mutually exclusive with `extras`.
+- `none`: install only what's in `extras`. Requires at least one
+  pattern.
 
 ```toml
+# Just the default set.
 [toolchain.options]
-vs           = "vs2026"
-msvc_version = "14.52.36328"
-profile      = "standard"
+build_version = "18.6.11819.183"
+
+# Default + a few extras.
+[toolchain.options]
+build_version = "18.6.11819.183"
+extras        = ["ATL.*", "MFC.*"]
+
+# Everything in the snapshot.
+[toolchain.options]
+build_version = "18.6.11819.183"
+base_install  = "full"
 ```
 
-Profiles:
-
-- `standard`: normal native C/C++ developer toolchain. Installs compiler
-  tools for x64-host/x64-target, tiny compiler resources for all manifest
-  locales, CRT headers, desktop + store CRT libs, CRT redist DLLs, and tiny
-  declared resource / props / servicing metadata dependencies.
-- `custom`: only the package patterns listed in `include`.
-- `full`: every `Microsoft.VC.<resolved-family>.*` package in the exact
-  resolved MSVC family. This is large; for MSVC `14.52` it is about 11 GiB
-  deployed.
-
-Standard with extras:
-
-```toml
-[toolchain.options]
-vs           = "vs2026"
-msvc_version = "14.52.36328"
-profile      = "standard"
-
-# Patterns without a Microsoft.* prefix match after stripping the resolved
-# family prefix. For 14.52, "ATL.*.base" matches Microsoft.VC.14.52.ATL.*.base.
-extras = [
-  "ATL.*.base",
-  "MFC.*.base",
-  "ASAN.*.base",
-]
-```
-
-Custom exact selection:
-
-```toml
-[toolchain.options]
-vs           = "vs2026"
-msvc_version = "14.52.36328"
-profile      = "custom"
-
-include = [
-  "Tools.HostX64.TargetX64.base",
-  "Tools.HostX64.TargetX64.Res*",
-  "CRT.Headers.base",
-  "CRT.x64.Desktop.base",
-  "CRT.Redist.X64.base",
-  "ATL.X64.base",
-]
-```
-
-Full family mirror:
-
-```toml
-[toolchain.options]
-vs           = "vs2026"
-msvc_version = "14.52.36328"
-profile      = "full"
-```
-
-Pattern rules:
+Pattern rules for `extras`:
 
 - `*` matches any characters; `?` matches one character.
 - Matching is case-insensitive.
-- Patterns starting with `Microsoft.` match raw full package IDs for the
-  resolved exact package version. This is an escape hatch for packages outside
-  the resolved `Microsoft.VC.<family>.` prefix, such as
-  `Microsoft.VC.Preview.DIA.*`.
-- Every user-supplied pattern must match at least one package, otherwise the
-  install fails instead of silently producing a partial toolchain.
+- Patterns without a `Microsoft.` prefix match against the
+  family-relative tail. For a snapshot whose primary compiler family is
+  `Microsoft.VC.14.50.18.0`, `ATL.X64.base` matches
+  `Microsoft.VC.14.50.18.0.ATL.X64.base`.
+- Patterns starting with `Microsoft.` match raw package IDs (escape
+  hatch for outside-family packages like
+  `Microsoft.VC.Preview.DIA.*`).
+- Every pattern must match at least one package, otherwise the install
+  fails instead of silently producing a partial toolchain.
 
 ### MSVC debug commands
 
-MSVC versioning and the per-version package set are awkward enough that
-natron ships dedicated `msvc` subcommands for exploration. None of these
-write to the cache's `installs/` or to project state — they're pure
-discovery.
-
 ```bash
-# What MSVC toolset versions are reachable, live + via the archive mirror?
+# Every available Microsoft VS build per series (newest-first).
 natron msvc versions
 natron msvc versions --vs vs2026
 
-# Every package in the resolved family at this version, grouped:
-# in-family first, other Microsoft.VC.* at the same version second.
-natron msvc packages --vs vs2026 --version 14.51.36223
+# Every package in one build's snapshot, grouped: family first, other.
+natron msvc packages --build-version 18.6.11819.183
 
-# Download + extract every package at a version into one subdirectory per
-# package. Then browse with Explorer, ripgrep, etc. to figure out which
-# package contains the file you're hunting. You manage cleanup.
-natron msvc extract --vs vs2026 --version 14.51.36223 --out C:\temp\msvc
+# Download + extract every package at a build into per-package dirs.
+# Use this to discover which package contains a missing file (grep,
+# Explorer, Everything, etc.). You manage cleanup of the --out directory.
+natron msvc extract --build-version 18.6.11819.183 --out C:\temp\msvc
 ```
 
-`versions` is non-fatal if either source is unreachable: it prints what it
-got and an error for the missing side. `extract` reuses the global download
-cache, so the bytes are not re-downloaded between runs; re-running into an
-existing `--out` skips packages already present.
+`versions` enumerates each release branch's commits via the GitHub API
+and fetches each commit's small `channel.json` (~130 KB; cached after
+first run). `extract` reuses the global download cache, so re-runs don't
+re-download. Already-populated package dirs in `--out` are skipped.
 
 ## Deploy modes
 

@@ -122,46 +122,46 @@ fn test_real_github_llvm_install() {
 
 #[test]
 fn test_real_msvc_manifest_shape() {
-    // Smoke test for the two upstream manifests the msvc provider depends
-    // on. Doesn't install anything (no Windows, no msiexec, no disk hit) —
-    // just confirms both URLs return JSON that parses into a VsManifest
-    // with at least one x64/x64 MSVC candidate. Catches schema drift.
+    // Smoke test for the roblabla mirror — the sole upstream the msvc and
+    // windows_sdk providers depend on. For each VS series: enumerate commits
+    // via the GitHub API, fetch the HEAD `channel.json` (confirming the
+    // info.buildVersion shape), and parse the HEAD `manifest.json` (confirming
+    // the packages shape). Doesn't install anything.
     if !enabled() {
         return;
     }
-    use natron::providers::{vs_manifest, InstallCtx};
+    use natron::providers::vs_manifest::{
+        self, MirrorUrls, VsVersion,
+    };
+    use natron::providers::InstallCtx;
     let env = TestEnv::new();
     let cache = Cache::at(env.cache_dir.clone());
     cache.ensure_layout().expect("cache layout");
-    let ctx = InstallCtx::new(cache.clone());
+    let ctx = InstallCtx::new(cache);
+    let urls = MirrorUrls::default();
 
-    // Microsoft's live channel for VS 2026 (channel "18").
-    let live = vs_manifest::fetch_vs_manifest(
-        vs_manifest::DEFAULT_CHANNEL_URL_TEMPLATE,
-        "18",
-        &ctx,
-    )
-    .expect("fetch live VS 2026 manifest");
-    let live_cands = live.find_msvc_candidates("x64", "x64");
-    assert!(
-        !live_cands.is_empty(),
-        "live VS 2026 manifest has no x64/x64 MSVC candidates"
-    );
+    for vs in VsVersion::all() {
+        let commits = vs_manifest::fetch_commits(&urls.commits_base, vs)
+            .unwrap_or_else(|e| panic!("commits for {}: {e:#}", vs.as_str()));
+        assert!(!commits.is_empty(), "no commits for {}", vs.as_str());
 
-    // roblabla mirror's release-18 branch — the archive fallback URL the
-    // msvc provider uses for pinned versions Microsoft no longer lists.
-    let archive_url =
-        "https://raw.githubusercontent.com/roblabla/msvc-manifest-history/release-18/manifest.json";
-    let archive_path = natron::download::fetch(archive_url, None, &cache.downloads)
-        .expect("fetch roblabla release-18 manifest");
-    let archive_text = std::fs::read_to_string(&archive_path).expect("read archive json");
-    let archive: vs_manifest::VsManifest =
-        serde_json::from_str(&archive_text).expect("parse roblabla manifest as VsManifest");
-    let archive_cands = archive.find_msvc_candidates("x64", "x64");
-    assert!(
-        !archive_cands.is_empty(),
-        "roblabla release-18 manifest has no x64/x64 MSVC candidates"
-    );
+        let head_sha = &commits[0].sha;
+        let info = vs_manifest::fetch_channel_info(&urls.raw_base, head_sha, &ctx)
+            .unwrap_or_else(|e| panic!("channel.json for {}@{head_sha}: {e:#}", vs.as_str()));
+        assert!(
+            !info.build_version.is_empty(),
+            "{} HEAD has no build_version",
+            vs.as_str()
+        );
+
+        let manifest = vs_manifest::fetch_manifest_at(&urls.raw_base, head_sha, &ctx)
+            .unwrap_or_else(|e| panic!("manifest.json for {}@{head_sha}: {e:#}", vs.as_str()));
+        assert!(
+            !manifest.packages.is_empty(),
+            "{} HEAD manifest has zero packages",
+            vs.as_str()
+        );
+    }
 }
 
 fn detect_zig_platform() -> &'static str {

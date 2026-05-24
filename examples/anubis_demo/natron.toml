@@ -52,21 +52,31 @@ provider    = "url"
 url          = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
 strip_prefix = "nasm-3.01"
 
-# === MSVC compiler + CRT (Visual Studio 18 series) ===
+# === MSVC compiler + CRT ===
+# Pin an exact Microsoft VS build_version. Run `natron msvc versions` to list
+# what's available. build_version's major (16/17/18) selects the VS series:
+# 16 = vs2019, 17 = vs2022, 18 = vs2026.
 [[toolchain]]
 name        = "msvc"
 deploy_dir  = "msvc"
 provider    = "msvc"
 [toolchain.options]
-vs           = "vs2026"
-msvc_version = "14.51.36243"
-profile      = "standard"
+build_version = "18.6.11819.183"   # VS 2026 18.6.1
+# base_install defaults to "default" (compiler tools + locale resources +
+# CRT headers + desktop CRT + store CRT + redist). Options:
+#   "full" — every package in the snapshot (legacy compat toolsets too); ~10 GB.
+#   "none" — install nothing from the default set; extras only.
+# extras adds globs on top of base_install. Patterns without a `Microsoft.`
+# prefix match family-relative tails (e.g. "ATL.*" matches
+# Microsoft.VC.<family>.ATL.*); patterns starting with `Microsoft.` match raw
+# ids (escape hatch for outside-family packages).
+# extras = ["ATL.*", "MFC.*"]
 
-# === Windows SDK ===
+# === Windows SDK (from the same VS snapshot as msvc above) ===
 [[toolchain]]
 name        = "windows_sdk"
 deploy_dir  = "windows_sdk"
 provider    = "windows_sdk"
 [toolchain.options]
-vs          = "vs2026"
-sdk_version = "26100"
+build_version = "18.6.11819.183"
+sdk_version   = "26100"            # optional; defaults to the highest SDK in the snapshot
