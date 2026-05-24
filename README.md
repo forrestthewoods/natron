@@ -306,7 +306,7 @@ overriding its base URL).
 `cargo test` is fully hermetic — no network. Synthetic archives and fake
 release JSON are generated at test time and served via `file://` URLs.
 
-Network-dependent integration tests live in `tests/network.rs` and are
+Integration tests that hit real upstream services are individually
 `#[ignore]`'d. Use cargo's standard runner flags to opt in:
 
 ```bash
