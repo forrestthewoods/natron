@@ -10,6 +10,7 @@ pub mod clean;
 pub mod install;
 pub mod list;
 pub mod msvc;
+pub mod windows_sdk;
 
 #[derive(Debug, Parser)]
 #[command(name = "natron", version, about = "Vendor compiler toolchains into source-controlled projects")]
@@ -40,6 +41,9 @@ pub enum Command {
     Clean(CleanArgs),
     /// MSVC debug + discovery tooling.
     Msvc(msvc::MsvcArgs),
+    /// Windows SDK debug + discovery tooling.
+    #[command(name = "windows_sdk")]
+    WindowsSdk(windows_sdk::WindowsSdkArgs),
 }
 
 #[derive(Debug, Args)]
@@ -145,6 +149,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::List(args) => list::run(&cli.config, &cli.cache_dir, args),
         Command::Clean(args) => clean::run(&cli.config, &cli.cache_dir, args),
         Command::Msvc(args) => msvc::run(&cli.config, &cli.cache_dir, args),
+        Command::WindowsSdk(args) => windows_sdk::run(&cli.config, &cli.cache_dir, args),
     }
 }
 

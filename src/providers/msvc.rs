@@ -287,7 +287,6 @@ fn select_packages(
         }
     }
 
-    close_metadata_deps(&mut selected, manifest, compiler_version);
     Ok(selected.into_iter().collect())
 }
 
@@ -332,57 +331,6 @@ fn match_pattern_into(
         bail!("msvc package pattern '{pattern}' matched no packages at version {compiler_version}");
     }
     Ok(())
-}
-
-/// Pull in tiny declared metadata dependencies (resource locales, MSBuild
-/// .props, servicing entries). The compiler-base also declares deps on the
-/// full toolchain (ATL, MFC, ASAN, ...) which we DON'T want — so the closure
-/// is suffix-anchored on a small whitelist of dot-segments.
-fn close_metadata_deps(
-    selected: &mut BTreeSet<PackageRequest>,
-    manifest: &VsManifest,
-    compiler_version: &str,
-) {
-    loop {
-        let snapshot: Vec<PackageRequest> = selected.iter().cloned().collect();
-        let mut grew = false;
-        for request in snapshot {
-            let Ok(pkg) = lookup_package(manifest, &request) else {
-                continue;
-            };
-            for dep_id in pkg.dependencies.keys() {
-                if !is_metadata_dependency(dep_id) {
-                    continue;
-                }
-                for candidate in &manifest.packages {
-                    if candidate.id.eq_ignore_ascii_case(dep_id)
-                        && candidate.version.as_deref() == Some(compiler_version)
-                    {
-                        grew |= selected.insert(package_request(candidate));
-                    }
-                }
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
-}
-
-fn is_metadata_dependency(dep_id: &str) -> bool {
-    let lower = dep_id.to_ascii_lowercase();
-    let prefix_ok = lower.starts_with("microsoft.vc.")
-        || lower.starts_with("microsoft.visualc.")
-        || lower.starts_with("microsoft.visualcpp.");
-    if !prefix_ok {
-        return false;
-    }
-    let segments: Vec<&str> = lower.split('.').collect();
-    segments.iter().enumerate().any(|(i, seg)| match *seg {
-        "res" | "resources" => i + 1 < segments.len(), // followed by language tag
-        "props" | "servicing" => true,
-        _ => false,
-    })
 }
 
 // ---- payload + manifest helpers --------------------------------------------

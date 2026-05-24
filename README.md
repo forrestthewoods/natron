@@ -33,6 +33,9 @@ natron clean --all --yes     # nuke the whole cache
 natron msvc versions         # list Microsoft VS builds available on the mirror
 natron msvc packages --build-version 18.6.11819.183
 natron msvc extract  --build-version 18.6.11819.183 --out C:\temp\msvc
+natron windows_sdk versions  # list Windows SDK versions available on the mirror
+natron windows_sdk packages --sdk-version 26100
+natron windows_sdk extract  --sdk-version 26100 --out C:\temp\sdk
 ```
 
 `natron` with no subcommand defaults to `install`.
@@ -85,8 +88,7 @@ name        = "windows_sdk"
 deploy_dir  = "windows_sdk"
 provider    = "windows_sdk"
 [toolchain.options]
-build_version = "18.6.11819.183"
-sdk_version   = "26100"
+sdk_version = "26100"              # required: exact Windows SDK build (see `natron windows_sdk versions`)
 ```
 
 Multiple toolchains of the same provider type are first-class. Vendor
@@ -107,20 +109,24 @@ block with distinct `name` and `deploy_dir`.
   Optional `base_install` (`none` | `default` | `full`, default
   `default`) and `extras` (list of glob patterns added on top of the
   base set). See "MSVC package selection" below.
-- **`windows_sdk`**: install Windows SDK headers + libs from the same
-  snapshot. Required `build_version`. Optional `sdk_version` (defaults
-  to the highest SDK in that snapshot).
+- **`windows_sdk`**: install Windows SDK headers + libs. Required
+  `sdk_version` (e.g. `26100`). Optional `base_install` (`none` |
+  `default` | `full`, default `default`) and `extras` (list of MSI
+  filename prefixes added on top). Independently versioned from MSVC.
+  See "Windows SDK package selection" below.
 
-Both providers source manifests from the
-[`roblabla/msvc-manifest-history`][mh] community mirror, which snapshots
-Microsoft's per-VS-release `channel.json` and `manifest.json` files on
-`release-{16,17,18}` branches. Pinning a `build_version` resolves to one
-mirror commit → one immutable manifest → fixed CDN payload URLs. That's
-the only string Microsoft guarantees identifies an exact build, so it's
-the only string that gives 100%-reproducible installs.
+Both providers source data from the
+[`roblabla/msvc-manifest-history`][mh] community mirror — Microsoft's
+per-VS-release `channel.json` and `manifest.json`, snapshotted on
+`release-{16,17,18}` branches. MSVC pins one snapshot via `build_version`
+(the only string Microsoft guarantees identifies a specific installer
+build, so the only string that gives 100%-reproducible MSVC installs).
+The Windows SDK is independently versioned by Microsoft and ships
+immutable payloads per `sdk_version`, so it pins that directly without
+caring which snapshot the manifest came from.
 
-If the mirror goes away, MSVC and SDK installs break. That's a known
-tradeoff — preferable to losing historical-version reproducibility.
+If the mirror goes away, both installs break. Known tradeoff —
+preferable to losing historical-version reproducibility.
 
 [mh]: https://github.com/roblabla/msvc-manifest-history
 
@@ -187,6 +193,58 @@ natron msvc extract --build-version 18.6.11819.183 --out C:\temp\msvc
 and fetches each commit's small `channel.json` (~130 KB; cached after
 first run). `extract` reuses the global download cache, so re-runs don't
 re-download. Already-populated package dirs in `--out` are skipped.
+
+### Windows SDK package selection
+
+Same `base_install` shape as MSVC, but the selection unit is **MSI
+filename prefix** rather than package id glob — the SDK's user-facing
+"components" are at the MSI level.
+
+- `default` (the default): 7 essential MSIs that get you a typical
+  C/C++ dev set — Universal CRT, Win32 desktop headers/libs, OneCore
+  headers, UWP/Windows Store headers + libs + tools.
+- `full`: every MSI in the SDK component meta-package's dep graph
+  (debuggers, ARM/ARM64 target libs, driver headers, signing tools,
+  etc.). ~3-4 GB. Mutually exclusive with `extras`.
+- `none`: install only what's in `extras`. Requires at least one prefix.
+
+```toml
+# Default install.
+[toolchain.options]
+sdk_version = "26100"
+
+# Default + extras (common: signtool, mt.exe, rc.exe, ARM64 libs).
+[toolchain.options]
+sdk_version = "26100"
+extras = [
+  "Universal CRT Tools x64",         # signtool, etc.
+  "SDK ARM64 Additions",
+]
+
+# Everything.
+[toolchain.options]
+sdk_version  = "26100"
+base_install = "full"
+```
+
+`extras` entries are plain filename prefixes — no globs. Each entry must
+match at least one MSI in the SDK, otherwise install fails (no silent
+typos).
+
+### Windows SDK debug commands
+
+```bash
+# Every available Windows SDK version (newest-first).
+natron windows_sdk versions
+
+# Every MSI in a specific SDK, grouped by default-installed vs
+# available-for-extras. Use this to discover what to put in extras.
+natron windows_sdk packages --sdk-version 26100
+
+# Download + extract every MSI from one SDK into per-MSI dirs.
+# Use this to discover which MSI contains a missing file.
+natron windows_sdk extract --sdk-version 26100 --out C:\temp\sdk
+```
 
 ## Deploy modes
 

@@ -1,16 +1,23 @@
 //! `windows_sdk` provider: install the Universal CRT + Windows SDK headers
-//! and libs from one Microsoft VS build snapshot.
+//! and libs from a Windows SDK version (e.g. `26100`).
 //!
-//! Manifest source + reproducibility model are identical to `msvc` (both
-//! pin a `build_version` → one mirror commit → one immutable manifest).
-//! `windows_sdk` selects the SDK component meta-package and follows its
-//! declared dependencies to the MSI-bearing packages.
+//! SDK packages are independently versioned from MSVC and immutable per
+//! `sdk_version`: Microsoft uploads each SDK's MSIs once to their CDN
+//! with stable URLs, and multiple Microsoft VS installer snapshots all
+//! reference the same payloads. So pinning `sdk_version` alone is fully
+//! reproducible — we just need any snapshot whose manifest lists it.
+//!
+//! Resolution: scan the newest snapshot of each VS series in
+//! vs2026 → vs2022 → vs2019 order, return on first hit.
 
 use anyhow::{Context, Result, anyhow, bail};
+use std::collections::BTreeSet;
 use std::path::Path;
 use xxhash_rust::xxh3::xxh3_64;
 
-use super::vs_manifest::{self, MirrorUrls, Package, VsManifest};
+use super::vs_manifest::{
+    self, BuildIndexEntry, MirrorUrls, Package, VsManifest, VsVersion,
+};
 use super::{InstallCtx, Installed, Provider};
 use crate::cache::sanitize_fingerprint;
 use crate::extract;
@@ -18,12 +25,12 @@ use crate::fs_util;
 
 pub const ID: &str = "windows_sdk";
 
-/// Filename prefixes of the SDK MSIs we actually need for C/C++ dev. The
-/// SDK ships many more (debuggers, ARM target libs, telemetry shims) we
-/// skip.
-const ESSENTIAL_MSIS: &[&str] = &[
+/// MSI filename prefixes that constitute `base_install = "default"`.
+/// The SDK ships many more MSIs (debuggers, ARM target libs, driver headers,
+/// signing tools, etc.) — the user opts into those via `extras`.
+pub const DEFAULT_ESSENTIAL_MSIS: &[&str] = &[
     "Universal CRT Headers Libraries and Sources",
-    "Windows SDK Desktop Headers x86", // includes d3d10misc.h etc.
+    "Windows SDK Desktop Headers x86", // contains windows.h, kernel32.h, etc.
     "Windows SDK Desktop Libs x64",
     "Windows SDK OnecoreUap Headers",
     "Windows SDK for Windows Store Apps Headers",
@@ -31,38 +38,76 @@ const ESSENTIAL_MSIS: &[&str] = &[
     "Windows SDK for Windows Store Apps Tools",
 ];
 
+// ---- option types ----------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseInstall {
+    None,
+    Default,
+    Full,
+}
+
+impl BaseInstall {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Default => "default",
+            Self::Full => "full",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "none" => Ok(Self::None),
+            "default" => Ok(Self::Default),
+            "full" => Ok(Self::Full),
+            other => bail!("invalid base_install '{other}'; valid: none, default, full"),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Options {
-    build_version: String,
-    sdk_version: Option<String>,
+    sdk_version: String,
+    base: BaseInstall,
+    extras: Vec<String>, // MSI filename prefixes
 }
 
 impl Options {
     fn parse(options: &toml::Table) -> Result<Self> {
-        let build_version = options
-            .get("build_version")
-            .ok_or_else(|| anyhow!("`windows_sdk` provider requires options.build_version"))?
-            .as_str()
-            .ok_or_else(|| anyhow!("`windows_sdk` option 'build_version' must be a string"))?
-            .to_string();
-        let major = vs_manifest::build_version_major(&build_version)
-            .map_err(|e| anyhow!("`windows_sdk` provider: {e}"))?;
-        vs_manifest::VsVersion::from_channel(major)
-            .map_err(|e| anyhow!("`windows_sdk` provider: {e}"))?;
-        let sdk_version = match options.get("sdk_version") {
-            None => None,
-            Some(v) => Some(
-                v.as_str()
-                    .ok_or_else(|| anyhow!("`windows_sdk` option 'sdk_version' must be a string"))?
-                    .to_string(),
-            ),
+        let sdk_version = required_str(options, "sdk_version")?.to_string();
+        if !is_numeric_sdk_version(&sdk_version) {
+            bail!(
+                "`windows_sdk`: sdk_version '{sdk_version}' must be a numeric build number (e.g. 26100)"
+            );
+        }
+        let base = match optional_str(options, "base_install")? {
+            Some(v) => BaseInstall::parse(v)?,
+            None => BaseInstall::Default,
         };
+        let extras = optional_string_list(options, "extras")?;
+
+        if base == BaseInstall::None && extras.is_empty() {
+            bail!("`windows_sdk`: base_install='none' with empty extras would install nothing");
+        }
+        if base == BaseInstall::Full && !extras.is_empty() {
+            bail!(
+                "`windows_sdk`: base_install='full' already selects every MSI; remove extras"
+            );
+        }
         Ok(Self {
-            build_version,
             sdk_version,
+            base,
+            extras,
         })
     }
 }
+
+fn is_numeric_sdk_version(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+// ---- provider --------------------------------------------------------------
 
 pub struct WindowsSdkProvider {
     urls: MirrorUrls,
@@ -93,54 +138,20 @@ impl Provider for WindowsSdkProvider {
 
     fn install(&self, options: &toml::Table, ctx: &mut InstallCtx) -> Result<Installed> {
         let opts = Options::parse(options)?;
+        let fp = fingerprint(&opts);
 
-        // Pinned-sdk_version cache fast path: no need to fetch anything if
-        // the install tree's already on disk.
-        if let Some(ver) = &opts.sdk_version {
-            let fp = sdk_fingerprint(&opts.build_version, ver);
-            if ctx.cache().install_present(&fp) {
-                return Ok(Installed {
-                    fingerprint: fp,
-                    display: display_for(&opts.build_version, ver),
-                    options: resolved_options(&opts, ver),
-                    freshly_extracted: false,
-                });
-            }
-        }
-
-        let entry = vs_manifest::resolve_build_version(&self.urls, &opts.build_version, ctx)?;
-        let manifest = vs_manifest::fetch_manifest_at(&self.urls.raw_base, &entry.commit.sha, ctx)?;
-        let candidates = find_sdk_candidates(&manifest);
-        if candidates.is_empty() {
-            bail!("no Windows SDK component packages in snapshot {}", opts.build_version);
-        }
-        let (resolved_ver, sdk_pkg_id) = match &opts.sdk_version {
-            Some(req) => candidates
-                .iter()
-                .find(|(v, _)| v == req)
-                .ok_or_else(|| {
-                    let avail: Vec<_> = candidates.iter().map(|(v, _)| v.as_str()).collect();
-                    anyhow!(
-                        "sdk_version='{req}' not in snapshot {}; available: {avail:?}",
-                        opts.build_version,
-                    )
-                })?
-                .clone(),
-            None => candidates[0].clone(),
-        };
-
-        let fp = sdk_fingerprint(&opts.build_version, &resolved_ver);
         if ctx.cache().install_present(&fp) {
             return Ok(Installed {
                 fingerprint: fp,
-                display: display_for(&opts.build_version, &resolved_ver),
-                options: resolved_options(&opts, &resolved_ver),
+                display: display_for(&opts),
+                options: resolved_options(&opts),
                 freshly_extracted: false,
             });
         }
 
-        let component = find_exact(&manifest, &sdk_pkg_id)
-            .ok_or_else(|| anyhow!("SDK component package {sdk_pkg_id} not in manifest"))?;
+        let resolved = resolve_sdk_version(&self.urls, &opts.sdk_version, ctx)?;
+        let component = lookup_exact(&resolved.manifest, &resolved.sdk_pkg_id)
+            .ok_or_else(|| anyhow!("SDK component {} not in manifest", resolved.sdk_pkg_id))?;
         let dep_ids: Vec<String> = component.dependencies.keys().cloned().collect();
 
         // Stage all CABs + MSIs in ONE flat directory so msiexec /a can
@@ -153,9 +164,9 @@ impl Provider for WindowsSdkProvider {
         std::fs::create_dir_all(&extract_dir)
             .with_context(|| format!("creating {}", extract_dir.display()))?;
 
-        let mut essential_msis: Vec<std::path::PathBuf> = Vec::new();
+        let mut msis_to_extract: Vec<std::path::PathBuf> = Vec::new();
         for dep_id in &dep_ids {
-            let Some(pkg) = find_exact(&manifest, dep_id) else {
+            let Some(pkg) = lookup_exact(&resolved.manifest, dep_id) else {
                 tracing::warn!("SDK dep package {dep_id} not in manifest; skipping");
                 continue;
             };
@@ -177,14 +188,16 @@ impl Provider for WindowsSdkProvider {
                         )
                     })?;
                 }
-                if filename.to_lowercase().ends_with(".msi") && is_essential_msi(&filename) {
-                    essential_msis.push(dest);
+                if filename.to_lowercase().ends_with(".msi")
+                    && msi_should_extract(&filename, &opts)
+                {
+                    msis_to_extract.push(dest);
                 }
             }
         }
 
-        tracing::info!("extracting {} essential SDK MSIs", essential_msis.len());
-        for msi in &essential_msis {
+        tracing::info!("extracting {} SDK MSIs", msis_to_extract.len());
+        for msi in &msis_to_extract {
             extract::extract_msi(msi, &extract_dir)
                 .with_context(|| format!("extracting MSI {}", msi.display()))?;
         }
@@ -195,18 +208,110 @@ impl Provider for WindowsSdkProvider {
 
         Ok(Installed {
             fingerprint: fp,
-            display: display_for(&opts.build_version, &resolved_ver),
-            options: resolved_options(&opts, &resolved_ver),
+            display: display_for(&opts),
+            options: resolved_options(&opts),
             freshly_extracted: true,
         })
     }
 }
 
-// ---- SDK package detection -------------------------------------------------
+// ---- SDK resolution (pub helpers shared with the CLI) ----------------------
 
-/// Find every Windows SDK component meta-package in the manifest. Returns
+/// One resolved SDK: which snapshot we found it in, the snapshot's manifest,
+/// and the SDK component meta-package id within that manifest.
+#[derive(Debug)]
+pub struct ResolvedSdk {
+    pub entry: BuildIndexEntry,
+    pub manifest: VsManifest,
+    pub sdk_pkg_id: String,
+}
+
+/// Walk the newest snapshot of each VS series in vs2026 → vs2022 → vs2019
+/// order; return the first snapshot whose manifest lists the requested
+/// `sdk_version`. Errors with the union of SDKs available across all three
+/// snapshots if nothing matches.
+pub fn resolve_sdk_version(
+    urls: &MirrorUrls,
+    sdk_version: &str,
+    ctx: &InstallCtx,
+) -> Result<ResolvedSdk> {
+    let mut available: BTreeSet<String> = BTreeSet::new();
+    let mut last_err: Option<anyhow::Error> = None;
+    for vs in VsVersion::all().iter().rev() {
+        let entry = match newest_entry_for(urls, *vs, ctx) {
+            Ok(e) => e,
+            Err(err) => {
+                last_err = Some(err);
+                continue;
+            }
+        };
+        let manifest = match vs_manifest::fetch_manifest_at(&urls.raw_base, &entry.commit.sha, ctx) {
+            Ok(m) => m,
+            Err(err) => {
+                last_err = Some(err);
+                continue;
+            }
+        };
+        let cands = find_sdk_candidates(&manifest);
+        for (v, _id) in &cands {
+            available.insert(v.clone());
+        }
+        if let Some((_, sdk_pkg_id)) = cands.iter().find(|(v, _)| v == sdk_version) {
+            return Ok(ResolvedSdk {
+                entry,
+                sdk_pkg_id: sdk_pkg_id.clone(),
+                manifest,
+            });
+        }
+    }
+    if available.is_empty() {
+        match last_err {
+            Some(err) => bail!("could not enumerate SDKs from any VS series: {err:#}"),
+            None => bail!("could not enumerate SDKs from any VS series"),
+        }
+    }
+    let mut sorted: Vec<String> = available.into_iter().collect();
+    sorted.sort_by_key(|v| std::cmp::Reverse(numeric_key(v)));
+    bail!(
+        "sdk_version '{sdk_version}' not found in any recent VS snapshot; available: {}",
+        sorted.join(", "),
+    )
+}
+
+/// Distinct SDK versions discovered across the newest snapshot of each VS
+/// series. Sorted descending by numeric key.
+pub fn discover_sdk_versions(urls: &MirrorUrls, ctx: &InstallCtx) -> Result<Vec<String>> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for vs in VsVersion::all() {
+        let entry = match newest_entry_for(urls, vs, ctx) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!("skipping {} for SDK discovery: {err:#}", vs.as_str());
+                continue;
+            }
+        };
+        let manifest = match vs_manifest::fetch_manifest_at(&urls.raw_base, &entry.commit.sha, ctx) {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::warn!(
+                    "skipping {} manifest for SDK discovery: {err:#}",
+                    vs.as_str()
+                );
+                continue;
+            }
+        };
+        for (v, _id) in find_sdk_candidates(&manifest) {
+            seen.insert(v);
+        }
+    }
+    let mut out: Vec<String> = seen.into_iter().collect();
+    out.sort_by_key(|v| std::cmp::Reverse(numeric_key(v)));
+    Ok(out)
+}
+
+/// Find every Windows SDK component meta-package in a manifest. Returns
 /// `(sdk_version, package_id)` sorted descending by numeric version.
-fn find_sdk_candidates(manifest: &VsManifest) -> Vec<(String, String)> {
+pub fn find_sdk_candidates(manifest: &VsManifest) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for pkg in &manifest.packages {
         for prefix in [
@@ -214,7 +319,7 @@ fn find_sdk_candidates(manifest: &VsManifest) -> Vec<(String, String)> {
             "Microsoft.VisualStudio.Component.Windows11SDK.",
         ] {
             if let Some(rest) = pkg.id.strip_prefix(prefix) {
-                if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                if is_numeric_sdk_version(rest) {
                     out.push((rest.to_string(), pkg.id.clone()));
                 }
             }
@@ -224,13 +329,65 @@ fn find_sdk_candidates(manifest: &VsManifest) -> Vec<(String, String)> {
     out
 }
 
-fn numeric_key(v: &str) -> Vec<u64> {
-    v.split('.').map(|s| s.parse::<u64>().unwrap_or(0)).collect()
+/// `(filename_prefix, group)` pairs for every MSI in the SDK component
+/// meta-package's dep graph. Groups: `"default"` if the MSI is in the
+/// essential set, `"extras"` otherwise.
+///
+/// Used by the `windows_sdk packages` CLI to show what an `extras = [...]`
+/// list could pick up.
+pub fn enumerate_msis(manifest: &VsManifest, sdk_pkg_id: &str) -> Result<Vec<(String, String)>> {
+    let component = lookup_exact(manifest, sdk_pkg_id)
+        .ok_or_else(|| anyhow!("SDK component {sdk_pkg_id} not in manifest"))?;
+    let mut out: BTreeSet<(String, String)> = BTreeSet::new();
+    for dep_id in component.dependencies.keys() {
+        let Some(pkg) = lookup_exact(manifest, dep_id) else {
+            continue;
+        };
+        for p in &pkg.payloads {
+            let filename = payload_filename(p);
+            if !filename.to_lowercase().ends_with(".msi") {
+                continue;
+            }
+            let base = strip_installer_prefix(&filename);
+            let group = if DEFAULT_ESSENTIAL_MSIS.iter().any(|p| base.starts_with(p)) {
+                "default"
+            } else {
+                "extras"
+            };
+            out.insert((base, group.to_string()));
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
+fn newest_entry_for(
+    urls: &MirrorUrls,
+    vs: VsVersion,
+    ctx: &InstallCtx,
+) -> Result<BuildIndexEntry> {
+    let entries = vs_manifest::build_index(urls, &[vs], ctx)?;
+    entries
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no commits on mirror for {}", vs.as_str()))
+}
+
+// ---- selection -------------------------------------------------------------
+
+fn msi_should_extract(filename: &str, opts: &Options) -> bool {
+    let base = strip_installer_prefix(filename);
+    let matches_default = DEFAULT_ESSENTIAL_MSIS.iter().any(|p| base.starts_with(p));
+    let matches_extras = opts.extras.iter().any(|p| base.starts_with(p));
+    match opts.base {
+        BaseInstall::Full => true,
+        BaseInstall::Default => matches_default || matches_extras,
+        BaseInstall::None => matches_extras,
+    }
 }
 
 // ---- helpers ---------------------------------------------------------------
 
-fn find_exact<'a>(manifest: &'a VsManifest, id: &str) -> Option<&'a Package> {
+fn lookup_exact<'a>(manifest: &'a VsManifest, id: &str) -> Option<&'a Package> {
     let lower = id.to_lowercase();
     let matches: Vec<&Package> = manifest
         .packages
@@ -259,15 +416,10 @@ fn payload_filename(p: &vs_manifest::Payload) -> String {
     "unknown.bin".to_string()
 }
 
-fn is_essential_msi(filename: &str) -> bool {
-    let base = strip_installer_prefix(filename);
-    ESSENTIAL_MSIS.iter().any(|prefix| base.starts_with(prefix))
-}
-
 /// VS manifest filenames sometimes embed install-subdirectory components
 /// (`Installers\foo.msi`, `Redistributable\10.1.0.0\UAPSDKAddOn-x86.msi`).
 /// Flatten to just the basename so msiexec sees CABs as siblings.
-fn strip_installer_prefix(filename: &str) -> String {
+pub fn strip_installer_prefix(filename: &str) -> String {
     let normalized = filename.replace('\\', "/");
     normalized
         .rsplit('/')
@@ -276,11 +428,10 @@ fn strip_installer_prefix(filename: &str) -> String {
         .to_string()
 }
 
-/// MSIs extract under `<extract>/Windows Kits/10/*`. Move each child up to
-/// `<dst>/` so the staged tree starts at Include/Lib/etc. Merges
-/// when names collide; leaves stray `.msi` siblings in the scratch dir
-/// (where they'll be cleaned up).
-fn flatten_windows_kits_into(src: &Path, dst: &Path) -> Result<()> {
+/// MSIs extract under `<src>/Windows Kits/10/*`. Move each child up to
+/// `<dst>/` so the staged tree starts at Include/Lib/etc. Merges when names
+/// collide. `pub` so the CLI's per-MSI extract can reuse it.
+pub fn flatten_windows_kits_into(src: &Path, dst: &Path) -> Result<()> {
     let kits = src.join("Windows Kits").join("10");
     if !kits.exists() {
         return Ok(());
@@ -318,28 +469,96 @@ fn merge_into(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+fn numeric_key(v: &str) -> Vec<u64> {
+    v.split('.').map(|s| s.parse::<u64>().unwrap_or(0)).collect()
+}
+
+// ---- option helpers --------------------------------------------------------
+
+fn required_str<'a>(options: &'a toml::Table, key: &str) -> Result<&'a str> {
+    options
+        .get(key)
+        .ok_or_else(|| anyhow!("`windows_sdk` provider requires options.{key}"))?
+        .as_str()
+        .ok_or_else(|| anyhow!("`windows_sdk` option '{key}' must be a string"))
+}
+
+fn optional_str<'a>(options: &'a toml::Table, key: &str) -> Result<Option<&'a str>> {
+    match options.get(key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| anyhow!("`windows_sdk` option '{key}' must be a string")),
+    }
+}
+
+fn optional_string_list(options: &toml::Table, key: &str) -> Result<Vec<String>> {
+    let Some(v) = options.get(key) else {
+        return Ok(Vec::new());
+    };
+    let arr = v
+        .as_array()
+        .ok_or_else(|| anyhow!("`windows_sdk` option '{key}' must be an array of strings"))?;
+    let mut out = Vec::new();
+    for item in arr {
+        let s = item
+            .as_str()
+            .ok_or_else(|| anyhow!("`windows_sdk` option '{key}' entries must be strings"))?;
+        if s.is_empty() {
+            bail!("`windows_sdk` option '{key}' entries may not be empty");
+        }
+        if !out.iter().any(|x: &String| x == s) {
+            out.push(s.to_string());
+        }
+    }
+    Ok(out)
+}
+
 // ---- fingerprint + display -------------------------------------------------
 
-fn sdk_fingerprint(build_version: &str, sdk_version: &str) -> String {
-    let key = format!("{build_version}\n{sdk_version}");
+fn fingerprint(opts: &Options) -> String {
+    let mut key = String::new();
+    key.push_str(&opts.sdk_version);
+    key.push('\n');
+    key.push_str(opts.base.as_str());
+    key.push('\n');
+    let mut extras = opts.extras.clone();
+    extras.sort();
+    for extra in extras {
+        key.push_str("extra\t");
+        key.push_str(&extra);
+        key.push('\n');
+    }
     let hash = xxh3_64(key.as_bytes());
-    sanitize_fingerprint(&format!("windows_sdk-{build_version}-{sdk_version}-{hash:016x}"))
+    sanitize_fingerprint(&format!("windows_sdk-{}-{hash:016x}", opts.sdk_version))
 }
 
-fn display_for(build_version: &str, sdk_version: &str) -> String {
-    format!("windows_sdk {sdk_version} (build {build_version})")
+fn display_for(opts: &Options) -> String {
+    format!("windows_sdk {} (base={})", opts.sdk_version, opts.base.as_str())
 }
 
-fn resolved_options(opts: &Options, resolved_sdk: &str) -> toml::Table {
+fn resolved_options(opts: &Options) -> toml::Table {
     let mut o = toml::Table::new();
     o.insert(
-        "build_version".into(),
-        toml::Value::String(opts.build_version.clone()),
+        "sdk_version".into(),
+        toml::Value::String(opts.sdk_version.clone()),
     );
     o.insert(
-        "sdk_version".into(),
-        toml::Value::String(resolved_sdk.to_string()),
+        "base_install".into(),
+        toml::Value::String(opts.base.as_str().to_string()),
     );
+    if !opts.extras.is_empty() {
+        o.insert(
+            "extras".into(),
+            toml::Value::Array(
+                opts.extras
+                    .iter()
+                    .map(|s| toml::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
     o
 }
 

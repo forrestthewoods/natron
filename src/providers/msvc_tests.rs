@@ -225,53 +225,6 @@ fn extras_zero_match_errors() {
     assert!(err.to_string().contains("matched no packages"), "got: {err}");
 }
 
-// ---- metadata dep closure --------------------------------------------------
-
-#[test]
-fn closure_pulls_res_props_servicing_not_atl() {
-    let m: VsManifest = serde_json::from_str(&format!(
-        r#"{{"packages":[
-            {{"id":"Microsoft.VC.14.52.18.5.Tools.HostX64.TargetX64.base",
-             "version":"14.52.36328","payloads":[],
-             "dependencies":{{
-                "Microsoft.VC.14.52.18.5.Tools.HostX64.TargetX64.Res.base":"14.52.36328",
-                "Microsoft.VC.14.52.18.5.Props.x64":"14.52.36328",
-                "Microsoft.VC.14.52.18.5.Servicing.Compilers":"14.52.36328",
-                "Microsoft.VC.14.52.18.5.ATL.X64.base":"14.52.36328"
-             }}}},
-            {res}, {props}, {svc}, {atl}
-        ]}}"#,
-        res = pkg_with_lang("Microsoft.VC.14.52.18.5.Tools.HostX64.TargetX64.Res.base", "14.52.36328", "en-US"),
-        props = pkg("Microsoft.VC.14.52.18.5.Props.x64", "14.52.36328"),
-        svc = pkg("Microsoft.VC.14.52.18.5.Servicing.Compilers", "14.52.36328"),
-        atl = pkg("Microsoft.VC.14.52.18.5.ATL.X64.base", "14.52.36328"),
-    ))
-    .unwrap();
-    let compiler = find_primary_compiler(&m, VsVersion::Vs2026).unwrap();
-    let family = family_prefix(&compiler.id).unwrap();
-    let opts = parsed_with_extras(
-        &[("build_version", "18.6.11819.183"), ("base_install", "none")],
-        &["Tools.HostX64.TargetX64.base"],
-    );
-
-    let selected = select_packages(&m, compiler, &family, &opts).unwrap();
-    let ids: Vec<&str> = selected.iter().map(|r| r.id.as_str()).collect();
-    assert!(ids.iter().any(|s| s.ends_with(".Tools.HostX64.TargetX64.Res.base")));
-    assert!(ids.iter().any(|s| s.ends_with(".Props.x64")));
-    assert!(ids.iter().any(|s| s.ends_with(".Servicing.Compilers")));
-    assert!(!ids.iter().any(|s| s.ends_with(".ATL.X64.base")));
-}
-
-#[test]
-fn metadata_dep_suffix_anchored() {
-    assert!(!is_metadata_dependency("Microsoft.VC.14.52.propsfoo"));
-    assert!(!is_metadata_dependency("Microsoft.VC.14.52.servicingX"));
-    assert!(is_metadata_dependency("Microsoft.VC.14.52.props.x64"));
-    assert!(is_metadata_dependency("Microsoft.VC.14.52.servicing.compilers"));
-    assert!(is_metadata_dependency("Microsoft.VC.14.52.Res.en-US"));
-    assert!(is_metadata_dependency("Microsoft.VC.14.52.Resources.en-US"));
-}
-
 // ---- fingerprint -----------------------------------------------------------
 
 #[test]

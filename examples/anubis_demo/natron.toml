@@ -72,11 +72,19 @@ build_version = "18.6.11819.183"   # VS 2026 18.6.1
 # ids (escape hatch for outside-family packages).
 # extras = ["ATL.*", "MFC.*"]
 
-# === Windows SDK (from the same VS snapshot as msvc above) ===
+# === Windows SDK ===
+# Independent of MSVC. Pin a Windows SDK build number directly. Run
+# `natron windows_sdk versions` to list what's available.
 [[toolchain]]
 name        = "windows_sdk"
 deploy_dir  = "windows_sdk"
 provider    = "windows_sdk"
 [toolchain.options]
-build_version = "18.6.11819.183"
-sdk_version   = "26100"            # optional; defaults to the highest SDK in the snapshot
+sdk_version = "26100"               # required: exact Windows SDK build number
+# base_install defaults to "default" (Universal CRT + Win32 desktop headers/libs +
+# UWP headers/libs). Options:
+#   "full" — every MSI in the SDK component meta-package (~3-4 GB).
+#   "none" — install nothing from default; extras only.
+# extras adds MSI filename-prefix matches on top of base_install. Run
+# `natron windows_sdk packages --sdk-version 26100` to see what's available.
+# extras = ["Windows SDK Signing Tools", "Universal CRT Tools x64"]
