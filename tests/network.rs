@@ -1,26 +1,21 @@
-//! Network-dependent integration tests. Gated behind `NATRON_NETWORK_TESTS=1`.
-//! These hit real upstream services (ziglang.org, GitHub, aka.ms) and are
-//! not run on every `cargo test` — they're for CI on a dedicated runner.
+//! Network-dependent integration tests. Each test is `#[ignore]`'d so the
+//! default `cargo test` run stays hermetic. To exercise:
 //!
-//! Each test starts with a short-circuit if the env var isn't set, so they
-//! show up as `ok` (skipped) in the default suite.
+//!     cargo test -- --ignored            # only the network tests
+//!     cargo test -- --include-ignored    # full suite, hermetic + network
+//!
+//! Tests hit real upstream services (ziglang.org, GitHub, the roblabla
+//! mirror) — they're for CI on a dedicated runner or for human spot checks.
 
 mod common;
 
 use common::TestEnv;
 use natron::{Cache, GithubProvider, Natron, ProviderRegistry, ToolchainEntry, UrlProvider, ZigProvider};
 
-fn enabled() -> bool {
-    std::env::var("NATRON_NETWORK_TESTS").is_ok()
-}
-
 #[test]
+#[ignore = "network: requires upstream access (cargo test -- --ignored)"]
 fn test_real_zig_install() {
-    if !enabled() {
-        return;
-    }
     let env = TestEnv::new();
-    // Use the real index URL, not a fixture.
     let cache = Cache::at(env.cache_dir.clone());
     let mut reg = ProviderRegistry::empty();
     reg.register(ZigProvider::new());
@@ -48,10 +43,8 @@ fn test_real_zig_install() {
 }
 
 #[test]
+#[ignore = "network: requires upstream access (cargo test -- --ignored)"]
 fn test_real_url_nasm_install() {
-    if !enabled() {
-        return;
-    }
     let env = TestEnv::new();
     let cache = Cache::at(env.cache_dir.clone());
     let mut reg = ProviderRegistry::empty();
@@ -83,10 +76,8 @@ fn test_real_url_nasm_install() {
 }
 
 #[test]
+#[ignore = "network: requires upstream access (cargo test -- --ignored)"]
 fn test_real_github_llvm_install() {
-    if !enabled() {
-        return;
-    }
     // Choose a smaller release if you want this test to run faster locally;
     // LLVM Windows asset is ~1.5 GB.
     let env = TestEnv::new();
@@ -120,19 +111,38 @@ fn test_real_github_llvm_install() {
     assert!(report.errors.is_empty(), "{:?}", report.errors);
 }
 
+// ---- MSVC / windows_sdk mirror tests ---------------------------------------
+//
+// Focused per-concern probes against the live roblabla mirror. Each one
+// pinpoints a specific failure mode if it breaks: "commits API shape
+// changed" vs "primary compiler heuristic missed vs2026" vs "SDK
+// enumeration broke" vs "SDK MSI grouping broke".
+
 #[test]
-fn test_real_msvc_manifest_shape() {
-    // Smoke test for the roblabla mirror — the sole upstream the msvc and
-    // windows_sdk providers depend on. For each VS series: enumerate commits
-    // via the GitHub API, fetch the HEAD `channel.json` (confirming the
-    // info.buildVersion shape), and parse the HEAD `manifest.json` (confirming
-    // the packages shape). Doesn't install anything.
-    if !enabled() {
-        return;
+#[ignore = "network: requires upstream access (cargo test -- --ignored)"]
+fn test_real_mirror_commits_api() {
+    use natron::providers::vs_manifest::{self, MirrorUrls, VsVersion};
+    let urls = MirrorUrls::default();
+    for vs in VsVersion::all() {
+        let commits = vs_manifest::fetch_commits(&urls.commits_base, vs)
+            .unwrap_or_else(|e| panic!("commits for {}: {e:#}", vs.as_str()));
+        assert!(
+            !commits.is_empty(),
+            "{} has zero commits on the mirror",
+            vs.as_str()
+        );
     }
-    use natron::providers::vs_manifest::{
-        self, MirrorUrls, VsVersion,
-    };
+}
+
+#[test]
+#[ignore = "network: requires upstream access (cargo test -- --ignored)"]
+fn test_real_msvc_primary_compiler() {
+    // Newest vs2026 snapshot → find_primary_compiler returns a
+    // Microsoft.VC.*.18.<minor>.Tools.HostX64.TargetX64.base id. If
+    // Microsoft renames the family or changes the .18.<minor>. structure,
+    // this catches it.
+    use natron::providers::msvc;
+    use natron::providers::vs_manifest::{self, MirrorUrls, VsVersion};
     use natron::providers::InstallCtx;
     let env = TestEnv::new();
     let cache = Cache::at(env.cache_dir.clone());
@@ -140,28 +150,70 @@ fn test_real_msvc_manifest_shape() {
     let ctx = InstallCtx::new(cache);
     let urls = MirrorUrls::default();
 
-    for vs in VsVersion::all() {
-        let commits = vs_manifest::fetch_commits(&urls.commits_base, vs)
-            .unwrap_or_else(|e| panic!("commits for {}: {e:#}", vs.as_str()));
-        assert!(!commits.is_empty(), "no commits for {}", vs.as_str());
+    let commits = vs_manifest::fetch_commits(&urls.commits_base, VsVersion::Vs2026)
+        .expect("commits");
+    let head_sha = &commits[0].sha;
+    let manifest = vs_manifest::fetch_manifest_at(&urls.raw_base, head_sha, &ctx)
+        .expect("manifest");
+    let primary = msvc::find_primary_compiler(&manifest, VsVersion::Vs2026)
+        .expect("primary compiler");
+    assert!(
+        primary.id.starts_with("Microsoft.VC.") && primary.id.contains(".18.")
+            && primary.id.ends_with(".Tools.HostX64.TargetX64.base"),
+        "unexpected primary id: {}",
+        primary.id,
+    );
+}
 
-        let head_sha = &commits[0].sha;
-        let info = vs_manifest::fetch_channel_info(&urls.raw_base, head_sha, &ctx)
-            .unwrap_or_else(|e| panic!("channel.json for {}@{head_sha}: {e:#}", vs.as_str()));
-        assert!(
-            !info.build_version.is_empty(),
-            "{} HEAD has no build_version",
-            vs.as_str()
-        );
+#[test]
+#[ignore = "network: requires upstream access (cargo test -- --ignored)"]
+fn test_real_windows_sdk_versions() {
+    use natron::providers::vs_manifest::MirrorUrls;
+    use natron::providers::windows_sdk;
+    use natron::providers::InstallCtx;
+    let env = TestEnv::new();
+    let cache = Cache::at(env.cache_dir.clone());
+    cache.ensure_layout().expect("cache layout");
+    let ctx = InstallCtx::new(cache);
+    let urls = MirrorUrls::default();
 
-        let manifest = vs_manifest::fetch_manifest_at(&urls.raw_base, head_sha, &ctx)
-            .unwrap_or_else(|e| panic!("manifest.json for {}@{head_sha}: {e:#}", vs.as_str()));
-        assert!(
-            !manifest.packages.is_empty(),
-            "{} HEAD manifest has zero packages",
-            vs.as_str()
-        );
-    }
+    let versions = windows_sdk::discover_sdk_versions(&urls, &ctx).expect("discover");
+    assert!(
+        !versions.is_empty(),
+        "no Windows SDK versions discovered on the mirror"
+    );
+}
+
+#[test]
+#[ignore = "network: requires upstream access (cargo test -- --ignored)"]
+fn test_real_windows_sdk_packages() {
+    // Resolve the newest SDK and confirm enumerate_msis returns at least
+    // one default-installed MSI AND at least one extras-available MSI.
+    use natron::providers::vs_manifest::MirrorUrls;
+    use natron::providers::windows_sdk;
+    use natron::providers::InstallCtx;
+    let env = TestEnv::new();
+    let cache = Cache::at(env.cache_dir.clone());
+    cache.ensure_layout().expect("cache layout");
+    let ctx = InstallCtx::new(cache);
+    let urls = MirrorUrls::default();
+
+    let versions = windows_sdk::discover_sdk_versions(&urls, &ctx).expect("discover");
+    let newest = versions.first().expect("at least one SDK").clone();
+    let resolved =
+        windows_sdk::resolve_sdk_version(&urls, &newest, &ctx).expect("resolve");
+    let msis = windows_sdk::enumerate_msis(&resolved.manifest, &resolved.sdk_pkg_id)
+        .expect("enumerate");
+    let default_count = msis.iter().filter(|(_, g)| g == "default").count();
+    let extras_count = msis.iter().filter(|(_, g)| g == "extras").count();
+    assert!(
+        default_count > 0,
+        "no default MSIs in SDK {newest} (have: {msis:?})"
+    );
+    assert!(
+        extras_count > 0,
+        "no extras MSIs in SDK {newest} (only default — unusual?)"
+    );
 }
 
 fn detect_zig_platform() -> &'static str {

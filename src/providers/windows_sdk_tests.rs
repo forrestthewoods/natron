@@ -344,6 +344,157 @@ fn strip_installer_prefix_flattens_subdirs() {
     assert_eq!(strip_installer_prefix("a/b/c.cab"), "c.cab");
 }
 
+// ---- is_numeric_sdk_version boundaries -------------------------------------
+
+#[test]
+fn is_numeric_sdk_version_boundaries() {
+    assert!(!is_numeric_sdk_version(""), "empty rejected");
+    assert!(is_numeric_sdk_version("26100"), "plain digits accepted");
+    assert!(is_numeric_sdk_version("10.0.26100"), "dotted accepted");
+    assert!(is_numeric_sdk_version("10.0.26100.0"), "fully dotted accepted");
+    assert!(!is_numeric_sdk_version("abc"), "alpha rejected");
+    assert!(!is_numeric_sdk_version("26100abc"), "mixed rejected");
+    assert!(!is_numeric_sdk_version("26100-x86"), "punctuation rejected");
+}
+
+// ---- enumerate_msis --------------------------------------------------------
+
+/// Build a manifest with one SDK component meta-package whose dependencies
+/// each carry the given MSI filenames as payloads. The component id is
+/// `Microsoft.VisualStudio.Component.Windows11SDK.<sdk_version>`.
+fn sdk_manifest_with_deps(sdk_version: &str, msi_filenames_per_dep: &[&[&str]]) -> VsManifest {
+    let mut dep_ids = Vec::new();
+    let mut dep_pkgs = Vec::new();
+    for (i, filenames) in msi_filenames_per_dep.iter().enumerate() {
+        let dep_id = format!("Microsoft.Windows.10.SDK.Dep{i}");
+        dep_ids.push(format!(r#""{dep_id}":"x""#));
+        let payloads: String = filenames
+            .iter()
+            .map(|f| {
+                // JSON-escape backslashes that may appear in nested paths.
+                let escaped = f.replace('\\', "\\\\");
+                format!(r#"{{"url":"file:///dummy","fileName":"{escaped}"}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        dep_pkgs.push(format!(
+            r#"{{"id":"{dep_id}","version":"x","payloads":[{payloads}]}}"#
+        ));
+    }
+    let component = format!(
+        r#"{{"id":"Microsoft.VisualStudio.Component.Windows11SDK.{sdk_version}","version":"x","payloads":[],"dependencies":{{{}}}}}"#,
+        dep_ids.join(",")
+    );
+    let json = format!(
+        r#"{{"packages":[{component},{}]}}"#,
+        dep_pkgs.join(",")
+    );
+    serde_json::from_str(&json).unwrap()
+}
+
+fn sdk_pkg_id(sdk_version: &str) -> String {
+    format!("Microsoft.VisualStudio.Component.Windows11SDK.{sdk_version}")
+}
+
+#[test]
+fn enumerate_msis_errors_on_missing_component() {
+    let m: VsManifest = serde_json::from_str(r#"{"packages":[]}"#).unwrap();
+    let err = enumerate_msis(&m, &sdk_pkg_id("26100")).unwrap_err();
+    assert!(err.to_string().contains("26100"), "got: {err}");
+}
+
+#[test]
+fn enumerate_msis_flattens_nested_filenames() {
+    let m = sdk_manifest_with_deps(
+        "26100",
+        &[&[
+            "Installers\\Universal CRT Headers Libraries and Sources-x86_en-us.msi",
+            "Redistributable/10.1.0.0/Windows SDK Desktop Libs x64-x86_en-us.msi",
+        ]],
+    );
+    let msis = enumerate_msis(&m, &sdk_pkg_id("26100")).unwrap();
+    let names: Vec<&str> = msis.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"Universal CRT Headers Libraries and Sources-x86_en-us.msi"),
+        "got: {names:?}"
+    );
+    assert!(
+        names.contains(&"Windows SDK Desktop Libs x64-x86_en-us.msi"),
+        "got: {names:?}"
+    );
+}
+
+#[test]
+fn enumerate_msis_dedupes_filenames_across_deps() {
+    // Two SDK deps each carrying the same MSI filename — they appear in
+    // the manifest twice, but `enumerate_msis` should collapse to one entry.
+    let m = sdk_manifest_with_deps(
+        "26100",
+        &[
+            &["Universal CRT Headers Libraries and Sources-x86_en-us.msi"],
+            &["Universal CRT Headers Libraries and Sources-x86_en-us.msi"],
+        ],
+    );
+    let msis = enumerate_msis(&m, &sdk_pkg_id("26100")).unwrap();
+    assert_eq!(msis.len(), 1, "expected dedup; got {msis:?}");
+    assert_eq!(
+        msis[0].0,
+        "Universal CRT Headers Libraries and Sources-x86_en-us.msi"
+    );
+}
+
+// ---- check_extras_match (zero-match regression) ----------------------------
+
+#[test]
+fn install_errors_on_extras_zero_match() {
+    // Regression: a typo'd extras prefix used to silently fall through
+    // to a default install. Now it errors loudly.
+    let tmp = TempDir::new().unwrap();
+    let sdk_v = "26100";
+    let pkgs_json = sdk_packages_for_install(sdk_v);
+    let fx = MirrorFixture::build(
+        tmp.path(),
+        &[(
+            VsVersion::Vs2026,
+            &[FxSnapshot {
+                sha: "s18",
+                date: "2026-05-01T00:00:00Z",
+                build_version: "18.6.0.0",
+                display_version: "18.6",
+                product_line_version: "18",
+                manifest_packages_json: pkgs_json,
+            }],
+        )],
+    );
+
+    let mut ctx = test_ctx(&tmp);
+    let provider = WindowsSdkProvider::with_urls(fx.urls);
+    let mut opts = toml::Table::new();
+    opts.insert("sdk_version".into(), toml::Value::String(sdk_v.into()));
+    opts.insert(
+        "extras".into(),
+        toml::Value::Array(vec![toml::Value::String("Sigining Tools".into())]), // typo
+    );
+    let err = provider.install(&opts, &mut ctx).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("Sigining Tools"), "got: {msg}");
+    assert!(msg.contains("matched no MSIs"), "got: {msg}");
+}
+
+/// Build a manifest packages JSON with one SDK component + a dep package
+/// carrying a single MSI (so the SDK has at least one extractable target,
+/// but a typo'd extras prefix won't match).
+fn sdk_packages_for_install(sdk_version: &str) -> String {
+    let dep_id = "Microsoft.Windows.10.SDK.Dep0";
+    let component = format!(
+        r#"{{"id":"Microsoft.VisualStudio.Component.Windows11SDK.{sdk_version}","version":"x","payloads":[],"dependencies":{{"{dep_id}":"x"}}}}"#
+    );
+    let dep = format!(
+        r#"{{"id":"{dep_id}","version":"x","payloads":[{{"url":"file:///dummy","fileName":"Universal CRT Headers Libraries and Sources-x86_en-us.msi"}}]}}"#
+    );
+    format!("{component},{dep}")
+}
+
 #[test]
 fn flatten_windows_kits_moves_children_to_dst() {
     let tmp = TempDir::new().unwrap();

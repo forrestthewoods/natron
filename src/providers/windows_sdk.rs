@@ -154,6 +154,11 @@ impl Provider for WindowsSdkProvider {
             .ok_or_else(|| anyhow!("SDK component {} not in manifest", resolved.sdk_pkg_id))?;
         let dep_ids: Vec<String> = component.dependencies.keys().cloned().collect();
 
+        // Validate extras BEFORE downloading anything — typo'd prefixes
+        // should fail loud, matching msvc's behavior on a zero-match
+        // glob. Otherwise the user silently gets a default install.
+        check_extras_match(&resolved.manifest, &dep_ids, &opts)?;
+
         // Stage all CABs + MSIs in ONE flat directory so msiexec /a can
         // resolve sibling CAB references by basename.
         let staging_raw = ctx.staging_dir()?.to_path_buf();
@@ -373,6 +378,52 @@ fn newest_entry_for(
 }
 
 // ---- selection -------------------------------------------------------------
+
+/// Verify every `opts.extras` prefix matches at least one MSI in the SDK's
+/// dep graph. A typo should error rather than silently produce a default
+/// install, matching `msvc`'s zero-match semantics.
+fn check_extras_match(
+    manifest: &VsManifest,
+    dep_ids: &[String],
+    opts: &Options,
+) -> Result<()> {
+    if opts.extras.is_empty() {
+        return Ok(());
+    }
+    let mut hits = vec![false; opts.extras.len()];
+    for dep_id in dep_ids {
+        let Some(pkg) = lookup_exact(manifest, dep_id) else {
+            continue;
+        };
+        for p in &pkg.payloads {
+            let filename = payload_filename(p);
+            if !filename.to_lowercase().ends_with(".msi") {
+                continue;
+            }
+            let base = strip_installer_prefix(&filename);
+            for (i, extra) in opts.extras.iter().enumerate() {
+                if base.starts_with(extra) {
+                    hits[i] = true;
+                }
+            }
+        }
+    }
+    let unmatched: Vec<&str> = opts
+        .extras
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !hits[*i])
+        .map(|(_, e)| e.as_str())
+        .collect();
+    if !unmatched.is_empty() {
+        bail!(
+            "`windows_sdk`: extras matched no MSIs in SDK {}: [{}]",
+            opts.sdk_version,
+            unmatched.join(", "),
+        );
+    }
+    Ok(())
+}
 
 fn msi_should_extract(filename: &str, opts: &Options) -> bool {
     let base = strip_installer_prefix(filename);

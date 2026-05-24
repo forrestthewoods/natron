@@ -256,6 +256,18 @@ fn resolve_build_version_rejects_unknown_major() {
 }
 
 #[test]
+fn default_commits_base_includes_path_filter() {
+    // Regression guard: `?path=channel.json` filters out the mirror's
+    // initial CI-setup commits which would otherwise show as 404 warnings
+    // for users running `msvc versions`. Removing the filter is a regression.
+    let url = default_commits_base();
+    assert!(
+        url.contains("path=channel.json"),
+        "default_commits_base() lost the path filter: {url}"
+    );
+}
+
+#[test]
 fn parse_json_evicts_cache_on_corruption() {
     let tmp = TempDir::new().unwrap();
     let bad = tmp.path().join("bad.json");

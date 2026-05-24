@@ -290,6 +290,16 @@ fn install_default_extracts_expected_files() {
     assert!(raw
         .join("VC/Redist/MSVC/14.52.36328/x64/Microsoft.VC145.CRT/vcruntime140.dll")
         .is_file());
+    // Regression: locale resources (.Res.base payloads) must land in the
+    // default install. They're how cl.exe's error messages get localized —
+    // without `1033/clui.dll` cl.exe fails to start. The closure deletion
+    // relies on DEFAULT_PATTERNS' `Tools.HostX64.TargetX64*` glob covering
+    // Res.base; this assertion locks that in.
+    assert!(
+        raw.join("VC/Tools/MSVC/14.52.36328/bin/Hostx64/x64/1033/clui.dll")
+            .is_file(),
+        "default install missing locale resources (clui.dll)"
+    );
 }
 
 #[test]
@@ -387,6 +397,13 @@ fn installable_packages_json(
             format!("Microsoft.VC.{id_version}.Tools.HostX64.TargetX64.base"),
             "tools.vsix",
             format!("VC/Tools/MSVC/{package_version}/bin/Hostx64/x64/cl.exe"),
+        ),
+        (
+            // Locale-resource package — must be matched by DEFAULT_PATTERNS'
+            // `Tools.HostX64.TargetX64*` glob.
+            format!("Microsoft.VC.{id_version}.Tools.HostX64.TargetX64.Res.base"),
+            "tools-res.vsix",
+            format!("VC/Tools/MSVC/{package_version}/bin/Hostx64/x64/1033/clui.dll"),
         ),
         (
             format!("Microsoft.VC.{id_version}.CRT.Headers.base"),
