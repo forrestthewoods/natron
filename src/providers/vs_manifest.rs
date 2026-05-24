@@ -152,8 +152,12 @@ pub fn commits_url(base: &str, vs: VsVersion, page: u32) -> String {
 }
 
 pub fn default_commits_base() -> String {
+    // `?path=channel.json` filters to commits that actually touched the file.
+    // Without it we'd also enumerate the mirror's initial CI-setup commits
+    // (which lack channel.json entirely) and pay a fetch + 404 per commit
+    // for nothing.
     format!(
-        "https://api.github.com/repos/{MIRROR_OWNER}/{MIRROR_REPO}/commits?sha={{branch}}&per_page=100&page={{page}}"
+        "https://api.github.com/repos/{MIRROR_OWNER}/{MIRROR_REPO}/commits?sha={{branch}}&path=channel.json&per_page=100&page={{page}}"
     )
 }
 
@@ -315,10 +319,8 @@ pub fn build_index(
 }
 
 /// Fan `fetch_channel_info_with_cache` out across a small worker pool.
-/// Preserves the order of `commits` in the returned entries (per-index
-/// result slots, not a queue of finished results). Per-commit fetch errors
-/// are logged via `tracing::warn!` and the commit is dropped — same UX as
-/// the original sequential loop.
+/// Results land in per-index slots so the input commit order (date-desc)
+/// is preserved without re-sorting. Fetch errors are logged and dropped.
 fn parallel_fetch_channel_infos(
     raw_base: &str,
     commits: &[CommitRef],
