@@ -148,10 +148,18 @@ fn run_packages(
     let (entry, manifest) = resolve_and_load(ctx, urls, &args.build_version)?;
     let compiler = msvc::find_primary_compiler(&manifest, entry.vs)?;
     let family = msvc::family_prefix(&compiler.id)?;
+    let compiler_version = primary_version(compiler)?;
 
+    // Scope to packages at the primary compiler's exact version. A snapshot
+    // contains thousands of unrelated entries — Android workloads, .NET
+    // tools, legacy compat toolsets at other versions — none of which a
+    // user running `msvc packages` would expect to see.
     let mut in_family: Vec<&Package> = Vec::new();
     let mut out_of_family: Vec<&Package> = Vec::new();
     for pkg in &manifest.packages {
+        if pkg.version.as_deref() != Some(compiler_version) {
+            continue;
+        }
         if starts_with_ignore_ascii_case(&pkg.id, &family) {
             in_family.push(pkg);
         } else {
@@ -215,7 +223,18 @@ fn run_extract(
     std::fs::create_dir_all(&args.out)
         .with_context(|| format!("creating {}", args.out.display()))?;
 
-    let mut to_extract: Vec<&Package> = manifest.packages.iter().collect();
+    let compiler = msvc::find_primary_compiler(&manifest, entry.vs)?;
+    let compiler_version = primary_version(compiler)?;
+
+    // Same scope as `packages`: filter to the primary compiler's exact
+    // version. Excludes Android/Python/etc. workloads + legacy compat
+    // toolsets at other versions that just happen to ship in the same
+    // VS snapshot.
+    let mut to_extract: Vec<&Package> = manifest
+        .packages
+        .iter()
+        .filter(|p| p.version.as_deref() == Some(compiler_version))
+        .collect();
     to_extract.sort_by_key(|p| sort_key(p));
 
     writeln!(
@@ -274,6 +293,12 @@ fn resolve_and_load(
 
 fn sort_key(p: &Package) -> (String, Option<String>) {
     (p.id.to_ascii_lowercase(), p.language.clone())
+}
+
+fn primary_version(pkg: &Package) -> Result<&str> {
+    pkg.version.as_deref().ok_or_else(|| {
+        anyhow!("primary compiler {} has no version field", pkg.id)
+    })
 }
 
 fn per_package_dir_name(id: &str, language: Option<&str>) -> String {

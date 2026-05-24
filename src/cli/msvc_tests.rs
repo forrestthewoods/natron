@@ -151,6 +151,131 @@ fn packages_groups_family_first_then_others() {
 }
 
 #[test]
+fn packages_excludes_other_versions_and_unrelated_workloads() {
+    // Regression: a snapshot includes thousands of unrelated packages
+    // (Android, Python, .NET, legacy compat toolsets at different versions).
+    // `msvc packages` must filter to the primary compiler's exact version —
+    // everything else is noise for an `msvc`-scoped command.
+    let tmp = TempDir::new().unwrap();
+    let primary = pkg(
+        "Microsoft.VC.14.52.18.5.Tools.HostX64.TargetX64.base",
+        "14.52.36328",
+    );
+    let preview_at_primary = pkg("Microsoft.VC.Preview.DIA.SDK", "14.52.36328");
+    // Should be excluded: different version (legacy compat toolset).
+    let legacy_compat = pkg(
+        "Microsoft.VC.14.44.17.14.Tools.HostX64.TargetX64.base",
+        "14.44.35227",
+    );
+    // Should be excluded: unrelated workload.
+    let android = pkg("Component.Android.NDK.R27C", "27.0.0.0");
+    let manifest_packages = format!(
+        "{primary},{preview_at_primary},{legacy_compat},{android}"
+    );
+
+    let fx = MirrorFixture::build(
+        tmp.path(),
+        &[(
+            VsVersion::Vs2026,
+            &[FxSnapshot {
+                sha: "abc",
+                date: "2026-05-01T00:00:00Z",
+                build_version: "18.6.11819.183",
+                display_version: "18.6.1",
+                product_line_version: "18",
+                manifest_packages_json: manifest_packages,
+            }],
+        )],
+    );
+    let ctx = test_ctx(&tmp);
+    let mut out = Vec::new();
+    run_packages(
+        &ctx,
+        &fx.urls,
+        PackagesArgs {
+            build_version: "18.6.11819.183".into(),
+        },
+        &mut out,
+    )
+    .unwrap();
+    let s = String::from_utf8(out).unwrap();
+    // Kept: primary + Preview (both at 14.52.36328).
+    assert!(s.contains("Microsoft.VC.14.52.18.5.Tools.HostX64.TargetX64.base"), "{s}");
+    assert!(s.contains("Microsoft.VC.Preview.DIA.SDK"), "{s}");
+    // Excluded: different version.
+    assert!(
+        !s.contains("Microsoft.VC.14.44.17.14.Tools.HostX64.TargetX64.base"),
+        "legacy compat at different version leaked into output:\n{s}"
+    );
+    assert!(
+        !s.contains("Component.Android.NDK.R27C"),
+        "unrelated workload leaked into output:\n{s}"
+    );
+}
+
+#[test]
+fn extract_excludes_other_versions_and_unrelated_workloads() {
+    // Regression: same filter logic as `packages`. `msvc extract` must not
+    // download/extract Android workloads or legacy compat toolsets.
+    let tmp = TempDir::new().unwrap();
+    let fixtures = tmp.path().join("vsix");
+    std::fs::create_dir_all(&fixtures).unwrap();
+
+    let id_primary = "Microsoft.VC.14.52.18.5.Tools.HostX64.TargetX64.base";
+    let arch_primary = fixtures.join("primary.vsix");
+    build_vsix(&arch_primary, &[("primary.bin", id_primary.as_bytes())]);
+    let id_legacy = "Microsoft.VC.14.44.17.14.Tools.HostX64.TargetX64.base";
+    let arch_legacy = fixtures.join("legacy.vsix");
+    build_vsix(&arch_legacy, &[("legacy.bin", id_legacy.as_bytes())]);
+    let id_android = "Component.Android.NDK.R27C";
+    let arch_android = fixtures.join("android.vsix");
+    build_vsix(&arch_android, &[("ndk.bin", id_android.as_bytes())]);
+
+    let pkgs = format!(
+        "{a},{b},{c}",
+        a = pkg_with_payload(id_primary, "14.52.36328", &file_url(&arch_primary), "primary.vsix"),
+        b = pkg_with_payload(id_legacy, "14.44.35227", &file_url(&arch_legacy), "legacy.vsix"),
+        c = pkg_with_payload(id_android, "27.0.0.0", &file_url(&arch_android), "android.vsix"),
+    );
+
+    let fx = MirrorFixture::build(
+        tmp.path(),
+        &[(
+            VsVersion::Vs2026,
+            &[FxSnapshot {
+                sha: "abc",
+                date: "2026-05-01T00:00:00Z",
+                build_version: "18.6.11819.183",
+                display_version: "18.6.1",
+                product_line_version: "18",
+                manifest_packages_json: pkgs,
+            }],
+        )],
+    );
+
+    let out_dir = tmp.path().join("out");
+    let ctx = test_ctx(&tmp);
+    let mut buf = Vec::new();
+    run_extract(
+        &ctx,
+        &fx.urls,
+        ExtractArgs {
+            build_version: "18.6.11819.183".into(),
+            out: out_dir.clone(),
+        },
+        &mut buf,
+    )
+    .unwrap();
+
+    let dirs: Vec<_> = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(dirs.len(), 1, "expected only the primary package; got {dirs:?}");
+    assert_eq!(dirs[0], id_primary);
+}
+
+#[test]
 fn packages_errors_on_unknown_build_version() {
     let tmp = TempDir::new().unwrap();
     let fx = MirrorFixture::build(
