@@ -81,38 +81,45 @@ fn derive_cached_name(url: &Url, expected_sha256: Option<&str>) -> String {
     }
 }
 
-/// Tunable retry behavior for HTTP downloads. Defaults are wired straight
-/// into `fetch`; expose later if a consumer needs to override.
+/// Tunable retry behavior for HTTP downloads.
+///
+/// The two knobs are the **initial backoff** and the **total backoff
+/// budget** — the number of attempts isn't configured directly, it's
+/// whatever fits inside the budget given the exponential schedule. With
+/// the defaults (100ms initial, 30s budget) the loop gets ~8-9 attempts
+/// before giving up, spending no more than 30s of cumulative
+/// `thread::sleep` between them. The actual transfer time per attempt
+/// is not counted against the budget — a legitimately slow download
+/// won't be cut short.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RetryPolicy {
-    pub max_attempts: u32,
     pub initial_backoff_ms: u64,
-    pub max_backoff_ms: u64,
+    pub max_total_backoff_ms: u64,
     pub jitter: bool,
 }
 
 impl RetryPolicy {
     pub(crate) const fn default() -> Self {
         Self {
-            max_attempts: 5,
             initial_backoff_ms: 100,
-            max_backoff_ms: 10_000,
+            max_total_backoff_ms: 30_000,
             jitter: true,
         }
     }
 
-    /// Delay before the next retry, given the 1-indexed `attempt` number that
-    /// just failed. Exponential up to `max_backoff_ms`, optionally multiplied
-    /// by a 0.5..1.5 jitter factor.
+    /// Delay before the next retry, given the 1-indexed `attempt` number
+    /// that just failed. Exponential (doubling each attempt), optionally
+    /// multiplied by a 0.5..1.5 jitter factor. The `shift.min(20)` guard
+    /// prevents u64 overflow in pathological loops; the budget check in
+    /// the retry loop is the real ceiling on individual sleep length.
     pub(crate) fn compute_delay(&self, attempt: u32) -> Duration {
         let shift = attempt.saturating_sub(1).min(20);
         let base = self.initial_backoff_ms.saturating_mul(1u64 << shift);
-        let capped = base.min(self.max_backoff_ms);
         let final_ms = if self.jitter {
             let frac = pseudo_random_unit();
-            ((capped as f64) * (0.5 + frac)) as u64
+            ((base as f64) * (0.5 + frac)) as u64
         } else {
-            capped
+            base
         };
         Duration::from_millis(final_ms)
     }
@@ -159,9 +166,13 @@ fn stream_http_into_cache(
     let mut hasher = Sha256::new();
     let mut bytes_received: u64 = 0;
     let verify = expected_sha256.is_some();
-    let mut last_err: Option<anyhow::Error> = None;
+    let mut attempt: u32 = 1;
+    let mut total_slept_ms: u64 = 0;
 
-    for attempt in 1..=policy.max_attempts {
+    // Loop terminates one of three ways: Ok, Fatal, or budget exhaustion on
+    // a Transient. ResetRequired can't loop forever — it requires
+    // `bytes_received > 0`, and we reset that to 0 each time it fires.
+    loop {
         match stream_once(url, &mut tmp, &mut hasher, &mut bytes_received, verify) {
             Ok(()) => {
                 if let Some(expected) = expected_sha256 {
@@ -180,48 +191,40 @@ fn stream_http_into_cache(
                 return Ok(());
             }
             Err(StreamErr::Transient(err)) => {
-                if attempt >= policy.max_attempts {
+                let delay = policy.compute_delay(attempt);
+                let delay_ms = delay.as_millis() as u64;
+                let new_total = total_slept_ms.saturating_add(delay_ms);
+                if new_total > policy.max_total_backoff_ms {
                     return Err(err.context(format!(
-                        "{url} failed after {} attempts",
-                        policy.max_attempts
+                        "{url} failed after {attempt} attempts ({total_slept_ms}ms of retry budget exhausted)"
                     )));
                 }
-                let delay = policy.compute_delay(attempt);
                 if bytes_received > 0 {
                     tracing::warn!(
-                        "transient error on {url} after {bytes_received} bytes (attempt {attempt}/{}): {err}; retrying in {}ms with Range",
-                        policy.max_attempts,
-                        delay.as_millis(),
+                        "transient error on {url} after {bytes_received} bytes (attempt {attempt}): {err}; retrying in {delay_ms}ms with Range"
                     );
                 } else {
                     tracing::warn!(
-                        "transient error on {url} (attempt {attempt}/{}): {err}; retrying in {}ms",
-                        policy.max_attempts,
-                        delay.as_millis(),
+                        "transient error on {url} (attempt {attempt}): {err}; retrying in {delay_ms}ms"
                     );
                 }
-                last_err = Some(err);
                 std::thread::sleep(delay);
+                total_slept_ms = new_total;
             }
             Err(StreamErr::ResetRequired(reason)) => {
-                if attempt >= policy.max_attempts {
-                    bail!("{reason} (exhausted {} attempts)", policy.max_attempts);
-                }
                 tracing::warn!(
-                    "{reason} (attempt {attempt}/{}); restarting from byte 0",
-                    policy.max_attempts,
+                    "{reason} (attempt {attempt}); restarting from byte 0"
                 );
                 bytes_received = 0;
                 hasher = Sha256::new();
                 tmp.as_file_mut().set_len(0)?;
                 tmp.as_file_mut().seek(SeekFrom::Start(0))?;
-                last_err = Some(anyhow!("{reason}"));
                 // No sleep — server is responsive, just non-cooperative.
             }
             Err(StreamErr::Fatal(err)) => return Err(err),
         }
+        attempt = attempt.saturating_add(1);
     }
-    Err(last_err.unwrap_or_else(|| anyhow!("download retry loop exited without success")))
 }
 
 /// One HTTP attempt. Sends `Range: bytes=N-` when `*bytes_received > 0`.

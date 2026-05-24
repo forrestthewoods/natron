@@ -112,18 +112,16 @@ fn sha256_of_known_bytes() {
 #[test]
 fn retry_policy_default_values() {
     let p = RetryPolicy::default();
-    assert_eq!(p.max_attempts, 5);
     assert_eq!(p.initial_backoff_ms, 100);
-    assert_eq!(p.max_backoff_ms, 10_000);
+    assert_eq!(p.max_total_backoff_ms, 30_000);
     assert!(p.jitter);
 }
 
 #[test]
-fn retry_policy_no_jitter_is_exponential_with_cap() {
+fn retry_policy_no_jitter_doubles_each_attempt() {
     let p = RetryPolicy {
-        max_attempts: 10,
         initial_backoff_ms: 50,
-        max_backoff_ms: 1_000,
+        max_total_backoff_ms: 1_000_000, // budget irrelevant for compute_delay
         jitter: false,
     };
     assert_eq!(p.compute_delay(1), Duration::from_millis(50));
@@ -131,17 +129,14 @@ fn retry_policy_no_jitter_is_exponential_with_cap() {
     assert_eq!(p.compute_delay(3), Duration::from_millis(200));
     assert_eq!(p.compute_delay(4), Duration::from_millis(400));
     assert_eq!(p.compute_delay(5), Duration::from_millis(800));
-    // Cap kicks in.
-    assert_eq!(p.compute_delay(6), Duration::from_millis(1_000));
-    assert_eq!(p.compute_delay(20), Duration::from_millis(1_000));
+    assert_eq!(p.compute_delay(6), Duration::from_millis(1_600));
 }
 
 #[test]
 fn retry_policy_jitter_stays_in_half_to_threehalves() {
     let p = RetryPolicy {
-        max_attempts: 5,
         initial_backoff_ms: 100,
-        max_backoff_ms: 10_000,
+        max_total_backoff_ms: 30_000,
         jitter: true,
     };
     // For attempt=3 the base would be 400ms (no jitter); jittered range is
@@ -153,15 +148,21 @@ fn retry_policy_jitter_stays_in_half_to_threehalves() {
 }
 
 #[test]
-fn retry_policy_handles_huge_attempt_without_overflow() {
+fn retry_policy_shift_clamp_prevents_overflow() {
+    // attempt=50 would shift past u64 if not clamped; the shift.min(20)
+    // guard pins the maximum to 100ms * 2^20 ≈ 104 seconds. Shifts saturate
+    // starting at attempt=21 (shift = attempt-1 = 20, which is the clamp).
     let p = RetryPolicy {
-        max_attempts: 100,
         initial_backoff_ms: 100,
-        max_backoff_ms: 10_000,
+        max_total_backoff_ms: u64::MAX,
         jitter: false,
     };
-    // attempt=50 would shift past u64 if not clamped; we cap shift at 20.
-    assert_eq!(p.compute_delay(50), Duration::from_millis(10_000));
+    let at_clamp = p.compute_delay(21);
+    let huge = p.compute_delay(50);
+    assert_eq!(huge, at_clamp, "compute_delay saturates at attempt=21");
+    assert_eq!(p.compute_delay(1000), at_clamp);
+    // Sanity: bounded, doesn't panic.
+    assert!(huge.as_millis() < 200_000_000);
 }
 
 #[test]
@@ -189,11 +190,21 @@ fn make_body(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i as u8).wrapping_mul(7).wrapping_add(3)).collect()
 }
 
-fn fast_test_policy(max_attempts: u32) -> RetryPolicy {
+/// Build a deterministic policy that allows exactly `attempts` attempts
+/// before exhausting the sleep budget. With initial=1ms and no jitter,
+/// sleeps follow 1, 2, 4, 8, ... so the sum after N-1 sleeps is 2^(N-1) - 1.
+/// Setting the budget to exactly that sum lets N attempts run; the N-th
+/// would-be sleep of 2^(N-1) ms pushes the cumulative to 2*2^(N-1) - 1
+/// which exceeds the budget and bails.
+fn fast_test_policy(attempts: u32) -> RetryPolicy {
+    let budget = if attempts == 0 {
+        0
+    } else {
+        (1u64 << (attempts - 1)) - 1
+    };
     RetryPolicy {
-        max_attempts,
         initial_backoff_ms: 1,
-        max_backoff_ms: 5,
+        max_total_backoff_ms: budget,
         jitter: false,
     }
 }
