@@ -339,6 +339,30 @@ fn dependency_closure_adds_resource_props_and_servicing() {
 }
 
 #[test]
+fn languageless_request_prefers_languageless_manifest_entry() {
+    // Manifest lists a ja-JP variant BEFORE the languageless variant. A
+    // request with language=None must still pick the languageless one,
+    // not blindly take the first id+version match.
+    let manifest = parse_msvc_manifest(
+        r#"{
+            "packages": [
+                {"id": "Microsoft.VC.14.52.Foo.base", "version": "14.52.36328", "language": "ja-JP", "payloads": []},
+                {"id": "Microsoft.VC.14.52.Foo.base", "version": "14.52.36328", "payloads": []}
+            ]
+        }"#,
+    );
+    let request = PackageRequest {
+        id: "Microsoft.VC.14.52.Foo.base".into(),
+        version: Some("14.52.36328".into()),
+        language: None,
+    };
+
+    let found = find_requested_package(&manifest, &request).unwrap().unwrap();
+
+    assert!(found.language.is_none(), "got: {:?}", found.language);
+}
+
+#[test]
 fn fingerprint_changes_when_normalized_selection_changes() {
     let standard = MsvcSelection::from_options(&opts_with_vs()).unwrap();
     let mut extra_opts = opts_with_vs();

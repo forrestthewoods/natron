@@ -120,6 +120,50 @@ fn test_real_github_llvm_install() {
     assert!(report.errors.is_empty(), "{:?}", report.errors);
 }
 
+#[test]
+fn test_real_msvc_manifest_shape() {
+    // Smoke test for the two upstream manifests the msvc provider depends
+    // on. Doesn't install anything (no Windows, no msiexec, no disk hit) —
+    // just confirms both URLs return JSON that parses into a VsManifest
+    // with at least one x64/x64 MSVC candidate. Catches schema drift.
+    if !enabled() {
+        return;
+    }
+    use natron::providers::{vs_manifest, InstallCtx};
+    let env = TestEnv::new();
+    let cache = Cache::at(env.cache_dir.clone());
+    cache.ensure_layout().expect("cache layout");
+    let ctx = InstallCtx::new(cache.clone());
+
+    // Microsoft's live channel for VS 2026 (channel "18").
+    let live = vs_manifest::fetch_vs_manifest(
+        vs_manifest::DEFAULT_CHANNEL_URL_TEMPLATE,
+        "18",
+        &ctx,
+    )
+    .expect("fetch live VS 2026 manifest");
+    let live_cands = live.find_msvc_candidates("x64", "x64");
+    assert!(
+        !live_cands.is_empty(),
+        "live VS 2026 manifest has no x64/x64 MSVC candidates"
+    );
+
+    // roblabla mirror's release-18 branch — the archive fallback URL the
+    // msvc provider uses for pinned versions Microsoft no longer lists.
+    let archive_url =
+        "https://raw.githubusercontent.com/roblabla/msvc-manifest-history/release-18/manifest.json";
+    let archive_path = natron::download::fetch(archive_url, None, &cache.downloads)
+        .expect("fetch roblabla release-18 manifest");
+    let archive_text = std::fs::read_to_string(&archive_path).expect("read archive json");
+    let archive: vs_manifest::VsManifest =
+        serde_json::from_str(&archive_text).expect("parse roblabla manifest as VsManifest");
+    let archive_cands = archive.find_msvc_candidates("x64", "x64");
+    assert!(
+        !archive_cands.is_empty(),
+        "roblabla release-18 manifest has no x64/x64 MSVC candidates"
+    );
+}
+
 fn detect_zig_platform() -> &'static str {
     // Zig's index.json keys are arch-os pairs.
     if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {

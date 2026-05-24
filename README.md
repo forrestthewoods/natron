@@ -84,7 +84,7 @@ name        = "windows_sdk"
 deploy_dir  = "windows_sdk"
 provider    = "windows_sdk"
 [toolchain.options]
-vs_channel  = "18"
+vs          = "vs2026"
 sdk_version = "26100"
 ```
 
@@ -112,7 +112,8 @@ block with distinct `name` and `deploy_dir`.
   [`roblabla/msvc-manifest-history`][mh] archive; pinned installs never
   silently fall back to latest.
 - **`windows_sdk`**: extract Windows SDK headers + libs from a VS channel
-  manifest. Required `vs_channel`. Optional `sdk_version`.
+  manifest. Required `vs` (`vs2019`, `vs2022`, or `vs2026`). Optional
+  `sdk_version`.
 
 [mh]: https://github.com/roblabla/msvc-manifest-history
 

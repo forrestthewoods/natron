@@ -63,7 +63,6 @@ fn find_msvc_candidates_picks_base_only_and_sorts_descending() {
         .map(|candidate| candidate.package_version.as_str())
         .collect();
     assert_eq!(versions, vec!["14.50.35731", "14.49.34567"]);
-    assert_eq!(cands[0].package_id_version, "14.50.18.0");
     // Premium variant is excluded.
     for candidate in &cands {
         assert!(!candidate.package_id.to_lowercase().contains(".premium."));

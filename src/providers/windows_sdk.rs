@@ -6,10 +6,10 @@
 //! component package is a meta-package whose `dependencies` map names the
 //! actual MSI-bearing packages.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use std::path::Path;
 
-use super::vs_manifest;
+use super::vs_manifest::{self, VsVersion};
 use super::{InstallCtx, Installed, Provider};
 use crate::cache::sanitize_fingerprint;
 use crate::extract;
@@ -65,20 +65,24 @@ impl Provider for WindowsSdkProvider {
         options: &toml::Table,
         ctx: &mut InstallCtx,
     ) -> Result<Installed> {
-        let vs_channel = options
-            .get("vs_channel")
+        if options.contains_key("vs_channel") {
+            bail!("`windows_sdk` option 'vs_channel' has been replaced by 'vs' (vs2019, vs2022, or vs2026)");
+        }
+        let vs = options
+            .get("vs")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                anyhow!("`windows_sdk` provider requires options.vs_channel")
-            })?;
+                anyhow!("`windows_sdk` provider requires options.vs (vs2019, vs2022, or vs2026)")
+            })
+            .and_then(VsVersion::parse)?;
         let pinned = options.get("sdk_version").and_then(|v| v.as_str());
 
         if let Some(ver) = pinned {
-            let fp = sanitize_fingerprint(&format!("windows_sdk-{ver}-{vs_channel}"));
+            let fp = sanitize_fingerprint(&format!("windows_sdk-{ver}-{}", vs.as_str()));
             if ctx.cache().install_present(&fp) {
                 return Ok(Installed {
                     fingerprint: fp,
-                    display: format!("windows_sdk {ver} (vs{vs_channel})"),
+                    display: format!("windows_sdk {ver} ({})", vs.as_str()),
                     options: options.clone(),
                     freshly_extracted: false,
                 });
@@ -87,7 +91,7 @@ impl Provider for WindowsSdkProvider {
 
         let manifest = vs_manifest::fetch_vs_manifest(
             &self.channel_url_template,
-            vs_channel,
+            vs.channel(),
             ctx,
         )?;
         let candidates = manifest.find_sdk_candidates();
@@ -110,11 +114,11 @@ impl Provider for WindowsSdkProvider {
             None => candidates[0].clone(),
         };
 
-        let fp = sanitize_fingerprint(&format!("windows_sdk-{resolved_ver}-{vs_channel}"));
+        let fp = sanitize_fingerprint(&format!("windows_sdk-{resolved_ver}-{}", vs.as_str()));
         if ctx.cache().install_present(&fp) {
             return Ok(Installed {
                 fingerprint: fp,
-                display: format!("windows_sdk {resolved_ver} (vs{vs_channel})"),
+                display: format!("windows_sdk {resolved_ver} ({})", vs.as_str()),
                 options: resolved_options(options, &resolved_ver),
                 freshly_extracted: false,
             });
@@ -198,7 +202,7 @@ impl Provider for WindowsSdkProvider {
 
         Ok(Installed {
             fingerprint: fp,
-            display: format!("windows_sdk {resolved_ver} (vs{vs_channel})"),
+            display: format!("windows_sdk {resolved_ver} ({})", vs.as_str()),
             options: resolved_options(options, &resolved_ver),
             freshly_extracted: true,
         })

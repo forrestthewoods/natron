@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeSet;
 use xxhash_rust::xxh3::xxh3_64;
 
-use super::vs_manifest::{self, MsvcCandidate, VsManifest};
+use super::vs_manifest::{self, MsvcCandidate, VsManifest, VsVersion};
 use super::{InstallCtx, Installed, Provider};
 use crate::cache::sanitize_fingerprint;
 use crate::extract;
@@ -56,13 +56,6 @@ struct MsvcSelection {
     profile: MsvcProfile,
     include: Vec<String>,
     extras: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VsVersion {
-    Vs2019,
-    Vs2022,
-    Vs2026,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,33 +344,6 @@ impl MsvcSelection {
     }
 }
 
-impl VsVersion {
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "vs2019" => Ok(Self::Vs2019),
-            "vs2022" => Ok(Self::Vs2022),
-            "vs2026" => Ok(Self::Vs2026),
-            other => bail!("invalid msvc vs value '{other}'; valid values: vs2019, vs2022, vs2026"),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Vs2019 => "vs2019",
-            Self::Vs2022 => "vs2022",
-            Self::Vs2026 => "vs2026",
-        }
-    }
-
-    fn channel(self) -> &'static str {
-        match self {
-            Self::Vs2019 => "16",
-            Self::Vs2022 => "17",
-            Self::Vs2026 => "18",
-        }
-    }
-}
-
 impl MsvcProfile {
     fn as_str(self) -> &'static str {
         match self {
@@ -445,6 +411,8 @@ fn add_pattern_matches(
         bail!("msvc package patterns may not be empty");
     }
 
+    let compiled = glob::Pattern::new(pattern)
+        .with_context(|| format!("msvc package pattern '{pattern}' is not a valid glob"))?;
     let raw_pattern = starts_with_ignore_ascii_case(pattern, "Microsoft.");
     let mut matched = 0usize;
     for pkg in &resolved.manifest.packages {
@@ -453,10 +421,10 @@ fn add_pattern_matches(
         }
 
         let matches = if raw_pattern {
-            glob_matches(pattern, &pkg.id)
+            glob_match(&compiled, &pkg.id)
         } else if starts_with_ignore_ascii_case(&pkg.id, &resolved.family_prefix) {
             let key = &pkg.id[resolved.family_prefix.len()..];
-            glob_matches(pattern, key)
+            glob_match(&compiled, key)
         } else {
             false
         };
@@ -476,6 +444,20 @@ fn add_pattern_matches(
     }
 
     Ok(())
+}
+
+fn glob_match(pattern: &glob::Pattern, text: &str) -> bool {
+    // Package ids look like dot-separated identifiers, not paths. Disable
+    // glob's path-aware behaviors so `*` matches dots and a leading dot is
+    // not special.
+    pattern.matches_with(
+        text,
+        glob::MatchOptions {
+            case_sensitive: false,
+            require_literal_separator: false,
+            require_literal_leading_dot: false,
+        },
+    )
 }
 
 fn include_declared_metadata_dependencies(
@@ -582,10 +564,18 @@ fn find_requested_package<'a>(
                     .find(|pkg| request_matches_package(request, pkg) && pkg.language.is_none())
             }));
     }
+    // Languageless request: prefer the languageless manifest entry over any
+    // language-tagged variant that happens to appear earlier in the list.
     Ok(manifest
         .packages
         .iter()
-        .find(|pkg| request_matches_package(request, pkg)))
+        .find(|pkg| request_matches_package(request, pkg) && pkg.language.is_none())
+        .or_else(|| {
+            manifest
+                .packages
+                .iter()
+                .find(|pkg| request_matches_package(request, pkg))
+        }))
 }
 
 fn request_matches_package(request: &PackageRequest, pkg: &vs_manifest::Package) -> bool {
@@ -617,30 +607,6 @@ fn family_prefix_from_compiler_package(package_id: &str) -> Result<String> {
 
 fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
     value.len() >= prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix)
-}
-
-fn glob_matches(pattern: &str, text: &str) -> bool {
-    let pattern = pattern.to_ascii_lowercase();
-    let text = text.to_ascii_lowercase();
-    let p = pattern.as_bytes();
-    let t = text.as_bytes();
-    let mut dp = vec![vec![false; t.len() + 1]; p.len() + 1];
-    dp[0][0] = true;
-    for i in 1..=p.len() {
-        if p[i - 1] == b'*' {
-            dp[i][0] = dp[i - 1][0];
-        }
-    }
-    for i in 1..=p.len() {
-        for j in 1..=t.len() {
-            dp[i][j] = match p[i - 1] {
-                b'*' => dp[i - 1][j] || dp[i][j - 1],
-                b'?' => dp[i - 1][j - 1],
-                literal => literal == t[j - 1] && dp[i - 1][j - 1],
-            };
-        }
-    }
-    dp[p.len()][t.len()]
 }
 
 fn option_str<'a>(options: &'a toml::Table, key: &str) -> Result<Option<&'a str>> {

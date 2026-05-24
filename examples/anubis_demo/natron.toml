@@ -68,5 +68,5 @@ name        = "windows_sdk"
 deploy_dir  = "windows_sdk"
 provider    = "windows_sdk"
 [toolchain.options]
-vs_channel  = "18"
+vs          = "vs2026"
 sdk_version = "26100"

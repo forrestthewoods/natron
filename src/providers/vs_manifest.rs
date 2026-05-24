@@ -1,14 +1,51 @@
 //! Internal helper for fetching + parsing the Visual Studio channel manifest.
 //! Shared between the `msvc` and `windows_sdk` providers.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 use super::InstallCtx;
 
 /// Default URL template for the channel manifest. `{channel}` is substituted
-/// with the user-provided VS channel (e.g. "18" for VS 2022 + 17 series).
+/// with the user-provided VS channel (e.g. "18" for VS 2026, "17" for VS 2022).
 pub const DEFAULT_CHANNEL_URL_TEMPLATE: &str = "https://aka.ms/vs/{channel}/stable/channel";
+
+/// User-facing VS product version. Maps to Microsoft's internal channel
+/// number. Shared by every provider that resolves packages from a VS
+/// channel manifest (`msvc`, `windows_sdk`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsVersion {
+    Vs2019,
+    Vs2022,
+    Vs2026,
+}
+
+impl VsVersion {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "vs2019" => Ok(Self::Vs2019),
+            "vs2022" => Ok(Self::Vs2022),
+            "vs2026" => Ok(Self::Vs2026),
+            other => bail!("invalid vs value '{other}'; valid values: vs2019, vs2022, vs2026"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vs2019 => "vs2019",
+            Self::Vs2022 => "vs2022",
+            Self::Vs2026 => "vs2026",
+        }
+    }
+
+    pub fn channel(self) -> &'static str {
+        match self {
+            Self::Vs2019 => "16",
+            Self::Vs2022 => "17",
+            Self::Vs2026 => "18",
+        }
+    }
+}
 
 /// Channel manifest (the small JSON returned from the aka.ms URL).
 #[derive(Debug, Deserialize)]
@@ -69,7 +106,6 @@ pub struct Package {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MsvcCandidate {
-    pub package_id_version: String,
     pub package_version: String,
     pub package_id: String,
 }
@@ -179,13 +215,12 @@ impl VsManifest {
             let Some(end) = after.to_lowercase().find(".tools.") else {
                 continue;
             };
-            let package_id_version = &after[..end];
+            let id_version = &after[..end];
             let package_version = pkg
                 .version
                 .clone()
-                .unwrap_or_else(|| package_id_version.to_string());
+                .unwrap_or_else(|| id_version.to_string());
             out.push(MsvcCandidate {
-                package_id_version: package_id_version.to_string(),
                 package_version,
                 package_id: pkg.id.clone(),
             });
