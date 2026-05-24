@@ -12,8 +12,11 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+use std::path::Path;
+use std::sync::Mutex;
 
 use super::InstallCtx;
+use crate::download;
 
 const MIRROR_OWNER: &str = "roblabla";
 const MIRROR_REPO: &str = "msvc-manifest-history";
@@ -207,9 +210,20 @@ pub fn fetch_channel_info(
     sha_or_branch: &str,
     ctx: &InstallCtx,
 ) -> Result<ChannelInfo> {
+    fetch_channel_info_with_cache(raw_base, sha_or_branch, &ctx.cache().downloads)
+}
+
+/// `Sync`-friendly variant of [`fetch_channel_info`] that takes a downloads
+/// directory directly. Used by [`build_index`] for parallel fan-out where
+/// the workers can't share `&InstallCtx` (its staging `RefCell` is not
+/// `Sync`).
+fn fetch_channel_info_with_cache(
+    raw_base: &str,
+    sha_or_branch: &str,
+    downloads: &Path,
+) -> Result<ChannelInfo> {
     let url = raw_url(raw_base, sha_or_branch, "channel.json");
-    let path = ctx
-        .download(&url, None)
+    let path = download::fetch(&url, None, downloads)
         .with_context(|| format!("fetching channel.json at {sha_or_branch}"))?;
     #[derive(Deserialize)]
     struct Wrapper {
@@ -272,34 +286,86 @@ impl Default for MirrorUrls {
     }
 }
 
+/// Maximum concurrent channel.json fetches during enumeration. Picked to
+/// saturate typical home internet without abusing GitHub's CDN.
+const PARALLEL_FETCH_LIMIT: usize = 16;
+
 /// Build the in-memory index across the requested VS series. For each
-/// series: list commits, fetch every commit's channel.json (cached after
-/// first run). Sorted descending by commit date within each VS series.
+/// series: list commits, then fetch every commit's channel.json in parallel
+/// (cached after first run). Sorted descending by commit date within each
+/// VS series.
 pub fn build_index(
     urls: &MirrorUrls,
     series: &[VsVersion],
     ctx: &InstallCtx,
 ) -> Result<Vec<BuildIndexEntry>> {
+    let downloads = ctx.cache().downloads.clone();
     let mut out = Vec::new();
     for vs in series {
         let mut commits = fetch_commits(&urls.commits_base, *vs)?;
         commits.sort_by(|a, b| b.date.cmp(&a.date));
-        for commit in commits {
-            match fetch_channel_info(&urls.raw_base, &commit.sha, ctx) {
-                Ok(info) => out.push(BuildIndexEntry {
-                    vs: *vs,
-                    info,
-                    commit,
-                }),
-                Err(err) => tracing::warn!(
-                    "skipping commit {} on {}: {err:#}",
-                    &commit.sha[..commit.sha.len().min(7)],
-                    vs.as_str(),
-                ),
-            }
-        }
+        out.extend(parallel_fetch_channel_infos(
+            &urls.raw_base,
+            &commits,
+            &downloads,
+            *vs,
+        ));
     }
     Ok(out)
+}
+
+/// Fan `fetch_channel_info_with_cache` out across a small worker pool.
+/// Preserves the order of `commits` in the returned entries (per-index
+/// result slots, not a queue of finished results). Per-commit fetch errors
+/// are logged via `tracing::warn!` and the commit is dropped — same UX as
+/// the original sequential loop.
+fn parallel_fetch_channel_infos(
+    raw_base: &str,
+    commits: &[CommitRef],
+    downloads: &Path,
+    vs: VsVersion,
+) -> Vec<BuildIndexEntry> {
+    if commits.is_empty() {
+        return Vec::new();
+    }
+    let queue: Mutex<Vec<usize>> = Mutex::new((0..commits.len()).rev().collect());
+    let results: Mutex<Vec<Option<ChannelInfo>>> = Mutex::new(vec![None; commits.len()]);
+
+    std::thread::scope(|s| {
+        for _ in 0..PARALLEL_FETCH_LIMIT.min(commits.len()) {
+            s.spawn(|| loop {
+                let idx = match queue.lock().unwrap().pop() {
+                    Some(i) => i,
+                    None => return,
+                };
+                let commit = &commits[idx];
+                match fetch_channel_info_with_cache(raw_base, &commit.sha, downloads) {
+                    Ok(info) => {
+                        results.lock().unwrap()[idx] = Some(info);
+                    }
+                    Err(err) => tracing::warn!(
+                        "skipping commit {} on {}: {err:#}",
+                        &commit.sha[..commit.sha.len().min(7)],
+                        vs.as_str(),
+                    ),
+                }
+            });
+        }
+    });
+
+    results
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, info)| {
+            info.map(|info| BuildIndexEntry {
+                vs,
+                info,
+                commit: commits[idx].clone(),
+            })
+        })
+        .collect()
 }
 
 /// Resolve a buildVersion to its mirror entry. Auto-detects the VS series
