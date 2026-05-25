@@ -224,7 +224,7 @@ fn discover_sdk_versions_dedupes_across_series_sorted_desc() {
         ],
     );
     let ctx = test_ctx(&tmp);
-    let versions = discover_sdk_versions(&fx.urls, &ctx).unwrap();
+    let versions = discover_sdk_versions(&fx.history(&ctx)).unwrap();
     assert_eq!(versions, vec!["26100", "22621", "22000", "19041", "17763"]);
 }
 
@@ -256,8 +256,8 @@ fn resolve_finds_sdk_in_newest_snapshot_containing_it() {
     );
     let ctx = test_ctx(&tmp);
     // 22000 is only in vs2022; resolve should walk down to find it.
-    let resolved = resolve_sdk_version(&fx.urls, "22000", &ctx).unwrap();
-    assert_eq!(resolved.entry.commit.sha, "s17");
+    let resolved = resolve_sdk_version(&fx.history(&ctx), "22000").unwrap();
+    assert_eq!(resolved.entry.vs, VsVersion::Vs2022);
     assert!(resolved.sdk_pkg_id.ends_with(".22000"));
 }
 
@@ -277,7 +277,7 @@ fn resolve_errors_with_available_list_on_miss() {
         )],
     );
     let ctx = test_ctx(&tmp);
-    let err = resolve_sdk_version(&fx.urls, "99999", &ctx).unwrap_err();
+    let err = resolve_sdk_version(&fx.history(&ctx), "99999").unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("99999"), "got: {msg}");
     assert!(msg.contains("26100"), "got: {msg}");
@@ -320,10 +320,7 @@ fn install_cache_fast_path_skips_fetch() {
     md.write(&cache.install_metadata_path(&fp)).unwrap();
 
     let mut ctx = InstallCtx::new(cache);
-    let provider = WindowsSdkProvider::with_urls(MirrorUrls {
-        raw_base: "file:///never".into(),
-        commits_base: "file:///never/{branch}.json".into(),
-    });
+    let provider = WindowsSdkProvider::with_remote("file:///never");
     let mut topts = toml::Table::new();
     topts.insert("sdk_version".into(), toml::Value::String("26100".into()));
     let installed = provider.install(&topts, &mut ctx).unwrap();
@@ -468,7 +465,7 @@ fn install_errors_on_extras_zero_match() {
     );
 
     let mut ctx = test_ctx(&tmp);
-    let provider = WindowsSdkProvider::with_urls(fx.urls);
+    let provider = WindowsSdkProvider::with_remote(fx.remote);
     let mut opts = toml::Table::new();
     opts.insert("sdk_version".into(), toml::Value::String(sdk_v.into()));
     opts.insert(

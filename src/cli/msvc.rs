@@ -22,13 +22,12 @@ use crate::download;
 use crate::extract;
 use crate::providers::msvc;
 use crate::providers::vs_manifest::{
-    self, BuildIndexEntry, MirrorUrls, Package, VsVersion,
+    self, BuildIndexEntry, ManifestHistory, Package, VsVersion,
 };
 use crate::providers::InstallCtx;
 
 /// Worker pool size for parallel package extraction. Each worker
-/// downloads + unzips one package at a time. 16 matches the rest of
-/// the codebase (vs_manifest::PARALLEL_FETCH_LIMIT).
+/// downloads + unzips one package at a time.
 const EXTRACT_PARALLELISM: usize = 16;
 
 #[derive(Debug, Args)]
@@ -78,11 +77,11 @@ pub fn run(
     args: MsvcArgs,
 ) -> Result<()> {
     let ctx = build_ctx(config, cache_dir_override)?;
-    let urls = MirrorUrls::default();
+    let history = ManifestHistory::open(&vs_manifest::default_remote(), ctx.cache())?;
     match args.verb {
-        MsvcVerb::Versions(a) => run_versions(&ctx, &urls, a, &mut std::io::stdout()),
-        MsvcVerb::Packages(a) => run_packages(&ctx, &urls, a, &mut std::io::stdout()),
-        MsvcVerb::Extract(a) => run_extract(&ctx, &urls, a, &mut std::io::stdout()),
+        MsvcVerb::Versions(a) => run_versions(&history, a, &mut std::io::stdout()),
+        MsvcVerb::Packages(a) => run_packages(&history, a, &mut std::io::stdout()),
+        MsvcVerb::Extract(a) => run_extract(&ctx, &history, a, &mut std::io::stdout()),
     }
 }
 
@@ -109,8 +108,7 @@ fn parse_vs(value: &str) -> Result<VsVersion> {
 // ---- versions --------------------------------------------------------------
 
 fn run_versions(
-    ctx: &InstallCtx,
-    urls: &MirrorUrls,
+    history: &ManifestHistory,
     args: VersionsArgs,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
@@ -127,7 +125,7 @@ fn run_versions(
         first = false;
         writeln!(out, "{} (channel {})", vs.as_str(), vs.channel())?;
 
-        let entries = vs_manifest::build_index(urls, &[vs], ctx)?;
+        let entries = history.index(&[vs])?;
         if entries.is_empty() {
             writeln!(out, "  (no builds found on mirror)")?;
             continue;
@@ -148,12 +146,11 @@ fn run_versions(
 // ---- packages --------------------------------------------------------------
 
 fn run_packages(
-    ctx: &InstallCtx,
-    urls: &MirrorUrls,
+    history: &ManifestHistory,
     args: PackagesArgs,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
-    let (entry, manifest) = resolve_and_load(ctx, urls, &args.build_version)?;
+    let (entry, manifest) = resolve_and_load(history, &args.build_version)?;
     let compiler = msvc::find_primary_compiler(&manifest, entry.vs)?;
     let family = msvc::family_prefix(&compiler.id)?;
     let compiler_version = primary_version(compiler)?;
@@ -223,11 +220,11 @@ fn print_packages(out: &mut dyn std::io::Write, packages: &[&Package]) -> Result
 
 fn run_extract(
     ctx: &InstallCtx,
-    urls: &MirrorUrls,
+    history: &ManifestHistory,
     args: ExtractArgs,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
-    let (entry, manifest) = resolve_and_load(ctx, urls, &args.build_version)?;
+    let (entry, manifest) = resolve_and_load(history, &args.build_version)?;
     std::fs::create_dir_all(&args.out)
         .with_context(|| format!("creating {}", args.out.display()))?;
 
@@ -358,12 +355,11 @@ fn extract_one(pkg: &Package, dest: &Path, downloads: &Path) -> Result<()> {
 // ---- shared helpers --------------------------------------------------------
 
 fn resolve_and_load(
-    ctx: &InstallCtx,
-    urls: &MirrorUrls,
+    history: &ManifestHistory,
     build_version: &str,
 ) -> Result<(BuildIndexEntry, vs_manifest::VsManifest)> {
-    let entry = vs_manifest::resolve_build_version(urls, build_version, ctx)?;
-    let manifest = vs_manifest::fetch_manifest_at(&urls.raw_base, &entry.commit.sha, ctx)?;
+    let entry = history.resolve_build_version(build_version)?;
+    let manifest = history.manifest(&entry.commit.sha)?;
     Ok((entry, manifest))
 }
 

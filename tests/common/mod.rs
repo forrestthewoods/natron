@@ -90,15 +90,15 @@ impl TestEnv {
     }
 
     /// Build a Natron with a default-style registry. The github provider's
-    /// api_base is set to a `file://` URL pointing at `<fixture_root>/api/`
-    /// so tests can pre-populate fake release JSON there. The zig provider's
+    /// download base is set to a `file://` URL pointing at `<fixture_root>/dl/`
+    /// so tests can pre-place release assets there. The zig provider's
     /// index_url points at `<fixture_root>/zig-index.json`; tests that use
     /// the zig provider must call `write_zig_index_json` first.
     pub fn make_natron(&self, cfg: Config) -> Natron {
         let cache = Cache::at(self.cache_dir.clone());
         let mut reg = ProviderRegistry::empty();
         reg.register(UrlProvider::new());
-        reg.register(GithubProvider::with_api_base(self.api_base()));
+        reg.register(GithubProvider::with_download_base(self.download_base()));
         reg.register(ZigProvider::with_index_url(self.zig_index_url()));
         Natron::new(cfg, cache, reg)
     }
@@ -141,37 +141,34 @@ impl TestEnv {
         std::fs::write(&path, json).unwrap();
     }
 
-    /// API base URL used by the github provider in tests. Format:
-    /// `file:///path/to/fixture_root/api` (no trailing slash).
-    pub fn api_base(&self) -> String {
-        let api_dir = self.fixture_root.join("api");
-        std::fs::create_dir_all(&api_dir).ok();
-        let url = url::Url::from_directory_path(&api_dir).unwrap().to_string();
+    /// Download base URL used by the github provider in tests. Format:
+    /// `file:///path/to/fixture_root/dl` (no trailing slash).
+    pub fn download_base(&self) -> String {
+        let dir = self.fixture_root.join("dl");
+        std::fs::create_dir_all(&dir).ok();
+        let url = url::Url::from_directory_path(&dir).unwrap().to_string();
         url.trim_end_matches('/').to_string()
     }
 
-    /// Pre-populate a fake GitHub release-info JSON. The asset's
-    /// browser_download_url points at the local archive.
-    pub fn write_github_release_json(
+    /// Pre-place a GitHub release asset where the provider builds its URL:
+    /// `<download_base>/{repo}/releases/download/{tag}/{asset}`.
+    pub fn place_github_asset(
         &self,
         repo: &str,
         tag: &str,
         asset_name: &str,
         archive_path: &Path,
     ) {
-        let api_dir = self.fixture_root.join("api");
-        let path = api_dir
-            .join("repos")
+        let dst = self
+            .fixture_root
+            .join("dl")
             .join(repo)
             .join("releases")
-            .join("tags")
-            .join(tag);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let asset_url = url::Url::from_file_path(archive_path).unwrap().to_string();
-        let json = format!(
-            r#"{{"tag_name":"{tag}","assets":[{{"name":"{asset_name}","browser_download_url":"{asset_url}"}}]}}"#
-        );
-        std::fs::write(&path, json).unwrap();
+            .join("download")
+            .join(tag)
+            .join(asset_name);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::copy(archive_path, &dst).unwrap();
     }
 
     /// Build a Natron with a caller-provided registry (lets tests inject
@@ -209,8 +206,8 @@ pub fn url_entry(name: &str, deploy_dir: &str, archive_path: &Path) -> Toolchain
 }
 
 /// Build a `[[toolchain]]` entry using `provider = "github"`. Caller is
-/// responsible for having pre-populated the matching release JSON via
-/// `TestEnv::write_github_release_json`.
+/// responsible for having pre-placed the matching asset via
+/// `TestEnv::place_github_asset`.
 pub fn github_entry(
     name: &str,
     deploy_dir: &str,

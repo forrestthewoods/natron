@@ -272,7 +272,7 @@ fn install_default_extracts_expected_files() {
 
     let ctx = test_ctx(&tmp);
     let mut ctx = ctx; // mut for install
-    let provider = MsvcProvider::with_urls(fx.urls.clone());
+    let provider = MsvcProvider::with_remote(fx.remote.clone());
     let mut opts = toml::Table::new();
     opts.insert(
         "build_version".into(),
@@ -326,10 +326,7 @@ fn install_cache_hit_skips_fetch() {
     md.write(&cache.install_metadata_path(&fp)).unwrap();
 
     let mut ctx = InstallCtx::new(cache);
-    let provider = MsvcProvider::with_urls(MirrorUrls {
-        raw_base: "file:///never/exists".into(),
-        commits_base: "file:///never/commits-{branch}.json".into(),
-    });
+    let provider = MsvcProvider::with_remote("file:///never/exists");
     let installed = provider.install(&opts, &mut ctx).unwrap();
     assert!(!installed.freshly_extracted);
     assert!(ctx.staging_root().is_none());

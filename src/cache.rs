@@ -21,6 +21,10 @@ pub struct Cache {
     pub cas: PathBuf,
     pub downloads: PathBuf,
     pub staging: PathBuf,
+    /// Persistent auxiliary data that isn't an install, a CAS blob, or a
+    /// downloaded artifact — currently the bare git clone of the VS
+    /// manifest-history mirror under `meta/msvc-manifest-history`.
+    pub meta: PathBuf,
 }
 
 impl Cache {
@@ -52,12 +56,14 @@ impl Cache {
         let cas = root.join("cas");
         let downloads = root.join("downloads");
         let staging = root.join("staging");
+        let meta = root.join("meta");
         Self {
             root,
             installs,
             cas,
             downloads,
             staging,
+            meta,
         }
     }
 
@@ -67,7 +73,7 @@ impl Cache {
     pub fn ensure_layout(&self) -> Result<()> {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("creating cache root {}", self.root.display()))?;
-        for d in [&self.installs, &self.cas, &self.downloads, &self.staging] {
+        for d in [&self.installs, &self.cas, &self.downloads, &self.staging, &self.meta] {
             std::fs::create_dir_all(d)
                 .with_context(|| format!("creating {}", d.display()))?;
         }

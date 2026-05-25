@@ -1,4 +1,4 @@
-//! Tests for `src/providers\github.rs` (split out so the production
+//! Tests for `src/providers/github.rs` (split out so the production
 //! file shows only the implementation).
 
 use super::*;
@@ -20,27 +20,25 @@ fn build_zip(path: &Path, entries: &[(&str, &[u8])]) {
     zw.finish().unwrap();
 }
 
-/// Write a fake GitHub release-info JSON. The asset's
-/// browser_download_url points at the local archive file.
-fn write_release_json(
-    api_base_dir: &Path,
-    repo: &str,
-    tag: &str,
-    asset_name: &str,
-    archive_path: &Path,
-) {
-    let path = api_base_dir
-        .join("repos")
+/// Place `archive` where the provider expects a release asset:
+/// `<base_dir>/{repo}/releases/download/{tag}/{asset}`.
+fn place_asset(base_dir: &Path, repo: &str, tag: &str, asset: &str, archive: &Path) {
+    let dst = base_dir
         .join(repo)
         .join("releases")
-        .join("tags")
-        .join(tag);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let asset_url = url::Url::from_file_path(archive_path).unwrap().to_string();
-    let json = format!(
-        r#"{{"tag_name":"{tag}","assets":[{{"name":"{asset_name}","browser_download_url":"{asset_url}"}}]}}"#
-    );
-    fs::write(&path, json).unwrap();
+        .join("download")
+        .join(tag)
+        .join(asset);
+    fs::create_dir_all(dst.parent().unwrap()).unwrap();
+    fs::copy(archive, &dst).unwrap();
+}
+
+fn download_base(dir: &Path) -> String {
+    url::Url::from_directory_path(dir)
+        .unwrap()
+        .to_string()
+        .trim_end_matches('/')
+        .to_string()
 }
 
 #[test]
@@ -51,14 +49,10 @@ fn github_provider_id() {
 #[test]
 fn github_provider_resolves_release_and_extracts() {
     let tmp = TempDir::new().unwrap();
-    let api = tmp.path().join("api");
+    let base = tmp.path().join("dl");
     let archive = tmp.path().join("clang.zip");
     build_zip(&archive, &[("bin/clang.exe", b"BIN"), ("LICENSE", b"LIC")]);
-    write_release_json(&api, "llvm/llvm-project", "llvmorg-21.1.6", "clang.zip", &archive);
-
-    let api_base = url::Url::from_directory_path(&api).unwrap().to_string();
-    // Trim trailing slash because we add one when constructing URLs.
-    let api_base = api_base.trim_end_matches('/').to_string();
+    place_asset(&base, "llvm/llvm-project", "llvmorg-21.1.6", "clang.zip", &archive);
 
     let cache = Cache::at(tmp.path().join("c"));
     cache.ensure_layout().unwrap();
@@ -69,7 +63,7 @@ fn github_provider_resolves_release_and_extracts() {
     opts.insert("tag".into(), toml::Value::String("llvmorg-21.1.6".into()));
     opts.insert("asset".into(), toml::Value::String("clang.zip".into()));
 
-    let provider = GithubProvider::with_api_base(api_base);
+    let provider = GithubProvider::with_download_base(download_base(&base));
     let installed = provider.install(&opts, &mut ctx).unwrap();
     assert!(installed.freshly_extracted);
     assert!(installed.fingerprint.contains("llvmorg-21.1.6"));
@@ -81,13 +75,11 @@ fn github_provider_resolves_release_and_extracts() {
 #[test]
 fn github_provider_missing_asset_errors() {
     let tmp = TempDir::new().unwrap();
-    let api = tmp.path().join("api");
+    let base = tmp.path().join("dl");
+    // Place a different asset; the one we request is absent.
     let archive = tmp.path().join("real.zip");
     build_zip(&archive, &[("f", b"F")]);
-    write_release_json(&api, "owner/repo", "v1", "real.zip", &archive);
-
-    let api_base = url::Url::from_directory_path(&api).unwrap().to_string();
-    let api_base = api_base.trim_end_matches('/').to_string();
+    place_asset(&base, "owner/repo", "v1", "real.zip", &archive);
 
     let cache = Cache::at(tmp.path().join("c"));
     cache.ensure_layout().unwrap();
@@ -98,9 +90,12 @@ fn github_provider_missing_asset_errors() {
     opts.insert("tag".into(), toml::Value::String("v1".into()));
     opts.insert("asset".into(), toml::Value::String("does-not-exist.zip".into()));
 
-    let provider = GithubProvider::with_api_base(api_base);
+    let provider = GithubProvider::with_download_base(download_base(&base));
     let err = provider.install(&opts, &mut ctx).unwrap_err();
-    assert!(err.to_string().contains("not found"));
+    assert!(
+        format!("{err:#}").contains("does-not-exist.zip"),
+        "got: {err:#}"
+    );
 }
 
 #[test]
@@ -137,13 +132,6 @@ fn github_archive_kind_inference() {
 #[test]
 fn github_cache_hit_short_circuits() {
     let tmp = TempDir::new().unwrap();
-    let api = tmp.path().join("api");
-    let archive = tmp.path().join("a.zip");
-    build_zip(&archive, &[("f", b"F")]);
-    write_release_json(&api, "x/y", "v", "a.zip", &archive);
-    let api_base = url::Url::from_directory_path(&api).unwrap().to_string();
-    let api_base = api_base.trim_end_matches('/').to_string();
-
     let cache = Cache::at(tmp.path().join("c"));
     cache.ensure_layout().unwrap();
     let mut opts = toml::Table::new();
@@ -165,7 +153,8 @@ fn github_cache_hit_short_circuits() {
     md.write(&cache.install_metadata_path(&sanitized)).unwrap();
 
     let mut ctx = InstallCtx::new(cache);
-    let provider = GithubProvider::with_api_base(api_base);
+    // Download base points nowhere real — a cache hit must not touch it.
+    let provider = GithubProvider::with_download_base("file:///never/exists");
     let installed = provider.install(&opts, &mut ctx).unwrap();
     assert!(!installed.freshly_extracted, "should have hit cache");
     // No staging dir should have been allocated.

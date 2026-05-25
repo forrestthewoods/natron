@@ -38,6 +38,7 @@ fn ensure_layout_creates_subdirs() {
     assert!(cache.cas.is_dir());
     assert!(cache.downloads.is_dir());
     assert!(cache.staging.is_dir());
+    assert!(cache.meta.is_dir());
 }
 
 #[test]

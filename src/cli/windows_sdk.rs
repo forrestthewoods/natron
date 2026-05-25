@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::cli::resolve_config_path;
 use crate::extract;
 use crate::fs_util;
-use crate::providers::vs_manifest::{self, MirrorUrls};
+use crate::providers::vs_manifest::{self, ManifestHistory};
 use crate::providers::windows_sdk;
 use crate::providers::InstallCtx;
 
@@ -56,11 +56,11 @@ pub fn run(
     args: WindowsSdkArgs,
 ) -> Result<()> {
     let ctx = build_ctx(config, cache_dir_override)?;
-    let urls = MirrorUrls::default();
+    let history = ManifestHistory::open(&vs_manifest::default_remote(), ctx.cache())?;
     match args.verb {
-        WindowsSdkVerb::Versions(a) => run_versions(&ctx, &urls, a, &mut std::io::stdout()),
-        WindowsSdkVerb::Packages(a) => run_packages(&ctx, &urls, a, &mut std::io::stdout()),
-        WindowsSdkVerb::Extract(a) => run_extract(&ctx, &urls, a, &mut std::io::stdout()),
+        WindowsSdkVerb::Versions(a) => run_versions(&history, a, &mut std::io::stdout()),
+        WindowsSdkVerb::Packages(a) => run_packages(&history, a, &mut std::io::stdout()),
+        WindowsSdkVerb::Extract(a) => run_extract(&ctx, &history, a, &mut std::io::stdout()),
     }
 }
 
@@ -83,12 +83,11 @@ fn build_ctx(
 // ---- versions --------------------------------------------------------------
 
 fn run_versions(
-    ctx: &InstallCtx,
-    urls: &MirrorUrls,
+    history: &ManifestHistory,
     _args: VersionsArgs,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
-    let versions = windows_sdk::discover_sdk_versions(urls, ctx)?;
+    let versions = windows_sdk::discover_sdk_versions(history)?;
     if versions.is_empty() {
         writeln!(out, "(no Windows SDK versions discovered)")?;
         return Ok(());
@@ -103,12 +102,11 @@ fn run_versions(
 // ---- packages --------------------------------------------------------------
 
 fn run_packages(
-    ctx: &InstallCtx,
-    urls: &MirrorUrls,
+    history: &ManifestHistory,
     args: PackagesArgs,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
-    let resolved = windows_sdk::resolve_sdk_version(urls, &args.sdk_version, ctx)?;
+    let resolved = windows_sdk::resolve_sdk_version(history, &args.sdk_version)?;
     let msis = windows_sdk::enumerate_msis(&resolved.manifest, &resolved.sdk_pkg_id)?;
 
     let mut defaults: Vec<&String> = Vec::new();
@@ -146,11 +144,11 @@ fn run_packages(
 
 fn run_extract(
     ctx: &InstallCtx,
-    urls: &MirrorUrls,
+    history: &ManifestHistory,
     args: ExtractArgs,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
-    let resolved = windows_sdk::resolve_sdk_version(urls, &args.sdk_version, ctx)?;
+    let resolved = windows_sdk::resolve_sdk_version(history, &args.sdk_version)?;
     let component = manifest_lookup(&resolved.manifest, &resolved.sdk_pkg_id)
         .ok_or_else(|| anyhow!("SDK component {} not in manifest", resolved.sdk_pkg_id))?;
     let dep_ids: Vec<String> = component.dependencies.keys().cloned().collect();

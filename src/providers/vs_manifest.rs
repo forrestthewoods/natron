@@ -6,21 +6,27 @@
 //! `channel.json` header (~130 KB). The full package list lives in the
 //! per-commit `manifest.json` (~15-25 MB).
 //!
+//! We read the mirror through a local **partial clone** rather than the
+//! GitHub REST API (whose anonymous rate limit is 60 req/hr per IP). A bare
+//! `git clone --filter=blob:limit=1m` pulls every commit + tree + the small
+//! `channel.json` blobs, deferring the big `manifest.json` blobs to on-demand
+//! `git cat-file` (the promisor remote fetches them lazily). `git` is a hard
+//! requirement; there is no API fallback. See [`ManifestHistory`].
+//!
 //! Pinning a `buildVersion` resolves to one commit_sha → one immutable
 //! manifest → one fixed set of CDN payload URLs. That's the only string
 //! that guarantees a reproducible install.
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use super::InstallCtx;
-use crate::download;
+use crate::cache::Cache;
+use crate::fs_util;
 
 const MIRROR_OWNER: &str = "roblabla";
 const MIRROR_REPO: &str = "msvc-manifest-history";
-const USER_AGENT: &str = concat!("natron/", env!("CARGO_PKG_VERSION"));
 
 // ---- types -----------------------------------------------------------------
 
@@ -132,286 +138,207 @@ pub struct Payload {
     pub file_name: Option<String>,
 }
 
-// ---- URL builders ----------------------------------------------------------
+// ---- manifest history (local partial clone) --------------------------------
 
-/// raw.githubusercontent.com URL pattern. The mirror parameter exists for
-/// test fixtures (`file://` URLs); production uses [`default_raw_base`].
-pub fn raw_url(base: &str, sha_or_branch: &str, filename: &str) -> String {
-    format!("{base}/{sha_or_branch}/{filename}")
+/// Default git remote for the manifest-history mirror.
+pub fn default_remote() -> String {
+    format!("https://github.com/{MIRROR_OWNER}/{MIRROR_REPO}")
 }
 
-pub fn default_raw_base() -> String {
-    format!("https://raw.githubusercontent.com/{MIRROR_OWNER}/{MIRROR_REPO}")
+/// A local bare partial clone of `roblabla/msvc-manifest-history`, opened for
+/// reading. [`ManifestHistory::open`] clones (or `git fetch`es) once; the
+/// query methods are then pure-local `git log` / `git cat-file`.
+///
+/// NOT general purpose: the `release-{channel}` branch layout and the
+/// `channel.json` / `manifest.json` filenames are specific to that mirror.
+pub struct ManifestHistory {
+    git_dir: PathBuf,
 }
 
-/// GitHub commits API for one release branch. Test fixtures override the
-/// base to point at a local `commits.json` file via `{branch}`.
-pub fn commits_url(base: &str, vs: VsVersion, page: u32) -> String {
-    base.replace("{branch}", &format!("release-{}", vs.channel()))
-        .replace("{page}", &page.to_string())
-}
-
-pub fn default_commits_base() -> String {
-    // `?path=channel.json` filters to commits that actually touched the file.
-    // Without it we'd also enumerate the mirror's initial CI-setup commits
-    // (which lack channel.json entirely) and pay a fetch + 404 per commit
-    // for nothing.
-    format!(
-        "https://api.github.com/repos/{MIRROR_OWNER}/{MIRROR_REPO}/commits?sha={{branch}}&path=channel.json&per_page=100&page={{page}}"
-    )
-}
-
-// ---- fetchers --------------------------------------------------------------
-
-/// Enumerate every commit on one release branch via the GitHub commits API.
-/// NOT cached — the response is tiny (~10 KB/page) and freshness matters
-/// when a new Microsoft release has just shipped.
-pub fn fetch_commits(commits_base: &str, vs: VsVersion) -> Result<Vec<CommitRef>> {
-    let mut out = Vec::new();
-    for page in 1u32.. {
-        let url = commits_url(commits_base, vs, page);
-        let body = http_get(&url)
-            .with_context(|| format!("fetching commits page {page} for {}", vs.as_str()))?;
-        let page_commits: Vec<GhCommit> = serde_json::from_str(&body)
-            .with_context(|| format!("parsing commits page {page} for {}", vs.as_str()))?;
-        if page_commits.is_empty() {
-            break;
+impl ManifestHistory {
+    /// Open the mirror under `<cache>/meta/msvc-manifest-history`, cloning it
+    /// (`--filter=blob:limit=1m`: commits + trees + the small `channel.json`
+    /// blobs, deferring the big `manifest.json` blobs) if absent, else
+    /// `git fetch`ing to pick up newly shipped releases. The fetch is
+    /// best-effort: a failure (e.g. a peer holds git's lock, or the network is
+    /// down) leaves the existing clone usable. Requires `git` on PATH.
+    pub fn open(remote: &str, cache: &Cache) -> Result<Self> {
+        let git_dir = cache.meta.join(MIRROR_REPO);
+        if git_dir.is_dir() {
+            let _ = git_in(&git_dir, &["fetch", "--quiet", "origin"]);
+        } else {
+            clone_into(remote, &git_dir, &cache.meta)?;
         }
-        let was_full = page_commits.len() == 100;
-        for c in page_commits {
-            out.push(CommitRef {
-                sha: c.sha,
-                date: c.commit.author.date,
-            });
-        }
-        if !was_full {
-            break;
-        }
+        Ok(Self { git_dir })
     }
-    Ok(out)
-}
 
-#[derive(Deserialize)]
-struct GhCommit {
-    sha: String,
-    commit: GhCommitInner,
-}
-
-#[derive(Deserialize)]
-struct GhCommitInner {
-    author: GhAuthor,
-}
-
-#[derive(Deserialize)]
-struct GhAuthor {
-    date: String,
-}
-
-/// Fetch + parse `channel.json` at a specific commit. Cached forever via
-/// the download layer (commit-sha-keyed URLs are immutable).
-pub fn fetch_channel_info(
-    raw_base: &str,
-    sha_or_branch: &str,
-    ctx: &InstallCtx,
-) -> Result<ChannelInfo> {
-    fetch_channel_info_with_cache(raw_base, sha_or_branch, &ctx.cache().downloads)
-}
-
-/// `Sync`-friendly variant of [`fetch_channel_info`] that takes a downloads
-/// directory directly. Used by [`build_index`] for parallel fan-out where
-/// the workers can't share `&InstallCtx` (its staging `RefCell` is not
-/// `Sync`).
-fn fetch_channel_info_with_cache(
-    raw_base: &str,
-    sha_or_branch: &str,
-    downloads: &Path,
-) -> Result<ChannelInfo> {
-    let url = raw_url(raw_base, sha_or_branch, "channel.json");
-    let path = download::fetch(&url, None, downloads)
-        .with_context(|| format!("fetching channel.json at {sha_or_branch}"))?;
-    #[derive(Deserialize)]
-    struct Wrapper {
-        info: ChannelInfo,
-    }
-    parse_json_or_evict::<Wrapper>(&path, "channel.json").map(|w| w.info)
-}
-
-/// Fetch + parse `manifest.json` at a specific commit. Cached forever.
-pub fn fetch_manifest_at(
-    raw_base: &str,
-    sha_or_branch: &str,
-    ctx: &InstallCtx,
-) -> Result<VsManifest> {
-    let url = raw_url(raw_base, sha_or_branch, "manifest.json");
-    let path = ctx
-        .download(&url, None)
-        .with_context(|| format!("fetching manifest.json at {sha_or_branch}"))?;
-    parse_json_or_evict(&path, "manifest.json")
-}
-
-/// Read a JSON file from disk and parse it. On parse failure, delete the
-/// cached file so the next call re-fetches (defensive against upstream
-/// briefly serving HTML or a truncated response that the download layer
-/// happened to cache).
-fn parse_json_or_evict<T: serde::de::DeserializeOwned>(
-    path: &std::path::Path,
-    label: &str,
-) -> Result<T> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {label} at {}", path.display()))?;
-    match serde_json::from_str(&text) {
-        Ok(v) => Ok(v),
-        Err(err) => {
-            let _ = std::fs::remove_file(path);
-            Err(anyhow!(
-                "parsing {label} at {} (cached file deleted; re-run will refetch): {err}",
-                path.display(),
-            ))
-        }
-    }
-}
-
-// ---- index builder ---------------------------------------------------------
-
-/// Configuration for the fetchers — bundled so tests can swap both URL
-/// bases at once.
-#[derive(Debug, Clone)]
-pub struct MirrorUrls {
-    pub raw_base: String,
-    pub commits_base: String,
-}
-
-impl Default for MirrorUrls {
-    fn default() -> Self {
-        Self {
-            raw_base: default_raw_base(),
-            commits_base: default_commits_base(),
-        }
-    }
-}
-
-/// Maximum concurrent channel.json fetches during enumeration. Picked to
-/// saturate typical home internet without abusing GitHub's CDN.
-const PARALLEL_FETCH_LIMIT: usize = 16;
-
-/// Build the in-memory index across the requested VS series. For each
-/// series: list commits, then fetch every commit's channel.json in parallel
-/// (cached after first run). Sorted descending by commit date within each
-/// VS series.
-pub fn build_index(
-    urls: &MirrorUrls,
-    series: &[VsVersion],
-    ctx: &InstallCtx,
-) -> Result<Vec<BuildIndexEntry>> {
-    let downloads = ctx.cache().downloads.clone();
-    let mut out = Vec::new();
-    for vs in series {
-        let mut commits = fetch_commits(&urls.commits_base, *vs)?;
-        commits.sort_by(|a, b| b.date.cmp(&a.date));
-        out.extend(parallel_fetch_channel_infos(
-            &urls.raw_base,
-            &commits,
-            &downloads,
-            *vs,
-        ));
-    }
-    Ok(out)
-}
-
-/// Fan `fetch_channel_info_with_cache` out across a small worker pool.
-/// Results land in per-index slots so the input commit order (date-desc)
-/// is preserved without re-sorting. Fetch errors are logged and dropped.
-fn parallel_fetch_channel_infos(
-    raw_base: &str,
-    commits: &[CommitRef],
-    downloads: &Path,
-    vs: VsVersion,
-) -> Vec<BuildIndexEntry> {
-    if commits.is_empty() {
-        return Vec::new();
-    }
-    let queue: Mutex<Vec<usize>> = Mutex::new((0..commits.len()).rev().collect());
-    let results: Mutex<Vec<Option<ChannelInfo>>> = Mutex::new(vec![None; commits.len()]);
-
-    std::thread::scope(|s| {
-        for _ in 0..PARALLEL_FETCH_LIMIT.min(commits.len()) {
-            s.spawn(|| loop {
-                let idx = match queue.lock().unwrap().pop() {
-                    Some(i) => i,
-                    None => return,
-                };
-                let commit = &commits[idx];
-                match fetch_channel_info_with_cache(raw_base, &commit.sha, downloads) {
-                    Ok(info) => {
-                        results.lock().unwrap()[idx] = Some(info);
-                    }
+    /// All builds across the requested series, newest-first within each.
+    pub fn index(&self, series: &[VsVersion]) -> Result<Vec<BuildIndexEntry>> {
+        let mut out = Vec::new();
+        for vs in series {
+            let mut commits = self.commits_on_branch(*vs)?;
+            commits.sort_by(|a, b| b.date.cmp(&a.date));
+            for commit in commits {
+                match self.channel_info_at(&commit.sha) {
+                    Ok(info) => out.push(BuildIndexEntry {
+                        vs: *vs,
+                        info,
+                        commit,
+                    }),
                     Err(err) => tracing::warn!(
                         "skipping commit {} on {}: {err:#}",
                         &commit.sha[..commit.sha.len().min(7)],
                         vs.as_str(),
                     ),
                 }
-            });
+            }
         }
-    });
+        Ok(out)
+    }
 
-    results
-        .into_inner()
-        .unwrap()
-        .into_iter()
-        .enumerate()
-        .filter_map(|(idx, info)| {
-            info.map(|info| BuildIndexEntry {
-                vs,
-                info,
-                commit: commits[idx].clone(),
+    /// Newest build for one series, if any.
+    pub fn newest(&self, vs: VsVersion) -> Result<Option<BuildIndexEntry>> {
+        Ok(self.index(&[vs])?.into_iter().next())
+    }
+
+    /// Resolve a buildVersion to its entry. Auto-detects the VS series from
+    /// the version's major component. On miss, surfaces a few of the nearest
+    /// available buildVersions for context.
+    pub fn resolve_build_version(&self, build_version: &str) -> Result<BuildIndexEntry> {
+        let major = build_version_major(build_version)?;
+        let vs = VsVersion::from_channel(major)?;
+        let entries = self.index(&[vs])?;
+        if let Some(hit) = entries
+            .iter()
+            .find(|e| e.info.build_version == build_version)
+        {
+            return Ok(hit.clone());
+        }
+        let mut available: Vec<&str> = entries
+            .iter()
+            .map(|e| e.info.build_version.as_str())
+            .collect();
+        available.sort();
+        // Show 5 nearest (lex-closest) so the error fits on a terminal.
+        let suggestions: Vec<&&str> = available
+            .iter()
+            .filter(|v| v.starts_with(&format!("{major}.")))
+            .take(5)
+            .collect();
+        bail!(
+            "buildVersion '{build_version}' not found on {} (release-{major}); {} available; nearest: {}",
+            vs.as_str(),
+            available.len(),
+            if suggestions.is_empty() {
+                "(none)".to_string()
+            } else {
+                suggestions
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        )
+    }
+
+    /// Read + parse `manifest.json` at a commit. The blob is excluded from the
+    /// partial clone, so `git cat-file` lazily fetches it from the promisor
+    /// remote on first access (cached in the clone thereafter).
+    pub fn manifest(&self, sha: &str) -> Result<VsManifest> {
+        let bytes = self
+            .cat_blob(sha, "manifest.json")
+            .with_context(|| format!("reading manifest.json at {sha}"))?;
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing manifest.json at {sha}"))
+    }
+
+    /// List the commits on one release branch that touched `channel.json`,
+    /// skipping the mirror's initial CI-setup commits that lack it. Unsorted;
+    /// callers sort by date.
+    fn commits_on_branch(&self, vs: VsVersion) -> Result<Vec<CommitRef>> {
+        let branch = format!("release-{}", vs.channel());
+        let stdout = git_in(
+            &self.git_dir,
+            &["log", "--format=%H %aI", branch.as_str(), "--", "channel.json"],
+        )
+        .with_context(|| format!("listing commits on {branch}"))?;
+        let text = String::from_utf8(stdout).context("git log output was not UTF-8")?;
+        Ok(text
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(sha, date)| CommitRef {
+                sha: sha.to_string(),
+                date: date.to_string(),
             })
-        })
-        .collect()
+            .collect())
+    }
+
+    /// Read + parse `channel.json` at a commit straight from the local clone.
+    fn channel_info_at(&self, sha: &str) -> Result<ChannelInfo> {
+        let bytes = self
+            .cat_blob(sha, "channel.json")
+            .with_context(|| format!("reading channel.json at {sha}"))?;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            info: ChannelInfo,
+        }
+        let wrapper: Wrapper = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing channel.json at {sha}"))?;
+        Ok(wrapper.info)
+    }
+
+    /// `git cat-file blob <sha>:<path>` — the bytes of a file at a commit.
+    fn cat_blob(&self, sha: &str, path: &str) -> Result<Vec<u8>> {
+        let spec = format!("{sha}:{path}");
+        git_in(&self.git_dir, &["cat-file", "blob", spec.as_str()])
+    }
 }
 
-/// Resolve a buildVersion to its mirror entry. Auto-detects the VS series
-/// from the version's major component. On miss, surfaces a few of the
-/// nearest available buildVersions for context.
-pub fn resolve_build_version(
-    urls: &MirrorUrls,
-    build_version: &str,
-    ctx: &InstallCtx,
-) -> Result<BuildIndexEntry> {
-    let major = build_version_major(build_version)?;
-    let vs = VsVersion::from_channel(major)?;
-    let entries = build_index(urls, &[vs], ctx)?;
-    if let Some(hit) = entries
-        .iter()
-        .find(|e| e.info.build_version == build_version)
-    {
-        return Ok(hit.clone());
-    }
-    let mut available: Vec<&str> = entries
-        .iter()
-        .map(|e| e.info.build_version.as_str())
-        .collect();
-    available.sort();
-    // Show 5 nearest (lex-closest) so the error fits on a terminal.
-    let suggestions: Vec<&&str> = available
-        .iter()
-        .filter(|v| v.starts_with(&format!("{major}.")))
-        .take(5)
-        .collect();
-    bail!(
-        "buildVersion '{build_version}' not found on {} (release-{major}); {} available; nearest: {}",
-        vs.as_str(),
-        available.len(),
-        if suggestions.is_empty() {
-            "(none)".to_string()
+/// Run `git <args>` and return stdout. Maps a missing `git` binary to a clear
+/// error; treats a non-zero exit as a failure carrying git's stderr.
+fn run_git(mut cmd: Command) -> Result<Vec<u8>> {
+    let out = cmd.output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow!(
+                "`git` was not found on PATH; natron needs git to read the MSVC / Windows SDK manifest mirror"
+            )
         } else {
-            suggestions
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        },
-    )
+            anyhow!("spawning git: {e}")
+        }
+    })?;
+    if !out.status.success() {
+        bail!("git failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(out.stdout)
+}
+
+/// `git -C <dir> <args>`.
+fn git_in(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    run_git(cmd)
+}
+
+/// Bare partial clone of `remote` into `dest` (a subdir of `meta_dir`). Clones
+/// into a unique temp dir under `meta_dir` then atomically renames it into
+/// place, so two concurrent natron runs can't corrupt a shared clone (same
+/// lock-free publish as the CAS).
+fn clone_into(remote: &str, dest: &Path, meta_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(meta_dir)
+        .with_context(|| format!("creating {}", meta_dir.display()))?;
+    let tmp = meta_dir.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
+    let mut cmd = Command::new("git");
+    cmd.args(["clone", "--bare", "--filter=blob:limit=1m"])
+        .arg(remote)
+        .arg(&tmp);
+    if let Err(err) = run_git(cmd) {
+        let _ = fs_util::remove_dir_all_writable(&tmp);
+        return Err(err).with_context(|| format!("cloning manifest mirror from {remote}"));
+    }
+    if std::fs::rename(&tmp, dest).is_err() {
+        // A peer published the clone first; keep theirs, drop ours.
+        let _ = fs_util::remove_dir_all_writable(&tmp);
+    }
+    Ok(())
 }
 
 /// Parse the major component (first dot-segment) of a buildVersion.
@@ -422,29 +349,6 @@ pub fn build_version_major(build_version: &str) -> Result<u8> {
         .ok_or_else(|| anyhow!("buildVersion '{build_version}' is empty"))?;
     head.parse::<u8>()
         .map_err(|e| anyhow!("buildVersion '{build_version}' major is not numeric: {e}"))
-}
-
-// ---- HTTP helper -----------------------------------------------------------
-
-/// Plain GET. Used for the GitHub commits API — small JSON, no caching,
-/// must set a User-Agent (GitHub requires it).
-pub fn http_get(url: &str) -> Result<String> {
-    if let Some(rest) = url.strip_prefix("file://") {
-        // For test fixtures.
-        let p = url::Url::parse(url)
-            .ok()
-            .and_then(|u| u.to_file_path().ok())
-            .unwrap_or_else(|| std::path::PathBuf::from(rest));
-        return std::fs::read_to_string(&p)
-            .with_context(|| format!("reading file URL {}", p.display()));
-    }
-    let resp = crate::download::agent()
-        .get(url)
-        .header("User-Agent", USER_AGENT)
-        .header("Accept", "application/json")
-        .call()
-        .with_context(|| format!("GET {url}"))?;
-    Ok(resp.into_body().read_to_string()?)
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ use std::path::Path;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::vs_manifest::{
-    self, BuildIndexEntry, MirrorUrls, Package, VsManifest, VsVersion,
+    self, BuildIndexEntry, ManifestHistory, Package, VsManifest, VsVersion,
 };
 use super::{InstallCtx, Installed, Provider};
 use crate::cache::sanitize_fingerprint;
@@ -110,18 +110,20 @@ fn is_numeric_sdk_version(s: &str) -> bool {
 // ---- provider --------------------------------------------------------------
 
 pub struct WindowsSdkProvider {
-    urls: MirrorUrls,
+    remote: String,
 }
 
 impl WindowsSdkProvider {
     pub fn new() -> Self {
         Self {
-            urls: MirrorUrls::default(),
+            remote: vs_manifest::default_remote(),
         }
     }
 
-    pub fn with_urls(urls: MirrorUrls) -> Self {
-        Self { urls }
+    pub fn with_remote(remote: impl Into<String>) -> Self {
+        Self {
+            remote: remote.into(),
+        }
     }
 }
 
@@ -149,7 +151,8 @@ impl Provider for WindowsSdkProvider {
             });
         }
 
-        let resolved = resolve_sdk_version(&self.urls, &opts.sdk_version, ctx)?;
+        let history = ManifestHistory::open(&self.remote, ctx.cache())?;
+        let resolved = resolve_sdk_version(&history, &opts.sdk_version)?;
         let component = lookup_exact(&resolved.manifest, &resolved.sdk_pkg_id)
             .ok_or_else(|| anyhow!("SDK component {} not in manifest", resolved.sdk_pkg_id))?;
         let dep_ids: Vec<String> = component.dependencies.keys().cloned().collect();
@@ -237,21 +240,21 @@ pub struct ResolvedSdk {
 /// `sdk_version`. Errors with the union of SDKs available across all three
 /// snapshots if nothing matches.
 pub fn resolve_sdk_version(
-    urls: &MirrorUrls,
+    history: &ManifestHistory,
     sdk_version: &str,
-    ctx: &InstallCtx,
 ) -> Result<ResolvedSdk> {
     let mut available: BTreeSet<String> = BTreeSet::new();
     let mut last_err: Option<anyhow::Error> = None;
     for vs in VsVersion::all().iter().rev() {
-        let entry = match newest_entry_for(urls, *vs, ctx) {
-            Ok(e) => e,
+        let entry = match history.newest(*vs) {
+            Ok(Some(e)) => e,
+            Ok(None) => continue,
             Err(err) => {
                 last_err = Some(err);
                 continue;
             }
         };
-        let manifest = match vs_manifest::fetch_manifest_at(&urls.raw_base, &entry.commit.sha, ctx) {
+        let manifest = match history.manifest(&entry.commit.sha) {
             Ok(m) => m,
             Err(err) => {
                 last_err = Some(err);
@@ -286,17 +289,18 @@ pub fn resolve_sdk_version(
 
 /// Distinct SDK versions discovered across the newest snapshot of each VS
 /// series. Sorted descending by numeric key.
-pub fn discover_sdk_versions(urls: &MirrorUrls, ctx: &InstallCtx) -> Result<Vec<String>> {
+pub fn discover_sdk_versions(history: &ManifestHistory) -> Result<Vec<String>> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for vs in VsVersion::all() {
-        let entry = match newest_entry_for(urls, vs, ctx) {
-            Ok(e) => e,
+        let entry = match history.newest(vs) {
+            Ok(Some(e)) => e,
+            Ok(None) => continue,
             Err(err) => {
                 tracing::warn!("skipping {} for SDK discovery: {err:#}", vs.as_str());
                 continue;
             }
         };
-        let manifest = match vs_manifest::fetch_manifest_at(&urls.raw_base, &entry.commit.sha, ctx) {
+        let manifest = match history.manifest(&entry.commit.sha) {
             Ok(m) => m,
             Err(err) => {
                 tracing::warn!(
@@ -364,18 +368,6 @@ pub fn enumerate_msis(manifest: &VsManifest, sdk_pkg_id: &str) -> Result<Vec<(St
         }
     }
     Ok(out.into_iter().collect())
-}
-
-fn newest_entry_for(
-    urls: &MirrorUrls,
-    vs: VsVersion,
-    ctx: &InstallCtx,
-) -> Result<BuildIndexEntry> {
-    let entries = vs_manifest::build_index(urls, &[vs], ctx)?;
-    entries
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("no commits on mirror for {}", vs.as_str()))
 }
 
 // ---- selection -------------------------------------------------------------

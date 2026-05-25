@@ -417,8 +417,8 @@ fn test_install_github_provider() {
             ("LICENSE", b"llvm-license"),
         ],
     );
-    // Pre-populate the fake GitHub release JSON.
-    env.write_github_release_json(
+    // Pre-place the fake GitHub release asset.
+    env.place_github_asset(
         "llvm/llvm-project",
         "llvmorg-21.1.6",
         "clang+llvm-21.1.6-x86_64-pc-windows-msvc.tar.xz",
@@ -474,7 +474,7 @@ fn test_install_three_providers_at_once() {
         "zig-windows-x86_64-0.15.2.zip",
         &[("zig-windows-x86_64-0.15.2/zig.exe", b"ZIG")],
     );
-    env.write_github_release_json(
+    env.place_github_asset(
         "llvm/llvm-project",
         "llvmorg-21",
         "llvm.tar.xz",
@@ -619,15 +619,21 @@ fn test_real_github_llvm_install() {
 
 #[test]
 #[ignore = "network: requires upstream access (cargo test -- --ignored)"]
-fn test_real_mirror_commits_api() {
-    use natron::providers::vs_manifest::{self, MirrorUrls, VsVersion};
-    let urls = MirrorUrls::default();
+fn test_real_mirror_enumeration() {
+    // Partial-clone the live mirror and confirm each release branch yields
+    // at least one build. Exercises clone + `git log` + channel.json reads.
+    use natron::providers::vs_manifest::{self, ManifestHistory, VsVersion};
+    let env = TestEnv::new();
+    let cache = Cache::at(env.cache_dir.clone());
+    cache.ensure_layout().expect("cache layout");
+    let history = ManifestHistory::open(&vs_manifest::default_remote(), &cache).expect("open");
     for vs in VsVersion::all() {
-        let commits = vs_manifest::fetch_commits(&urls.commits_base, vs)
-            .unwrap_or_else(|e| panic!("commits for {}: {e:#}", vs.as_str()));
+        let entries = history
+            .index(&[vs])
+            .unwrap_or_else(|e| panic!("index for {}: {e:#}", vs.as_str()));
         assert!(
-            !commits.is_empty(),
-            "{} has zero commits on the mirror",
+            !entries.is_empty(),
+            "{} has zero builds on the mirror",
             vs.as_str()
         );
     }
@@ -641,19 +647,15 @@ fn test_real_msvc_primary_compiler() {
     // Microsoft renames the family or changes the .18.<minor>. structure,
     // this catches it.
     use natron::providers::msvc;
-    use natron::providers::vs_manifest::{self, MirrorUrls, VsVersion};
-    use natron::providers::InstallCtx;
+    use natron::providers::vs_manifest::{self, ManifestHistory, VsVersion};
     let env = TestEnv::new();
     let cache = Cache::at(env.cache_dir.clone());
     cache.ensure_layout().expect("cache layout");
-    let ctx = InstallCtx::new(cache);
-    let urls = MirrorUrls::default();
+    let history = ManifestHistory::open(&vs_manifest::default_remote(), &cache).expect("open");
 
-    let commits = vs_manifest::fetch_commits(&urls.commits_base, VsVersion::Vs2026)
-        .expect("commits");
-    let head_sha = &commits[0].sha;
-    let manifest = vs_manifest::fetch_manifest_at(&urls.raw_base, head_sha, &ctx)
-        .expect("manifest");
+    let entries = history.index(&[VsVersion::Vs2026]).expect("index");
+    let head_sha = &entries[0].commit.sha; // newest-first
+    let manifest = history.manifest(head_sha).expect("manifest");
     let primary = msvc::find_primary_compiler(&manifest, VsVersion::Vs2026)
         .expect("primary compiler");
     assert!(
@@ -667,16 +669,14 @@ fn test_real_msvc_primary_compiler() {
 #[test]
 #[ignore = "network: requires upstream access (cargo test -- --ignored)"]
 fn test_real_windows_sdk_versions() {
-    use natron::providers::vs_manifest::MirrorUrls;
+    use natron::providers::vs_manifest::{self, ManifestHistory};
     use natron::providers::windows_sdk;
-    use natron::providers::InstallCtx;
     let env = TestEnv::new();
     let cache = Cache::at(env.cache_dir.clone());
     cache.ensure_layout().expect("cache layout");
-    let ctx = InstallCtx::new(cache);
-    let urls = MirrorUrls::default();
+    let history = ManifestHistory::open(&vs_manifest::default_remote(), &cache).expect("open");
 
-    let versions = windows_sdk::discover_sdk_versions(&urls, &ctx).expect("discover");
+    let versions = windows_sdk::discover_sdk_versions(&history).expect("discover");
     assert!(
         !versions.is_empty(),
         "no Windows SDK versions discovered on the mirror"
@@ -688,19 +688,16 @@ fn test_real_windows_sdk_versions() {
 fn test_real_windows_sdk_packages() {
     // Resolve the newest SDK and confirm enumerate_msis returns at least
     // one default-installed MSI AND at least one extras-available MSI.
-    use natron::providers::vs_manifest::MirrorUrls;
+    use natron::providers::vs_manifest::{self, ManifestHistory};
     use natron::providers::windows_sdk;
-    use natron::providers::InstallCtx;
     let env = TestEnv::new();
     let cache = Cache::at(env.cache_dir.clone());
     cache.ensure_layout().expect("cache layout");
-    let ctx = InstallCtx::new(cache);
-    let urls = MirrorUrls::default();
+    let history = ManifestHistory::open(&vs_manifest::default_remote(), &cache).expect("open");
 
-    let versions = windows_sdk::discover_sdk_versions(&urls, &ctx).expect("discover");
+    let versions = windows_sdk::discover_sdk_versions(&history).expect("discover");
     let newest = versions.first().expect("at least one SDK").clone();
-    let resolved =
-        windows_sdk::resolve_sdk_version(&urls, &newest, &ctx).expect("resolve");
+    let resolved = windows_sdk::resolve_sdk_version(&history, &newest).expect("resolve");
     let msis = windows_sdk::enumerate_msis(&resolved.manifest, &resolved.sdk_pkg_id)
         .expect("enumerate");
     let default_count = msis.iter().filter(|(_, g)| g == "default").count();
