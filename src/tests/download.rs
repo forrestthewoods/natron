@@ -24,6 +24,25 @@ fn fetch_file_url_no_sha() {
 }
 
 #[test]
+fn fetch_with_outcome_reports_downloaded_then_cached() {
+    // First call: cache miss → Downloaded.
+    // Second call (same URL+cache): cache hit → Cached.
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("payload.bin");
+    std::fs::write(&src, b"abc").unwrap();
+    let cache = tmp.path().join("cache");
+    let url = url::Url::from_file_path(&src).unwrap();
+
+    let (path1, source1) = fetch_with_outcome(url.as_str(), None, &cache).unwrap();
+    assert!(path1.is_file());
+    assert_eq!(source1, FetchSource::Downloaded);
+
+    let (path2, source2) = fetch_with_outcome(url.as_str(), None, &cache).unwrap();
+    assert_eq!(path1, path2);
+    assert_eq!(source2, FetchSource::Cached);
+}
+
+#[test]
 fn fetch_file_url_with_correct_sha() {
     let tmp = TempDir::new().unwrap();
     let src = tmp.path().join("payload.bin");

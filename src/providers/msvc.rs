@@ -153,17 +153,28 @@ impl Provider for MsvcProvider {
 
         let selected = select_packages(&manifest, &family, &opts)?;
         let staging = ctx.staging_dir()?;
+        let mut downloaded_count = 0usize;
+        let mut cached_count = 0usize;
         for request in &selected {
             let pkg = lookup_package(&manifest, request)?;
             for payload in &pkg.payloads {
                 let filename = payload_filename(payload);
-                let archive = ctx
-                    .download(&payload.url, payload.sha256.as_deref())
+                let (archive, source) = ctx
+                    .download_with_outcome(&payload.url, payload.sha256.as_deref())
                     .with_context(|| format!("downloading {filename} for {}", pkg.id))?;
+                match source {
+                    crate::download::FetchSource::Cached => cached_count += 1,
+                    crate::download::FetchSource::Downloaded => downloaded_count += 1,
+                }
                 extract_payload(&archive, &filename, &staging)
                     .with_context(|| format!("extracting {filename} for {}", pkg.id))?;
             }
         }
+        tracing::info!(
+            "msvc build {}: {downloaded_count} payloads downloaded, \
+             {cached_count} already cached",
+            opts.build_version,
+        );
 
         Ok(Installed {
             fingerprint: fp,

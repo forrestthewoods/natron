@@ -118,6 +118,18 @@ impl InstallCtx {
     pub fn download(&self, url: &str, expected_sha256: Option<&str>) -> Result<PathBuf> {
         download::fetch(url, expected_sha256, &self.cache.downloads)
     }
+
+    /// Same as [`download`], but also reports whether the result came
+    /// from cache or required a fresh fetch. Used by install loops that
+    /// want to report a per-provider summary (e.g. "X downloaded, Y
+    /// already cached").
+    pub fn download_with_outcome(
+        &self,
+        url: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<(PathBuf, download::FetchSource)> {
+        download::fetch_with_outcome(url, expected_sha256, &self.cache.downloads)
+    }
 }
 
 /// Owns a set of provider implementations keyed by their `id()`.
