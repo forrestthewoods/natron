@@ -217,24 +217,49 @@ fn build_index_sorts_commits_descending_by_date() {
 #[test]
 fn resolve_build_version_finds_exact_match() {
     let tmp = TempDir::new().unwrap();
+    // Two snapshots on the same series. Resolving must return the entry for
+    // the requested build, proven by a field that is NOT the match key
+    // (product_display_version comes from that commit's channel.json).
     let fx = MirrorFixture::build(
         tmp.path(),
         &[(
             VsVersion::Vs2026,
-            &[FxSnapshot {
-                sha: "sha_a",
-                date: "2026-05-01T00:00:00Z",
-                build_version: "18.6.11819.183",
-                display_version: "18.6.1",
-                product_line_version: "18",
-                manifest_packages_json: String::new(),
-            }],
+            &[
+                FxSnapshot {
+                    sha: "sha_old",
+                    date: "2026-04-01T00:00:00Z",
+                    build_version: "18.5.9000.0",
+                    display_version: "18.5",
+                    product_line_version: "18",
+                    manifest_packages_json: String::new(),
+                },
+                FxSnapshot {
+                    sha: "sha_a",
+                    date: "2026-05-01T00:00:00Z",
+                    build_version: "18.6.11819.183",
+                    display_version: "18.6.1",
+                    product_line_version: "18",
+                    manifest_packages_json: String::new(),
+                },
+            ],
         )],
     );
     let ctx = test_ctx(&tmp);
-    let entry = fx.history(&ctx).resolve_build_version("18.6.11819.183").unwrap();
+    let history = fx.history(&ctx);
+
+    let entry = history.resolve_build_version("18.6.11819.183").unwrap();
     assert_eq!(entry.info.build_version, "18.6.11819.183");
     assert_eq!(entry.vs, VsVersion::Vs2026);
+    // The load came from the matching commit, not the other snapshot.
+    assert_eq!(entry.info.product_display_version, "18.6.1");
+
+    // Resolving the other build returns its own distinct commit + metadata.
+    let other = history.resolve_build_version("18.5.9000.0").unwrap();
+    assert_eq!(other.info.product_display_version, "18.5");
+    assert_ne!(
+        entry.commit.sha, other.commit.sha,
+        "distinct builds must resolve to distinct commits"
+    );
 }
 
 #[test]
@@ -346,4 +371,52 @@ fn open_refetches_new_upstream_commits_on_existing_clone() {
         "open() must refetch new upstream commits on an existing clone"
     );
     assert_eq!(second[0].info.build_version, "18.7.0.0");
+}
+
+#[test]
+fn newest_returns_latest_valid_commit_skipping_unparseable() {
+    // Guards the newest()-only optimization: with several commits per branch,
+    // it must return the newest by date AND fall through a newest commit whose
+    // channel.json doesn't parse. A naive "first/oldest commit" or a
+    // "newest commit, no skip" implementation would fail this.
+    let tmp = TempDir::new().unwrap();
+    let fx = MirrorFixture::build(
+        tmp.path(),
+        &[(
+            VsVersion::Vs2026,
+            &[
+                FxSnapshot {
+                    sha: "old",
+                    date: "2026-01-01T00:00:00Z",
+                    build_version: "18.5.0.0",
+                    display_version: "18.5",
+                    product_line_version: "18",
+                    manifest_packages_json: String::new(),
+                },
+                FxSnapshot {
+                    sha: "newest-valid",
+                    date: "2026-05-01T00:00:00Z",
+                    build_version: "18.6.0.0",
+                    display_version: "18.6",
+                    product_line_version: "18",
+                    manifest_packages_json: String::new(),
+                },
+            ],
+        )],
+    );
+    // Newest commit by date carries a corrupt channel.json.
+    std::fs::write(fx.root.join("channel.json"), b"{ not valid json").unwrap();
+    git(&fx.root, &["add", "channel.json"]);
+    git_commit(&fx.root, "corrupt", "2026-06-01T00:00:00Z");
+
+    let ctx = test_ctx(&tmp);
+    let newest = fx
+        .history(&ctx)
+        .newest(VsVersion::Vs2026)
+        .unwrap()
+        .expect("a valid build exists");
+    assert_eq!(
+        newest.info.build_version, "18.6.0.0",
+        "newest() must skip the unparseable newest commit and return the next-newest valid one"
+    );
 }
