@@ -318,16 +318,23 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     run_git(cmd)
 }
 
-/// Bare partial clone of `remote` into `dest` (a subdir of `meta_dir`). Clones
-/// into a unique temp dir under `meta_dir` then atomically renames it into
-/// place, so two concurrent natron runs can't corrupt a shared clone (same
-/// lock-free publish as the CAS).
+/// Mirror partial clone of `remote` into `dest` (a subdir of `meta_dir`).
+/// Clones into a unique temp dir under `meta_dir` then atomically renames it
+/// into place, so two concurrent natron runs can't corrupt a shared clone
+/// (same lock-free publish as the CAS).
+///
+/// `--mirror` (not plain `--bare`): a bare clone configures no
+/// `remote.origin.fetch` refspec, so the periodic `git fetch` in
+/// [`ManifestHistory::open`] would update only FETCH_HEAD and never advance
+/// `release-*`, freezing the snapshot set at first-clone time. `--mirror`
+/// sets `+refs/*:refs/*`, so fetch keeps the local branches current and newly
+/// shipped releases actually appear.
 fn clone_into(remote: &str, dest: &Path, meta_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(meta_dir)
         .with_context(|| format!("creating {}", meta_dir.display()))?;
     let tmp = meta_dir.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
     let mut cmd = Command::new("git");
-    cmd.args(["clone", "--bare", "--filter=blob:limit=1m"])
+    cmd.args(["clone", "--mirror", "--filter=blob:limit=1m"])
         .arg(remote)
         .arg(&tmp);
     if let Err(err) = run_git(cmd) {

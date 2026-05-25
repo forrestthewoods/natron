@@ -300,3 +300,50 @@ fn commits_filtered_to_channel_json_touching() {
     assert_eq!(entries.len(), 1, "only channel.json commits should appear");
     assert_eq!(entries[0].info.build_version, "18.6.0.0");
 }
+
+#[test]
+fn open_refetches_new_upstream_commits_on_existing_clone() {
+    // Regression guard for the `--mirror` requirement. A second open() against
+    // an already-cloned cache must `git fetch` newly shipped upstream commits,
+    // not serve the snapshot set frozen at first-clone time. A plain
+    // `git clone --bare` configures no fetch refspec, so its refresh fetch is a
+    // no-op for branch refs and this test would see only the original build.
+    let tmp = TempDir::new().unwrap();
+    let fx = MirrorFixture::build(
+        tmp.path(),
+        &[(
+            VsVersion::Vs2026,
+            &[FxSnapshot {
+                sha: "first",
+                date: "2026-05-01T00:00:00Z",
+                build_version: "18.6.0.0",
+                display_version: "18.6",
+                product_line_version: "18",
+                manifest_packages_json: String::new(),
+            }],
+        )],
+    );
+    let ctx = test_ctx(&tmp);
+
+    // First open clones the mirror; one build visible.
+    let first = fx.history(&ctx).index(&[VsVersion::Vs2026]).unwrap();
+    assert_eq!(first.len(), 1);
+
+    // Upstream ships a newer release on release-18.
+    std::fs::write(
+        fx.root.join("channel.json"),
+        channel_json("18.7.0.0", "18.7", "18"),
+    )
+    .unwrap();
+    git(&fx.root, &["add", "channel.json"]);
+    git_commit(&fx.root, "second", "2026-06-01T00:00:00Z");
+
+    // Second open reuses the same cache, so it must fetch and now see both.
+    let second = fx.history(&ctx).index(&[VsVersion::Vs2026]).unwrap();
+    assert_eq!(
+        second.len(),
+        2,
+        "open() must refetch new upstream commits on an existing clone"
+    );
+    assert_eq!(second[0].info.build_version, "18.7.0.0");
+}

@@ -172,9 +172,11 @@ fn cas_file(
     // The CAS owns the content now; drop our staging copy. On the
     // just-inserted path `src` and `cas_path` are two names for one inode, so
     // this just removes the redundant name; on the dedupe path `src` was a
-    // distinct copy.
-    std::fs::remove_file(src)
-        .with_context(|| format!("removing staging file {}", src.display()))?;
+    // distinct copy. Best-effort: the content is already safely in the CAS,
+    // and the engine reaps the whole staging dir afterward, so a transient
+    // unlink failure (e.g. an AV scanner briefly holding `src` on Windows)
+    // must not abort an otherwise-successful install.
+    let _ = std::fs::remove_file(src);
 
     // Hardlink CAS → install tree position. Do this BEFORE marking the CAS
     // file readonly: on Windows, marking a file's attributes momentarily
