@@ -152,8 +152,13 @@ impl Provider for WindowsSdkProvider {
             });
         }
 
+        let t_git = std::time::Instant::now();
         let history = ManifestHistory::open(&self.remote, ctx.cache())?;
         let resolved = resolve_sdk_version(&history, &opts.sdk_version)?;
+        tracing::info!(
+            "[timing] windows_sdk: git manifest open+resolve took {:.2}s",
+            t_git.elapsed().as_secs_f64()
+        );
         let component = lookup_exact(&resolved.manifest, &resolved.sdk_pkg_id)
             .ok_or_else(|| anyhow!("SDK component {} not in manifest", resolved.sdk_pkg_id))?;
         let dep_ids: Vec<String> = component.dependencies.keys().cloned().collect();
@@ -174,6 +179,7 @@ impl Provider for WindowsSdkProvider {
         std::fs::create_dir_all(&extract_dir)
             .with_context(|| format!("creating {}", extract_dir.display()))?;
 
+        let t_dl = std::time::Instant::now();
         let mut msis_to_extract: Vec<std::path::PathBuf> = Vec::new();
         let mut downloaded_count = 0usize;
         let mut cached_count = 0usize;
@@ -234,9 +240,20 @@ impl Provider for WindowsSdkProvider {
              {cached_count} already cached",
             opts.sdk_version,
         );
+        tracing::info!(
+            "[timing] windows_sdk: serial download+stage of {} payloads took {:.2}s",
+            downloaded_count + cached_count,
+            t_dl.elapsed().as_secs_f64()
+        );
         tracing::info!("extracting {} SDK MSIs", msis_to_extract.len());
+        let t_ex = std::time::Instant::now();
         extract::extract_msis_in_parallel(&msis_to_extract, &extract_dir)
             .context("extracting SDK MSIs")?;
+        tracing::info!(
+            "[timing] windows_sdk: parallel MSI extract ({} MSIs) took {:.2}s",
+            msis_to_extract.len(),
+            t_ex.elapsed().as_secs_f64()
+        );
         flatten_windows_kits_into(&extract_dir, &staging_raw)
             .context("flattening Windows Kits/10")?;
         let _ = fs_util::remove_dir_all_writable(&payloads_dir);

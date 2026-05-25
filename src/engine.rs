@@ -224,7 +224,13 @@ impl Natron {
         let provider = self.registry.require(&entry.provider)?;
         let mode = self.effective_mode(entry, opts);
         let mut ctx = InstallCtx::new(self.cache.clone());
+        let t_install = std::time::Instant::now();
         let installed = provider.install(&entry.options, &mut ctx)?;
+        tracing::info!(
+            "[timing] {} provider.install (download+extract) took {:.2}s",
+            entry.name,
+            t_install.elapsed().as_secs_f64()
+        );
         let raw_fp = installed.fingerprint;
         let fingerprint = sanitize_fingerprint(&raw_fp);
 
@@ -238,14 +244,20 @@ impl Natron {
             let staging_raw = staging_root.join("raw");
             let staging_tree = staging_root.join("tree");
 
+            let t_cas = std::time::Instant::now();
             let cas_report = if opts.no_cas {
                 cas::run_no_cas(&staging_raw, &staging_tree)?
             } else {
                 cas::run(&self.cache, &staging_raw, &staging_tree)?
             };
-            tracing::debug!(
-                "cas pass: files={} dedupe_hits={} bytes_freed={}",
-                cas_report.files_processed,
+            let cas_elapsed = t_cas.elapsed().as_secs_f64();
+            let total_files = cas_report.files_processed + cas_report.dedupe_hits;
+            tracing::info!(
+                "[timing] {} cas pass: {} files in {:.2}s ({:.0} files/s), dedupe_hits={} bytes_freed={}",
+                entry.name,
+                total_files,
+                cas_elapsed,
+                (total_files as f64) / cas_elapsed.max(0.0001),
                 cas_report.dedupe_hits,
                 cas_report.bytes_freed
             );
@@ -313,7 +325,14 @@ impl Natron {
         }
 
         let action = if diff.needs_redeploy() {
+            let t_deploy = std::time::Instant::now();
             deploy::deploy(&install_tree, &deploy_path, mode)?;
+            tracing::info!(
+                "[timing] {} deploy ({}) took {:.2}s",
+                entry.name,
+                mode,
+                t_deploy.elapsed().as_secs_f64()
+            );
             state.upsert(
                 entry.name.clone(),
                 DeployedEntry {

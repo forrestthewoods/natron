@@ -148,9 +148,14 @@ impl Provider for MsvcProvider {
             });
         }
 
+        let t_git = std::time::Instant::now();
         let history = ManifestHistory::open(&self.remote, ctx.cache())?;
         let entry = history.resolve_build_version(&opts.build_version)?;
         let manifest = history.manifest(&entry.commit.sha)?;
+        tracing::info!(
+            "[timing] msvc: git manifest open+resolve+load took {:.2}s",
+            t_git.elapsed().as_secs_f64()
+        );
         let compiler = find_primary_compiler(&manifest, entry.vs)
             .with_context(|| format!("locating primary compiler for build {}", opts.build_version))?;
         let family = family_prefix(&compiler.id)?;
@@ -159,25 +164,37 @@ impl Provider for MsvcProvider {
         let staging = ctx.staging_dir()?;
         let mut downloaded_count = 0usize;
         let mut cached_count = 0usize;
+        let mut dl_secs = 0.0f64;
+        let mut ex_secs = 0.0f64;
         for request in &selected {
             let pkg = lookup_package(&manifest, request)?;
             for payload in &pkg.payloads {
                 let filename = payload_filename(payload);
+                let t_dl = std::time::Instant::now();
                 let (archive, source) = ctx
                     .download_with_outcome(&payload.url, payload.sha256.as_deref())
                     .with_context(|| format!("downloading {filename} for {}", pkg.id))?;
+                dl_secs += t_dl.elapsed().as_secs_f64();
                 match source {
                     FetchSource::Cached => cached_count += 1,
                     FetchSource::Downloaded => downloaded_count += 1,
                 }
+                let t_ex = std::time::Instant::now();
                 extract_payload(&archive, &filename, &staging)
                     .with_context(|| format!("extracting {filename} for {}", pkg.id))?;
+                ex_secs += t_ex.elapsed().as_secs_f64();
             }
         }
         tracing::info!(
             "msvc build {}: {downloaded_count} payloads downloaded, \
              {cached_count} already cached",
             opts.build_version,
+        );
+        tracing::info!(
+            "[timing] msvc: {} payloads, serial download {:.2}s + serial extract {:.2}s",
+            downloaded_count + cached_count,
+            dl_secs,
+            ex_secs
         );
 
         Ok(Installed {
