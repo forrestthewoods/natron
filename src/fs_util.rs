@@ -327,5 +327,5 @@ pub fn slash_path_buf(path: PathBuf) -> String {
     slash_str(&path)
 }
 #[cfg(test)]
-#[path = "fs_util_tests.rs"]
+#[path = "tests/fs_util.rs"]
 mod tests;

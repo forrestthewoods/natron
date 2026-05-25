@@ -188,5 +188,5 @@ struct AssetEntry {
     browser_download_url: String,
 }
 #[cfg(test)]
-#[path = "github_tests.rs"]
+#[path = "tests/github.rs"]
 mod tests;

@@ -169,5 +169,5 @@ impl Default for ProviderRegistry {
     }
 }
 #[cfg(test)]
-#[path = "mod_tests.rs"]
+#[path = "tests/providers.rs"]
 mod tests;

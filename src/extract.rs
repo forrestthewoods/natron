@@ -300,5 +300,5 @@ pub fn extract_msi(_msi: &Path, _dest: &Path) -> Result<()> {
     bail!("MSI extraction requires Windows (msiexec.exe)");
 }
 #[cfg(test)]
-#[path = "extract_tests.rs"]
+#[path = "tests/extract.rs"]
 mod tests;

@@ -614,5 +614,5 @@ fn resolved_options(opts: &Options) -> toml::Table {
 }
 
 #[cfg(test)]
-#[path = "windows_sdk_tests.rs"]
+#[path = "tests/windows_sdk.rs"]
 mod tests;

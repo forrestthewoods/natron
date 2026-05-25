@@ -142,5 +142,5 @@ impl StateDiff {
     }
 }
 #[cfg(test)]
-#[path = "state_tests.rs"]
+#[path = "tests/state.rs"]
 mod tests;

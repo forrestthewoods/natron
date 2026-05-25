@@ -252,5 +252,5 @@ fn ymd_from_days(days: i64) -> (i32, u32, u32) {
     (year, m as u32, d as u32)
 }
 #[cfg(test)]
-#[path = "cache_tests.rs"]
+#[path = "tests/cache.rs"]
 mod tests;

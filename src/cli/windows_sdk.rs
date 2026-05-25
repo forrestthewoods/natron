@@ -265,5 +265,5 @@ fn dir_has_content(p: &Path) -> bool {
 }
 
 #[cfg(test)]
-#[path = "windows_sdk_tests.rs"]
+#[path = "tests/windows_sdk.rs"]
 mod tests;

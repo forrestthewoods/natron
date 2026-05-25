@@ -406,5 +406,5 @@ fn sha256_eq(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 #[cfg(test)]
-#[path = "download_tests.rs"]
+#[path = "tests/download.rs"]
 mod tests;

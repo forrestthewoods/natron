@@ -503,5 +503,5 @@ fn resolved_options(opts: &Options) -> toml::Table {
 }
 
 #[cfg(test)]
-#[path = "msvc_tests.rs"]
+#[path = "tests/msvc.rs"]
 mod tests;

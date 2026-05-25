@@ -142,5 +142,5 @@ fn resolved_options(options: &toml::Table) -> toml::Table {
     options.clone()
 }
 #[cfg(test)]
-#[path = "url_tests.rs"]
+#[path = "tests/url.rs"]
 mod tests;

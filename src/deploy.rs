@@ -187,5 +187,5 @@ pub fn undeploy(dest: &Path) -> Result<()> {
     Ok(())
 }
 #[cfg(test)]
-#[path = "deploy_tests.rs"]
+#[path = "tests/deploy.rs"]
 mod tests;

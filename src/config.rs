@@ -316,5 +316,5 @@ fn home_dir() -> Result<PathBuf> {
     dirs::home_dir().ok_or_else(|| anyhow!("could not determine user home directory"))
 }
 #[cfg(test)]
-#[path = "config_tests.rs"]
+#[path = "tests/config.rs"]
 mod tests;

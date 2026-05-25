@@ -399,5 +399,5 @@ fn format_datetime(secs: u64) -> String {
     )
 }
 #[cfg(test)]
-#[path = "engine_tests.rs"]
+#[path = "tests/engine.rs"]
 mod tests;

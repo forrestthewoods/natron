@@ -306,5 +306,5 @@ pub fn ensure_writable(path: &Path) -> Result<()> {
     fs_util::clear_readonly(path)
 }
 #[cfg(test)]
-#[path = "cas_tests.rs"]
+#[path = "tests/cas.rs"]
 mod tests;

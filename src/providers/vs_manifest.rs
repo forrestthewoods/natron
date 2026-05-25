@@ -447,5 +447,5 @@ pub fn http_get(url: &str) -> Result<String> {
 }
 
 #[cfg(test)]
-#[path = "vs_manifest_tests.rs"]
+#[path = "tests/vs_manifest.rs"]
 pub(crate) mod tests;

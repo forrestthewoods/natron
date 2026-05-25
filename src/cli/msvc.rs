@@ -422,5 +422,5 @@ fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
 }
 
 #[cfg(test)]
-#[path = "msvc_tests.rs"]
+#[path = "tests/msvc.rs"]
 mod tests;

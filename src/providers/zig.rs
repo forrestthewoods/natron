@@ -160,5 +160,5 @@ fn derive_strip_prefix(filename: &str, kind: ArchiveKind) -> Option<String> {
     stem.map(|s| s.to_string())
 }
 #[cfg(test)]
-#[path = "zig_tests.rs"]
+#[path = "tests/zig.rs"]
 mod tests;
