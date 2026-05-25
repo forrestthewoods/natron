@@ -137,7 +137,7 @@ fn default_selection_covers_compiler_crt_redist() {
     let family = family_prefix(&compiler.id).unwrap();
     let opts = parsed(&[("build_version", "18.6.11819.183")]);
 
-    let selected = select_packages(&m, compiler, &family, &opts).unwrap();
+    let selected = select_packages(&m, &family, &opts).unwrap();
     let ids: Vec<&str> = selected.iter().map(|r| r.id.as_str()).collect();
 
     assert!(ids.iter().any(|s| s.contains(".Tools.HostX64.TargetX64.base")));
@@ -159,7 +159,7 @@ fn full_selection_includes_everything_in_snapshot() {
         ("base_install", "full"),
     ]);
 
-    let selected = select_packages(&m, compiler, &family, &opts).unwrap();
+    let selected = select_packages(&m, &family, &opts).unwrap();
     let ids: Vec<&str> = selected.iter().map(|r| r.id.as_str()).collect();
     assert!(ids.iter().any(|s| s.contains("ATL")));
     assert!(ids.iter().any(|s| s.contains("Preview")));
@@ -175,7 +175,7 @@ fn none_with_extras_selects_only_extras() {
         &["ATL.X64.base"],
     );
 
-    let selected = select_packages(&m, compiler, &family, &opts).unwrap();
+    let selected = select_packages(&m, &family, &opts).unwrap();
     let ids: Vec<&str> = selected.iter().map(|r| r.id.as_str()).collect();
     assert!(ids.iter().any(|s| s.ends_with(".ATL.X64.base")));
     assert!(!ids.iter().any(|s| s.contains(".Tools.HostX64")));
@@ -191,7 +191,7 @@ fn extras_additive_on_top_of_default() {
         &["ATL.X64.base"],
     );
 
-    let selected = select_packages(&m, compiler, &family, &opts).unwrap();
+    let selected = select_packages(&m, &family, &opts).unwrap();
     let ids: Vec<&str> = selected.iter().map(|r| r.id.as_str()).collect();
     assert!(ids.iter().any(|s| s.ends_with(".ATL.X64.base")));
     assert!(ids.iter().any(|s| s.ends_with(".CRT.Headers.base")));
@@ -207,7 +207,7 @@ fn extras_raw_microsoft_prefix_targets_outside_family() {
         &["Microsoft.VC.Preview.DIA.*"],
     );
 
-    let selected = select_packages(&m, compiler, &family, &opts).unwrap();
+    let selected = select_packages(&m, &family, &opts).unwrap();
     let ids: Vec<&str> = selected.iter().map(|r| r.id.as_str()).collect();
     assert!(ids.contains(&"Microsoft.VC.Preview.DIA.SDK"));
 }
@@ -221,7 +221,7 @@ fn extras_zero_match_errors() {
         &[("build_version", "18.6.11819.183")],
         &["Definitely.Not.Real.*"],
     );
-    let err = select_packages(&m, compiler, &family, &opts).unwrap_err();
+    let err = select_packages(&m, &family, &opts).unwrap_err();
     assert!(err.to_string().contains("matched no packages"), "got: {err}");
 }
 
@@ -300,6 +300,111 @@ fn install_default_extracts_expected_files() {
             .is_file(),
         "default install missing locale resources (clui.dll)"
     );
+}
+
+#[test]
+fn install_includes_crt_when_compiler_patched() {
+    // Regression: Microsoft ships compiler patches that bump the primary
+    // compiler's version without bumping CRT/ATL/MFC versions inside the
+    // same snapshot. Selection must include the older-versioned family
+    // packages, not filter them out by exact version match against the
+    // primary compiler. Bug: the old `match_pattern_into` had
+    // `pkg.version == compiler_version`, which rejected CRT here.
+    let tmp = TempDir::new().unwrap();
+    let fixtures = tmp.path().join("vsix");
+    std::fs::create_dir_all(&fixtures).unwrap();
+
+    // Compiler-side packages at the PATCHED version.
+    let compiler_v = "14.50.35731";
+    // CRT-side packages at the OLDER version (not bumped by the patch).
+    let crt_v = "14.50.35728";
+
+    let mk = |id: &str, ver: &str, filename: &str, entry: &str| {
+        let archive = fixtures.join(filename);
+        build_vsix(&archive, &[(entry, id.as_bytes())]);
+        let url = file_url(&archive);
+        pkg_with_payload(id, ver, &url, filename)
+    };
+
+    let packages = format!(
+        "{a},{b},{c},{d},{e},{f}",
+        a = mk(
+            "Microsoft.VC.14.50.18.0.Tools.HostX64.TargetX64.base",
+            compiler_v,
+            "tools.vsix",
+            "VC/Tools/MSVC/14.50.35731/bin/Hostx64/x64/cl.exe",
+        ),
+        b = mk(
+            "Microsoft.VC.14.50.18.0.Tools.HostX64.TargetX64.Res.base",
+            compiler_v,
+            "tools-res.vsix",
+            "VC/Tools/MSVC/14.50.35731/bin/Hostx64/x64/1033/clui.dll",
+        ),
+        c = mk(
+            "Microsoft.VC.14.50.18.0.CRT.Headers.base",
+            crt_v,
+            "crt-headers.vsix",
+            "VC/Tools/MSVC/14.50.35728/include/vcruntime.h",
+        ),
+        d = mk(
+            "Microsoft.VC.14.50.18.0.CRT.x64.Desktop.base",
+            crt_v,
+            "crt-desktop.vsix",
+            "VC/Tools/MSVC/14.50.35728/lib/x64/vcruntime.lib",
+        ),
+        e = mk(
+            "Microsoft.VC.14.50.18.0.CRT.x64.Store.base",
+            crt_v,
+            "crt-store.vsix",
+            "VC/Tools/MSVC/14.50.35728/lib/x64/store/store.lib",
+        ),
+        f = mk(
+            "Microsoft.VC.14.50.18.0.CRT.Redist.X64.base",
+            crt_v,
+            "crt-redist.vsix",
+            "VC/Redist/MSVC/14.50.35728/x64/Microsoft.VC145.CRT/vcruntime140.dll",
+        ),
+    );
+    let fx = MirrorFixture::build(
+        tmp.path(),
+        &[(
+            VsVersion::Vs2026,
+            &[FxSnapshot {
+                sha: "abc1234",
+                date: "2026-05-13T00:00:00Z",
+                build_version: "18.6.11819.183",
+                display_version: "18.6.1",
+                product_line_version: "18",
+                manifest_packages_json: packages,
+            }],
+        )],
+    );
+
+    let ctx = test_ctx(&tmp);
+    let mut ctx = ctx;
+    let provider = MsvcProvider::with_urls(fx.urls.clone());
+    let mut opts = toml::Table::new();
+    opts.insert(
+        "build_version".into(),
+        toml::Value::String("18.6.11819.183".into()),
+    );
+    let installed = provider.install(&opts, &mut ctx).unwrap();
+    assert!(installed.freshly_extracted);
+
+    let raw = ctx.staging_dir().unwrap();
+    // Compiler (patched version) is present.
+    assert!(raw.join("VC/Tools/MSVC/14.50.35731/bin/Hostx64/x64/cl.exe").is_file());
+    // CRT.Headers (OLDER version) is also present — the bug would drop it.
+    assert!(
+        raw.join("VC/Tools/MSVC/14.50.35728/include/vcruntime.h").is_file(),
+        "CRT.Headers at older version was filtered out — version-equality \
+         filter regression?"
+    );
+    // The other older-versioned CRT packages too.
+    assert!(raw.join("VC/Tools/MSVC/14.50.35728/lib/x64/vcruntime.lib").is_file());
+    assert!(raw
+        .join("VC/Redist/MSVC/14.50.35728/x64/Microsoft.VC145.CRT/vcruntime140.dll")
+        .is_file());
 }
 
 #[test]

@@ -151,11 +151,76 @@ fn packages_groups_family_first_then_others() {
 }
 
 #[test]
-fn packages_excludes_other_versions_and_unrelated_workloads() {
-    // Regression: a snapshot includes thousands of unrelated packages
-    // (Android, Python, .NET, legacy compat toolsets at different versions).
-    // `msvc packages` must filter to the primary compiler's exact version —
-    // everything else is noise for an `msvc`-scoped command.
+fn packages_includes_in_family_packages_at_different_version() {
+    // Regression: `msvc packages` must show CRT/ATL/MFC packages that
+    // share the primary compiler's family prefix even when their
+    // `version` field doesn't match the primary's (Microsoft patches
+    // the compiler without bumping CRT versions). The old version-
+    // equality filter on in-family wrongly hid those.
+    let tmp = TempDir::new().unwrap();
+    let primary = pkg(
+        "Microsoft.VC.14.50.18.0.Tools.HostX64.TargetX64.base",
+        "14.50.35731",
+    );
+    // CRT.Headers in the same family but at an OLDER version (Microsoft
+    // didn't bump it in the compiler patch).
+    let crt = pkg(
+        "Microsoft.VC.14.50.18.0.CRT.Headers.base",
+        "14.50.35728",
+    );
+    let manifest_packages = format!("{primary},{crt}");
+
+    let fx = MirrorFixture::build(
+        tmp.path(),
+        &[(
+            VsVersion::Vs2026,
+            &[FxSnapshot {
+                sha: "abc",
+                date: "2026-05-01T00:00:00Z",
+                build_version: "18.6.11819.183",
+                display_version: "18.6.1",
+                product_line_version: "18",
+                manifest_packages_json: manifest_packages,
+            }],
+        )],
+    );
+    let ctx = test_ctx(&tmp);
+    let mut out = Vec::new();
+    run_packages(
+        &ctx,
+        &fx.urls,
+        PackagesArgs {
+            build_version: "18.6.11819.183".into(),
+        },
+        &mut out,
+    )
+    .unwrap();
+    let s = String::from_utf8(out).unwrap();
+
+    // Both packages must appear, both in the family section.
+    assert!(s.contains("Microsoft.VC.14.50.18.0.Tools.HostX64.TargetX64.base"), "{s}");
+    assert!(
+        s.contains("Microsoft.VC.14.50.18.0.CRT.Headers.base"),
+        "CRT.Headers at older version was filtered out — version-equality \
+         filter regression?\n{s}"
+    );
+    // CRT.Headers must appear in the family section, not the "other" one.
+    let i_fam = s.find("== family ==").unwrap();
+    let i_oth = s.find("== other in snapshot ==").unwrap();
+    let i_crt = s.find("CRT.Headers.base").unwrap();
+    assert!(
+        i_fam < i_crt && i_crt < i_oth,
+        "CRT.Headers must be in the family section\n{s}"
+    );
+}
+
+#[test]
+fn packages_excludes_other_families_and_unrelated_workloads() {
+    // A snapshot includes thousands of unrelated packages (Android,
+    // Python, .NET, legacy compat toolsets at OTHER family prefixes).
+    // `msvc packages` must scope to the primary compiler's family
+    // prefix + outside-family packages at the primary's version
+    // (Preview-style escape-hatch). Everything else is noise.
     let tmp = TempDir::new().unwrap();
     let primary = pkg(
         "Microsoft.VC.14.52.18.5.Tools.HostX64.TargetX64.base",
@@ -199,14 +264,15 @@ fn packages_excludes_other_versions_and_unrelated_workloads() {
     )
     .unwrap();
     let s = String::from_utf8(out).unwrap();
-    // Kept: primary + Preview (both at 14.52.36328).
+    // Kept: primary (in family) + Preview (out of family, primary version).
     assert!(s.contains("Microsoft.VC.14.52.18.5.Tools.HostX64.TargetX64.base"), "{s}");
     assert!(s.contains("Microsoft.VC.Preview.DIA.SDK"), "{s}");
-    // Excluded: different version.
+    // Excluded: different family AND different version (legacy compat).
     assert!(
         !s.contains("Microsoft.VC.14.44.17.14.Tools.HostX64.TargetX64.base"),
-        "legacy compat at different version leaked into output:\n{s}"
+        "legacy compat at different family leaked into output:\n{s}"
     );
+    // Excluded: unrelated workload (different namespace entirely).
     assert!(
         !s.contains("Component.Android.NDK.R27C"),
         "unrelated workload leaked into output:\n{s}"
@@ -214,9 +280,11 @@ fn packages_excludes_other_versions_and_unrelated_workloads() {
 }
 
 #[test]
-fn extract_excludes_other_versions_and_unrelated_workloads() {
-    // Regression: same filter logic as `packages`. `msvc extract` must not
-    // download/extract Android workloads or legacy compat toolsets.
+fn extract_excludes_other_families_and_unrelated_workloads() {
+    // Same scoping rules as `packages`: in-family ∪ out-of-family at
+    // primary version. `msvc extract` must not download/extract
+    // Android workloads or legacy compat toolsets at other family
+    // prefixes.
     let tmp = TempDir::new().unwrap();
     let fixtures = tmp.path().join("vsix");
     std::fs::create_dir_all(&fixtures).unwrap();
