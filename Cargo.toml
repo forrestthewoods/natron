@@ -15,11 +15,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.100"
+cab = "0.6"
 clap = { version = "4.5.56", features = ["derive"] }
 dirs = "5.0"
 glob = "0.3.3"
 indicatif = "0.17"
 jwalk = "0.8"
+msi = "0.10"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10"
@@ -46,7 +48,9 @@ tempfile = "3"
 # Integration tests build synthetic archives + URLs at runtime. These also
 # appear under [dependencies] (used in src/), but cargo doesn't propagate
 # regular deps into the integration-test compilation unit, so list them here.
+cab = "0.6"
 filetime = "0.2"
+msi = "0.10"
 serde_json = "1.0.149"
 sha2 = "0.10"
 tar = "0.4"

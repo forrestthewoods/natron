@@ -1,8 +1,20 @@
-//! Archive extraction: zip, tar.xz, tar.gz, vsix (zip with `Contents/` prefix),
-//! and msi (Windows-only via `msiexec /a`).
+//! Archive extraction: zip, tar.xz, tar.gz, vsix (zip with `Contents/`
+//! prefix), and msi.
 //!
-//! Uses `zip::ZipFile::enclosed_name()` to defend against zip-slip
-//! (entries like `../../../etc/passwd`).
+//! Two MSI extractors coexist during the cross-platform migration:
+//!
+//! - [`extract_msi`] shells out to `msiexec.exe /a` and is Windows-only.
+//! - [`extract_msi_pure`] is the pure-Rust replacement (cross-platform)
+//!   built on the `msi` + `cab` crates. Lives in [`crate::extract_msi`]
+//!   and is re-exported here for call-site symmetry.
+//!
+//! `extract_msi` will be deleted once the A/B integration test
+//! (`tests/integration.rs::test_msi_ab_extract_matches_msiexec`)
+//! confirms byte-identical output across real SDK installs and the new
+//! path has shipped through one release cycle.
+//!
+//! Zip-related code uses `zip::ZipFile::enclosed_name()` to defend
+//! against zip-slip (entries like `../../../etc/passwd`).
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::fs::File;
@@ -10,6 +22,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::config::ArchiveKind;
+
+pub use crate::extract_msi::extract_msi_pure;
 
 /// Extract the archive at `archive` into `dest`. If `strip_prefix` is set
 /// and an entry's path starts with it, that prefix is removed before

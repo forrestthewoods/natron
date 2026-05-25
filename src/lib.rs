@@ -8,6 +8,7 @@ pub mod deploy;
 pub mod download;
 pub mod engine;
 pub mod extract;
+pub mod extract_msi;
 pub mod fs_util;
 pub mod providers;
 pub mod state;
