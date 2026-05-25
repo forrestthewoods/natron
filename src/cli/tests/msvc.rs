@@ -38,8 +38,7 @@ fn versions_lists_builds_descending_per_series() {
     let ctx = test_ctx(&tmp);
     let mut out = Vec::new();
     run_versions(
-        &ctx,
-        &fx.urls,
+        &fx.history(&ctx),
         VersionsArgs {
             vs: Some("vs2026".into()),
         },
@@ -98,7 +97,7 @@ fn versions_iterates_all_series_when_no_filter() {
     );
     let ctx = test_ctx(&tmp);
     let mut out = Vec::new();
-    run_versions(&ctx, &fx.urls, VersionsArgs { vs: None }, &mut out).unwrap();
+    run_versions(&fx.history(&ctx), VersionsArgs { vs: None }, &mut out).unwrap();
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("vs2019 (channel 16)"), "{s}");
     assert!(s.contains("vs2022 (channel 17)"), "{s}");
@@ -131,8 +130,7 @@ fn packages_groups_family_first_then_others() {
     let ctx = test_ctx(&tmp);
     let mut out = Vec::new();
     run_packages(
-        &ctx,
-        &fx.urls,
+        &fx.history(&ctx),
         PackagesArgs {
             build_version: "18.6.11819.183".into(),
         },
@@ -187,8 +185,7 @@ fn packages_includes_in_family_packages_at_different_version() {
     let ctx = test_ctx(&tmp);
     let mut out = Vec::new();
     run_packages(
-        &ctx,
-        &fx.urls,
+        &fx.history(&ctx),
         PackagesArgs {
             build_version: "18.6.11819.183".into(),
         },
@@ -255,8 +252,7 @@ fn packages_excludes_other_families_and_unrelated_workloads() {
     let ctx = test_ctx(&tmp);
     let mut out = Vec::new();
     run_packages(
-        &ctx,
-        &fx.urls,
+        &fx.history(&ctx),
         PackagesArgs {
             build_version: "18.6.11819.183".into(),
         },
@@ -326,7 +322,7 @@ fn extract_excludes_other_families_and_unrelated_workloads() {
     let mut buf = Vec::new();
     run_extract(
         &ctx,
-        &fx.urls,
+        &fx.history(&ctx),
         ExtractArgs {
             build_version: "18.6.11819.183".into(),
             out: out_dir.clone(),
@@ -363,8 +359,7 @@ fn packages_errors_on_unknown_build_version() {
     let ctx = test_ctx(&tmp);
     let mut out = Vec::new();
     let err = run_packages(
-        &ctx,
-        &fx.urls,
+        &fx.history(&ctx),
         PackagesArgs {
             build_version: "18.99.99.99".into(),
         },
@@ -424,7 +419,7 @@ fn extract_writes_per_package_dirs_idempotently() {
     };
 
     let mut buf = Vec::new();
-    run_extract(&ctx, &fx.urls, args(), &mut buf).unwrap();
+    run_extract(&ctx, &fx.history(&ctx), args(), &mut buf).unwrap();
     let entries: Vec<_> = std::fs::read_dir(&out_dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -436,7 +431,7 @@ fn extract_writes_per_package_dirs_idempotently() {
         .is_file());
 
     buf.clear();
-    run_extract(&ctx, &fx.urls, args(), &mut buf).unwrap();
+    run_extract(&ctx, &fx.history(&ctx), args(), &mut buf).unwrap();
     let s = String::from_utf8(buf).unwrap();
     assert!(s.contains("0 extracted, 2 already present"), "{s}");
 }
@@ -487,7 +482,7 @@ fn extract_propagates_worker_error() {
     let mut buf = Vec::new();
     let err = run_extract(
         &ctx,
-        &fx.urls,
+        &fx.history(&ctx),
         ExtractArgs {
             build_version: "18.6.11819.183".into(),
             out: out_dir,

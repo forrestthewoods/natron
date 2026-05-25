@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use xxhash_rust::xxh3::xxh3_64;
 
-use super::vs_manifest::{self, MirrorUrls, Package, VsManifest, VsVersion};
+use super::vs_manifest::{self, ManifestHistory, Package, VsManifest, VsVersion};
 use super::{InstallCtx, Installed, Provider};
 use crate::cache::sanitize_fingerprint;
 use crate::download::FetchSource;
@@ -107,18 +107,20 @@ struct PackageRequest {
 // ---- provider --------------------------------------------------------------
 
 pub struct MsvcProvider {
-    urls: MirrorUrls,
+    remote: String,
 }
 
 impl MsvcProvider {
     pub fn new() -> Self {
         Self {
-            urls: MirrorUrls::default(),
+            remote: vs_manifest::default_remote(),
         }
     }
 
-    pub fn with_urls(urls: MirrorUrls) -> Self {
-        Self { urls }
+    pub fn with_remote(remote: impl Into<String>) -> Self {
+        Self {
+            remote: remote.into(),
+        }
     }
 }
 
@@ -146,8 +148,9 @@ impl Provider for MsvcProvider {
             });
         }
 
-        let entry = vs_manifest::resolve_build_version(&self.urls, &opts.build_version, ctx)?;
-        let manifest = vs_manifest::fetch_manifest_at(&self.urls.raw_base, &entry.commit.sha, ctx)?;
+        let history = ManifestHistory::open(&self.remote, ctx.cache())?;
+        let entry = history.resolve_build_version(&opts.build_version)?;
+        let manifest = history.manifest(&entry.commit.sha)?;
         let compiler = find_primary_compiler(&manifest, entry.vs)
             .with_context(|| format!("locating primary compiler for build {}", opts.build_version))?;
         let family = family_prefix(&compiler.id)?;

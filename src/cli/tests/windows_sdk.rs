@@ -70,7 +70,7 @@ fn versions_lists_distinct_across_series_sorted_desc() {
     );
     let ctx = test_ctx(&tmp);
     let mut out = Vec::new();
-    run_versions(&ctx, &fx.urls, VersionsArgs {}, &mut out).unwrap();
+    run_versions(&fx.history(&ctx), VersionsArgs {}, &mut out).unwrap();
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("Windows SDK versions"), "{s}");
     assert!(s.contains("26100"), "{s}");
@@ -121,8 +121,7 @@ fn packages_groups_default_and_extras() {
     let ctx = test_ctx(&tmp);
     let mut out = Vec::new();
     run_packages(
-        &ctx,
-        &fx.urls,
+        &fx.history(&ctx),
         PackagesArgs {
             sdk_version: "26100".into(),
         },
@@ -165,8 +164,7 @@ fn packages_errors_on_unknown_sdk_version() {
     let ctx = test_ctx(&tmp);
     let mut out = Vec::new();
     let err = run_packages(
-        &ctx,
-        &fx.urls,
+        &fx.history(&ctx),
         PackagesArgs {
             sdk_version: "99999".into(),
         },
@@ -207,7 +205,7 @@ fn extract_errors_on_unknown_sdk_version() {
     let mut buf = Vec::new();
     let err = run_extract(
         &ctx,
-        &fx.urls,
+        &fx.history(&ctx),
         ExtractArgs {
             sdk_version: "99999".into(),
             out: out_dir,
