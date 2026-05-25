@@ -131,11 +131,11 @@ fn read_component_map<F: Read + Seek>(
 
 fn read_media_table<F: Read + Seek>(
     package: &mut msi::Package<F>,
-) -> Result<Vec<(i32, String)>> {
+) -> Result<Vec<(i32, Option<String>)>> {
     if !package.has_table("Media") {
         bail!("MSI has no Media table");
     }
-    let mut out: Vec<(i32, String)> = Vec::new();
+    let mut out: Vec<(i32, Option<String>)> = Vec::new();
     let rows = package
         .select_rows(Select::table("Media"))
         .context("select Media")?;
@@ -143,20 +143,14 @@ fn read_media_table<F: Read + Seek>(
         let last_seq = row["LastSequence"].as_int().ok_or_else(|| {
             anyhow!("Media row has null/non-int LastSequence")
         })?;
-        let cabinet_val = &row["Cabinet"];
-        let cabinet = if cabinet_val.is_null() {
-            bail!(
-                "Media row (LastSequence={last_seq}) has null Cabinet — \
-                 loose-file extraction is not implemented"
-            );
-        } else {
-            cabinet_val
-                .as_str()
-                .ok_or_else(|| {
-                    anyhow!("Media row (LastSequence={last_seq}) has non-string Cabinet")
-                })?
-                .to_string()
-        };
+        // Null/empty Cabinet is valid: SDK header-only MSIs declare an
+        // empty `Media` row with `LastSequence=0` and no CAB. If a real
+        // `File` row maps to such a row, the error surfaces at
+        // file-walk time with file-specific context.
+        let cabinet = row["Cabinet"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from);
         out.push((last_seq, cabinet));
     }
     out.sort_by_key(|&(seq, _)| seq);
@@ -242,7 +236,7 @@ fn enumerate_files<F: Read + Seek>(
     package: &mut msi::Package<F>,
     components: &HashMap<String, String>,
     dir_paths: &HashMap<String, PathBuf>,
-    media: &[(i32, String)],
+    media: &[(i32, Option<String>)],
 ) -> Result<HashMap<String, Vec<ExtractJob>>> {
     if !package.has_table("File") {
         bail!("MSI has no File table");
@@ -298,11 +292,11 @@ fn enumerate_files<F: Read + Seek>(
     Ok(by_cab)
 }
 
-fn find_cab_for_sequence(media: &[(i32, String)], sequence: i32) -> Option<&str> {
+fn find_cab_for_sequence(media: &[(i32, Option<String>)], sequence: i32) -> Option<&str> {
     media
         .iter()
         .find(|(last_seq, _)| *last_seq >= sequence)
-        .map(|(_, name)| name.as_str())
+        .and_then(|(_, name)| name.as_deref())
 }
 
 // ---- per-CAB extraction ----------------------------------------------------
