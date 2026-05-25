@@ -8,8 +8,6 @@ use natron::{
     Cache, Config, DeployMode, GithubProvider, Natron, ProviderRegistry, Settings,
     ToolchainEntry, UrlProvider, ZigProvider,
 };
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -191,104 +189,6 @@ impl TestEnv {
     pub fn deploy_root(&self) -> PathBuf {
         self.project_dir.join("toolchains")
     }
-}
-
-/// Diff the `Windows Kits/10/` subtree of two directories, comparing files
-/// by SHA-256. Returns `Ok(())` if the two subtrees contain the same set
-/// of files with the same contents, otherwise `Err(msg)` with a
-/// human-readable diff (capped at 50 entries per category).
-///
-/// Used by the MSI A/B test to confirm `extract_msi_pure` produces the
-/// same on-disk output as `msiexec /a` for real SDK installs. Lives
-/// here so it stays test-only and is reusable if other A/B comparisons
-/// come up later. Will be deleted alongside the A/B test once the new
-/// extractor is the only one.
-pub fn diff_trees(old: &Path, new: &Path) -> Result<(), String> {
-    let kit_old = old.join("Windows Kits").join("10");
-    let kit_new = new.join("Windows Kits").join("10");
-    let snap_old = snapshot_tree(&kit_old);
-    let snap_new = snapshot_tree(&kit_new);
-    if snap_old == snap_new {
-        return Ok(());
-    }
-
-    let old_keys: BTreeSet<&PathBuf> = snap_old.keys().collect();
-    let new_keys: BTreeSet<&PathBuf> = snap_new.keys().collect();
-    let only_old: Vec<&PathBuf> = old_keys.difference(&new_keys).copied().collect();
-    let only_new: Vec<&PathBuf> = new_keys.difference(&old_keys).copied().collect();
-    let common: Vec<&PathBuf> = old_keys.intersection(&new_keys).copied().collect();
-    let hash_differs: Vec<&PathBuf> = common
-        .iter()
-        .copied()
-        .filter(|k| snap_old.get(*k) != snap_new.get(*k))
-        .collect();
-
-    const CAP: usize = 50;
-    let mut msg = String::new();
-    msg.push_str(&format!(
-        "trees differ under Windows Kits/10/:\n  old: {} files\n  new: {} files\n  common keys: {}\n",
-        snap_old.len(),
-        snap_new.len(),
-        common.len(),
-    ));
-    if !only_old.is_empty() {
-        msg.push_str(&format!(
-            "\nonly in old ({} total, showing first {}):\n",
-            only_old.len(),
-            only_old.len().min(CAP)
-        ));
-        for p in only_old.iter().take(CAP) {
-            msg.push_str(&format!("  {}\n", p.display()));
-        }
-    }
-    if !only_new.is_empty() {
-        msg.push_str(&format!(
-            "\nonly in new ({} total, showing first {}):\n",
-            only_new.len(),
-            only_new.len().min(CAP)
-        ));
-        for p in only_new.iter().take(CAP) {
-            msg.push_str(&format!("  {}\n", p.display()));
-        }
-    }
-    if !hash_differs.is_empty() {
-        msg.push_str(&format!(
-            "\nhash differs ({} total, showing first {}):\n",
-            hash_differs.len(),
-            hash_differs.len().min(CAP)
-        ));
-        for p in hash_differs.iter().take(CAP) {
-            msg.push_str(&format!("  {}\n", p.display()));
-        }
-    }
-    Err(msg)
-}
-
-fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, [u8; 32]> {
-    let mut out = BTreeMap::new();
-    if !root.exists() {
-        return out;
-    }
-    for entry in jwalk::WalkDir::new(root).into_iter().flatten() {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let abs = entry.path();
-        let rel = match abs.strip_prefix(root) {
-            Ok(r) => r.to_path_buf(),
-            Err(_) => continue,
-        };
-        let bytes = match std::fs::read(&abs) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let mut sha = [0u8; 32];
-        sha.copy_from_slice(&hasher.finalize());
-        out.insert(rel, sha);
-    }
-    out
 }
 
 /// Build a `[[toolchain]]` entry that uses `provider = "url"` against the

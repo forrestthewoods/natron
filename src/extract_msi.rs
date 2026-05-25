@@ -1,5 +1,4 @@
-//! Pure-Rust MSI extractor — cross-platform replacement for shelling
-//! out to `msiexec.exe /a`.
+//! Pure-Rust, cross-platform MSI extractor.
 //!
 //! Walks an MSI's `Directory` / `Component` / `Media` / `File` tables
 //! to figure out the intended on-disk layout, then opens each CAB
@@ -29,11 +28,10 @@ const FILE_ATTR_NONCOMPRESSED: i32 = 0x2000;
 /// `Directory` table (with the root entry — `TARGETDIR` — mapped to
 /// `dest`).
 ///
-/// Creates `dest` if missing. Overwrites existing files silently to
-/// match msiexec /a behavior; callers (e.g. `windows_sdk` install)
-/// manage scratch dirs themselves.
-pub fn extract_msi_pure(msi: &Path, dest: &Path) -> Result<()> {
-    tracing::debug!("extract_msi_pure {} -> {}", msi.display(), dest.display());
+/// Creates `dest` if missing. Overwrites existing files silently;
+/// callers (e.g. `windows_sdk` install) manage scratch dirs themselves.
+pub fn extract_msi(msi: &Path, dest: &Path) -> Result<()> {
+    tracing::debug!("extract_msi {} -> {}", msi.display(), dest.display());
     std::fs::create_dir_all(dest)
         .with_context(|| format!("creating {}", dest.display()))?;
 

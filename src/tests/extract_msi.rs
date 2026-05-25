@@ -6,7 +6,7 @@
 //! correct on-disk layout for the MSI features SDK installers
 //! actually use.
 
-use super::extract_msi_pure;
+use super::extract_msi;
 
 use anyhow::Result;
 use cab::{CabinetBuilder, CompressionType};
@@ -176,7 +176,7 @@ fn extracts_single_file_into_targetdir() {
     )
     .unwrap();
 
-    extract_msi_pure(&msi, &dest).unwrap();
+    extract_msi(&msi, &dest).unwrap();
     assert_eq!(read_text(&dest.join("hello.txt")), "hello world");
 }
 
@@ -195,7 +195,7 @@ fn resolves_short_pipe_long_filename() {
     )
     .unwrap();
 
-    extract_msi_pure(&msi, &dest).unwrap();
+    extract_msi(&msi, &dest).unwrap();
     assert!(
         dest.join("LongName.txt").is_file(),
         "expected long-name file; dest contents: {:?}",
@@ -227,7 +227,7 @@ fn resolves_nested_directories() {
     )
     .unwrap();
 
-    extract_msi_pure(&msi, &dest).unwrap();
+    extract_msi(&msi, &dest).unwrap();
     let expected = dest.join("alpha").join("beta").join("gamma").join("leaf.txt");
     assert!(expected.is_file(), "expected {} to exist", expected.display());
     assert_eq!(read_text(&expected), "deep");
@@ -256,7 +256,7 @@ fn splits_files_across_two_embedded_cabs() {
     )
     .unwrap();
 
-    extract_msi_pure(&msi, &dest).unwrap();
+    extract_msi(&msi, &dest).unwrap();
     assert_eq!(read_text(&dest.join("a.txt")), "AAA");
     assert_eq!(read_text(&dest.join("b.txt")), "BBB");
     assert_eq!(read_text(&dest.join("c.txt")), "CCC");
@@ -283,7 +283,7 @@ fn external_cab_resolved_as_sibling() {
     )
     .unwrap();
 
-    extract_msi_pure(&msi, &dest).unwrap();
+    extract_msi(&msi, &dest).unwrap();
     assert_eq!(read_text(&dest.join("ext.txt")), "sibling");
 }
 
@@ -303,7 +303,7 @@ fn bails_on_missing_cab_stream() {
     )
     .unwrap();
 
-    let err = extract_msi_pure(&msi, &dest)
+    let err = extract_msi(&msi, &dest)
         .expect_err("missing embedded CAB stream must error");
     let msg = format!("{err:#}");
     assert!(

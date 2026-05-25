@@ -50,7 +50,6 @@ tempfile = "3"
 # regular deps into the integration-test compilation unit, so list them here.
 cab = "0.6"
 filetime = "0.2"
-jwalk = "0.8"
 msi = "0.10"
 serde_json = "1.0.149"
 sha2 = "0.10"

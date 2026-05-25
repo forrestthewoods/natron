@@ -204,7 +204,7 @@ impl Provider for WindowsSdkProvider {
 
         tracing::info!("extracting {} SDK MSIs", msis_to_extract.len());
         for msi in &msis_to_extract {
-            extract::extract_msi_pure(msi, &extract_dir)
+            extract::extract_msi(msi, &extract_dir)
                 .with_context(|| format!("extracting MSI {}", msi.display()))?;
         }
         flatten_windows_kits_into(&extract_dir, &staging_raw)
@@ -470,7 +470,8 @@ fn payload_filename(p: &vs_manifest::Payload) -> String {
 
 /// VS manifest filenames sometimes embed install-subdirectory components
 /// (`Installers\foo.msi`, `Redistributable\10.1.0.0\UAPSDKAddOn-x86.msi`).
-/// Flatten to just the basename so msiexec sees CABs as siblings.
+/// Flatten to just the basename so each MSI's external sibling CABs
+/// resolve correctly during extraction.
 pub fn strip_installer_prefix(filename: &str) -> String {
     let normalized = filename.replace('\\', "/");
     normalized

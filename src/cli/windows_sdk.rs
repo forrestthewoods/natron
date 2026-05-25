@@ -217,7 +217,7 @@ fn run_extract(
         let _ = fs_util::remove_dir_all_writable(&msi_scratch);
         std::fs::create_dir_all(&msi_scratch)
             .with_context(|| format!("creating {}", msi_scratch.display()))?;
-        extract::extract_msi_pure(msi_path, &msi_scratch)
+        extract::extract_msi(msi_path, &msi_scratch)
             .with_context(|| format!("extracting {name}"))?;
         windows_sdk::flatten_windows_kits_into(&msi_scratch, &dest)
             .with_context(|| format!("flattening {name}"))?;
