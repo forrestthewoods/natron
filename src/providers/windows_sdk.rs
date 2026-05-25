@@ -176,6 +176,23 @@ impl Provider for WindowsSdkProvider {
                 tracing::warn!("SDK dep package {dep_id} not in manifest; skipping");
                 continue;
             };
+
+            // Decide once per dep whether we'll extract any of its MSIs.
+            // If not, skip the whole dep — don't download its CABs either,
+            // since CABs are only useful as siblings of an MSI we're about
+            // to extract. For the typical `default` install (7 essentials),
+            // this skips ~85% of SDK component deps.
+            let install_this_dep = pkg.payloads.iter().any(|p| {
+                let filename = payload_filename(p);
+                if !filename.to_lowercase().ends_with(".msi") {
+                    return false;
+                }
+                msi_should_extract(&filename, &opts)
+            });
+            if !install_this_dep {
+                continue;
+            }
+
             for p in &pkg.payloads {
                 let filename = payload_filename(p);
                 let basename = strip_installer_prefix(&filename);
