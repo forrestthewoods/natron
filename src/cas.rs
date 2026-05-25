@@ -2,10 +2,14 @@
 //! with xxhash3-128, places exactly one copy in `cache/cas/<aa>/<bb...>`,
 //! and hardlinks each install-tree path to that CAS file.
 //!
-//! Atomicity: each CAS insertion is a `rename(staging_file, cas_path)`. If
-//! the target already exists (peer beat us, or a previous install already
-//! owned this content), we byte-compare to confirm equality and discard our
-//! staging copy. Hash collisions are detected — never silently corrupt.
+//! Atomicity: each CAS insertion publishes the staging file by
+//! `hard_link(staging_file, cas_path)`, then drops the staging name. `link`
+//! never overwrites: if the target already exists (peer beat us, or a previous
+//! install already owned this content) it fails with `AlreadyExists` and we
+//! byte-compare to confirm equality and discard our staging copy. Because a
+//! published blob's dentry is never replaced, a peer concurrently hardlinking
+//! that blob into its install tree can't observe a torn/missing slot. Hash
+//! collisions are detected — never silently corrupt.
 
 use anyhow::{Context, Result, anyhow};
 use std::fs::File;
@@ -28,8 +32,8 @@ pub struct CasReport {
 
 /// Run the CAS pass:
 ///   1. walk `staging_raw` (the dir the provider wrote to)
-///   2. for each regular file: xxhash3-128, rename into CAS (byte-compare on
-///      EEXIST), hardlink CAS→`staging_tree/<relpath>`
+///   2. for each regular file: xxhash3-128, publish into CAS via hardlink
+///      (byte-compare on EEXIST), hardlink CAS→`staging_tree/<relpath>`
 ///   3. for each directory: mkdir under `staging_tree`
 ///   4. for each symlink: reproduce under `staging_tree`
 ///
@@ -121,68 +125,56 @@ fn cas_file(
     let hex = hash_file_xxh3_128(src)?;
     let cas_path = cache.cas_path(&hex);
 
-    // Make sure the parent dir exists before any rename attempt.
+    // Make sure the parent dir exists before any link attempt.
     if let Some(parent) = cas_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Try to claim the CAS slot.
-    let cas_existed = cas_path.is_file();
+    // Publish our staging copy into the CAS by hardlinking it onto the cas
+    // slot. `hard_link` is non-destructive: if the slot is already populated
+    // (a peer raced us, or a prior install owns this content) it fails with
+    // `AlreadyExists` and we leave the existing blob untouched. A `rename`
+    // here would *overwrite* on POSIX, churning the blob's dentry — and a
+    // peer mid-`hard_link(cas -> install tree)` against that same slot can
+    // observe a transient ENOENT during the swap. Once a cas blob exists its
+    // dentry is now never replaced, which keeps concurrent links race-free.
     let mut just_inserted = false;
-    if cas_existed {
-        // Byte-compare to detect a (vanishingly rare) hash collision.
-        if !files_equal(src, &cas_path)? {
-            // Collision: keep src in place at dst, log loudly. Never
-            // silently corrupt.
-            tracing::error!(
-                "xxh3-128 collision on {} (cas slot {}); keeping staging copy in install tree without CAS link",
+    match std::fs::hard_link(src, &cas_path) {
+        Ok(()) => {
+            just_inserted = true;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Slot already populated. Byte-compare to detect a (vanishingly
+            // rare) xxh3-128 collision; never silently corrupt.
+            if !files_equal(src, &cas_path)? {
+                tracing::error!(
+                    "xxh3-128 collision on {} (cas slot {}); keeping staging copy in install tree without CAS link",
+                    src.display(),
+                    cas_path.display()
+                );
+                move_into_install_tree(src, dst)?;
+                report.files_processed += 1;
+                return Ok(());
+            }
+            let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+            report.dedupe_hits += 1;
+            report.bytes_freed += size;
+        }
+        Err(err) => {
+            return Err(anyhow!(
+                "publishing {} -> {}: {err}",
                 src.display(),
                 cas_path.display()
-            );
-            move_into_install_tree(src, dst)?;
-            report.files_processed += 1;
-            return Ok(());
-        }
-        let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-        report.dedupe_hits += 1;
-        report.bytes_freed += size;
-        // Drop our staging duplicate.
-        std::fs::remove_file(src).with_context(|| {
-            format!("removing duplicate staging file {}", src.display())
-        })?;
-    } else {
-        // Try atomic rename; on EEXIST fall through to byte-compare branch
-        // (peer raced us between our existence check and rename).
-        match std::fs::rename(src, &cas_path) {
-            Ok(()) => {
-                just_inserted = true;
-            }
-            Err(err) => {
-                if cas_path.is_file() {
-                    if !files_equal(src, &cas_path)? {
-                        tracing::error!(
-                            "xxh3-128 collision (race) on {} (cas slot {}); keeping staging copy",
-                            src.display(),
-                            cas_path.display()
-                        );
-                        move_into_install_tree(src, dst)?;
-                        report.files_processed += 1;
-                        return Ok(());
-                    }
-                    let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-                    report.dedupe_hits += 1;
-                    report.bytes_freed += size;
-                    let _ = std::fs::remove_file(src);
-                } else {
-                    return Err(anyhow!(
-                        "rename {} -> {}: {err}",
-                        src.display(),
-                        cas_path.display()
-                    ));
-                }
-            }
+            ));
         }
     }
+
+    // The CAS owns the content now; drop our staging copy. On the
+    // just-inserted path `src` and `cas_path` are two names for one inode, so
+    // this just removes the redundant name; on the dedupe path `src` was a
+    // distinct copy.
+    std::fs::remove_file(src)
+        .with_context(|| format!("removing staging file {}", src.display()))?;
 
     // Hardlink CAS → install tree position. Do this BEFORE marking the CAS
     // file readonly: on Windows, marking a file's attributes momentarily
