@@ -196,9 +196,24 @@ impl ManifestHistory {
         Ok(out)
     }
 
-    /// Newest build for one series, if any.
+    /// Newest build for one series, if any. Reads `channel.json` only for the
+    /// newest commit(s) — stopping at the first that parses — rather than the
+    /// whole branch like [`Self::index`], since callers (SDK discovery /
+    /// resolution) only need the latest snapshot per series.
     pub fn newest(&self, vs: VsVersion) -> Result<Option<BuildIndexEntry>> {
-        Ok(self.index(&[vs])?.into_iter().next())
+        let mut commits = self.commits_on_branch(vs)?;
+        commits.sort_by(|a, b| b.date.cmp(&a.date));
+        for commit in commits {
+            match self.channel_info_at(&commit.sha) {
+                Ok(info) => return Ok(Some(BuildIndexEntry { vs, info, commit })),
+                Err(err) => tracing::warn!(
+                    "skipping commit {} on {}: {err:#}",
+                    &commit.sha[..commit.sha.len().min(7)],
+                    vs.as_str(),
+                ),
+            }
+        }
+        Ok(None)
     }
 
     /// Resolve a buildVersion to its entry. Auto-detects the VS series from
@@ -341,9 +356,17 @@ fn clone_into(remote: &str, dest: &Path, meta_dir: &Path) -> Result<()> {
         let _ = fs_util::remove_dir_all_writable(&tmp);
         return Err(err).with_context(|| format!("cloning manifest mirror from {remote}"));
     }
-    if std::fs::rename(&tmp, dest).is_err() {
-        // A peer published the clone first; keep theirs, drop ours.
+    if let Err(err) = std::fs::rename(&tmp, dest) {
         let _ = fs_util::remove_dir_all_writable(&tmp);
+        // A peer publishing first is fine — `dest` now holds their clone, so
+        // drop ours and use theirs. Any other failure (ENOSPC, EACCES, …)
+        // left `dest` absent; surface it rather than returning a handle to a
+        // path that doesn't exist (which would only fail later as an opaque
+        // `git` error on the first query).
+        if !dest.is_dir() {
+            return Err(err)
+                .with_context(|| format!("publishing manifest mirror clone to {}", dest.display()));
+        }
     }
     Ok(())
 }

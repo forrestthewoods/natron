@@ -1,4 +1,4 @@
-//! Global cache layout: `installs/`, `cas/`, `downloads/`, `staging/`.
+//! Global cache layout: `installs/`, `cas/`, `downloads/`, `staging/`, `meta/`.
 //!
 //! Also owns fingerprint sanitization and the per-install `metadata.toml`
 //! schema (read + write).
@@ -67,9 +67,10 @@ impl Cache {
         }
     }
 
-    /// Create all four subdirectories if missing. Verifies they share a
-    /// filesystem volume (engine guarantees this since they're siblings of
-    /// `root`, but we double-check on first init).
+    /// Create the cache root and its subdirectories if missing. They are all
+    /// siblings of `root`, so they share a filesystem volume — which is what
+    /// lets the CAS hardlink blobs into install trees and stage files via
+    /// hardlink rather than copy.
     pub fn ensure_layout(&self) -> Result<()> {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("creating cache root {}", self.root.display()))?;
