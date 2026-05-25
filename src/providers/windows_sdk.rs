@@ -159,8 +159,9 @@ impl Provider for WindowsSdkProvider {
         // glob. Otherwise the user silently gets a default install.
         check_extras_match(&resolved.manifest, &dep_ids, &opts)?;
 
-        // Stage all CABs + MSIs in ONE flat directory so msiexec /a can
-        // resolve sibling CAB references by basename.
+        // Stage all CABs + MSIs in ONE flat directory so the pure-Rust
+        // extractor can resolve external sibling CABs (referenced from
+        // the MSI's `Media` table) by basename.
         let staging_raw = ctx.staging_dir()?.to_path_buf();
         let payloads_dir = staging_raw.join("__sdk_payloads");
         let extract_dir = staging_raw.join("__sdk_extract");
@@ -203,7 +204,7 @@ impl Provider for WindowsSdkProvider {
 
         tracing::info!("extracting {} SDK MSIs", msis_to_extract.len());
         for msi in &msis_to_extract {
-            extract::extract_msi(msi, &extract_dir)
+            extract::extract_msi_pure(msi, &extract_dir)
                 .with_context(|| format!("extracting MSI {}", msi.display()))?;
         }
         flatten_windows_kits_into(&extract_dir, &staging_raw)

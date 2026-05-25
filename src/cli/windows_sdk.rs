@@ -157,10 +157,11 @@ fn run_extract(
     std::fs::create_dir_all(&args.out)
         .with_context(|| format!("creating {}", args.out.display()))?;
 
-    // msiexec /a resolves each MSI's sibling CABs by their unmangled basename.
-    // Our download cache stores files with hash-prefixed names, so we first
-    // stage every SDK payload (MSIs + CABs) flat into a scratch dir with
-    // original basenames. The provider's install path uses the same trick.
+    // The pure-Rust extractor resolves each MSI's external sibling CABs
+    // (referenced from the `Media` table) by basename. Our download cache
+    // stores files with hash-prefixed names, so we first stage every SDK
+    // payload (MSIs + CABs) flat into a scratch dir with original
+    // basenames. The provider's install path uses the same trick.
     let staging = ctx.staging_dir()?.to_path_buf();
     let payloads_dir = staging.join("__sdk_payloads");
     let msi_scratch = staging.join("__sdk_scratch");
@@ -210,13 +211,13 @@ fn run_extract(
             skipped += 1;
             continue;
         }
-        // Fresh scratch per MSI: msiexec /a writes `<scratch>/Windows Kits/10/*`
-        // plus a copy of the MSI itself. We move just the Windows Kits content
-        // into `dest` and discard the rest.
+        // Fresh scratch per MSI: the extractor writes
+        // `<scratch>/Windows Kits/10/*` per the MSI's Directory table.
+        // We then move just that subtree into `dest`.
         let _ = fs_util::remove_dir_all_writable(&msi_scratch);
         std::fs::create_dir_all(&msi_scratch)
             .with_context(|| format!("creating {}", msi_scratch.display()))?;
-        extract::extract_msi(msi_path, &msi_scratch)
+        extract::extract_msi_pure(msi_path, &msi_scratch)
             .with_context(|| format!("extracting {name}"))?;
         windows_sdk::flatten_windows_kits_into(&msi_scratch, &dest)
             .with_context(|| format!("flattening {name}"))?;

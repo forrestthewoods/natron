@@ -402,7 +402,7 @@ fn extract_payload(archive: &Path, filename: &str, dest: &Path) -> Result<()> {
     if lower.ends_with(".vsix") || lower.ends_with(".zip") {
         extract::extract_vsix(archive, dest)?;
     } else if lower.ends_with(".msi") {
-        extract::extract_msi(archive, dest)?;
+        extract::extract_msi_pure(archive, dest)?;
     } else {
         tracing::warn!("skipping MSVC payload of unknown type: {filename}");
     }
