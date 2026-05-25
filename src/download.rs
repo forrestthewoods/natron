@@ -5,8 +5,28 @@ use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 use url::Url;
+
+/// Shared HTTP agent. Verifies server certificates against the OS trust store
+/// (via rustls-platform-verifier) rather than ureq's compiled-in webpki-roots,
+/// so natron works behind TLS-inspecting proxies and with enterprise/custom
+/// CAs installed system-wide.
+pub fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        use ureq::tls::{RootCerts, TlsConfig};
+        ureq::Agent::config_builder()
+            .tls_config(
+                TlsConfig::builder()
+                    .root_certs(RootCerts::PlatformVerifier)
+                    .build(),
+            )
+            .build()
+            .new_agent()
+    })
+}
 
 /// Fetch `url` into the `cache` directory and return the absolute path of the
 /// cached file. If `expected_sha256` is provided, the download stream is
@@ -237,7 +257,7 @@ fn stream_once(
     bytes_received: &mut u64,
     verify_sha: bool,
 ) -> std::result::Result<(), StreamErr> {
-    let mut req = ureq::get(url);
+    let mut req = agent().get(url);
     if *bytes_received > 0 {
         req = req.header("Range", format!("bytes={}-", *bytes_received));
     }

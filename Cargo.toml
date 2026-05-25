@@ -30,7 +30,7 @@ tempfile = "3"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ureq = { version = "3.1.4", features = ["json"] }
+ureq = { version = "3.1.4", features = ["json", "platform-verifier"] }
 url = "2.5"
 uuid = { version = "1", features = ["v4"] }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }

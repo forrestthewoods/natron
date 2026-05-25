@@ -438,7 +438,8 @@ pub fn http_get(url: &str) -> Result<String> {
         return std::fs::read_to_string(&p)
             .with_context(|| format!("reading file URL {}", p.display()));
     }
-    let resp = ureq::get(url)
+    let resp = crate::download::agent()
+        .get(url)
         .header("User-Agent", USER_AGENT)
         .header("Accept", "application/json")
         .call()
