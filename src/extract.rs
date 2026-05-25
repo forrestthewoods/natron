@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::ArchiveKind;
 
-pub use crate::extract_msi::extract_msi;
+pub use crate::extract_msi::{extract_msi, extract_msis_in_parallel};
 
 /// Extract the archive at `archive` into `dest`. If `strip_prefix` is set
 /// and an entry's path starts with it, that prefix is removed before

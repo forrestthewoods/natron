@@ -311,3 +311,70 @@ fn bails_on_missing_cab_stream() {
         "error should mention the missing stream; got: {msg}"
     );
 }
+
+#[test]
+fn extract_msis_in_parallel_all_succeed() {
+    // Build a small batch of distinct MSIs and run them through the
+    // parallel batch helper. Each writes a different file into the
+    // shared dest. Asserts: all files land, none lost, no per-MSI
+    // collision panic.
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("out");
+
+    let mut msi_paths: Vec<std::path::PathBuf> = Vec::new();
+    for i in 0..4 {
+        let msi_path = tmp.path().join(format!("pkg-{i}.msi"));
+        let payload_name = format!("file-{i}.txt");
+        let payload_bytes = format!("contents of pkg {i}").into_bytes();
+        build_msi(
+            &msi_path,
+            &[("TARGETDIR", None, ".")],
+            &[("c1", "TARGETDIR")],
+            &[(1, "#Cab1")],
+            &[("f1", "c1", &payload_name, 1)],
+            &[("Cab1", &build_cab(&[("f1", &payload_bytes)]))],
+        )
+        .unwrap();
+        msi_paths.push(msi_path);
+    }
+
+    super::extract_msis_in_parallel(&msi_paths, &dest).unwrap();
+
+    for i in 0..4 {
+        let path = dest.join(format!("file-{i}.txt"));
+        assert!(path.is_file(), "missing: {}", path.display());
+        assert_eq!(read_text(&path), format!("contents of pkg {i}"));
+    }
+}
+
+#[test]
+fn extract_msis_in_parallel_propagates_first_error() {
+    // One bad MSI in a batch must cause the whole call to error. We
+    // don't care which worker hit the bad one first, only that the
+    // function returns Err and mentions the failing MSI.
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("out");
+
+    let good_msi = tmp.path().join("good.msi");
+    build_msi(
+        &good_msi,
+        &[("TARGETDIR", None, ".")],
+        &[("c1", "TARGETDIR")],
+        &[(1, "#Cab1")],
+        &[("f1", "c1", "good.txt", 1)],
+        &[("Cab1", &build_cab(&[("f1", b"good")]))],
+    )
+    .unwrap();
+
+    let bad_msi = tmp.path().join("bad.msi");
+    // Write garbage so `msi::open` fails (Invalid CFB).
+    std::fs::write(&bad_msi, b"not an msi").unwrap();
+
+    let err = super::extract_msis_in_parallel(&[good_msi, bad_msi.clone()], &dest)
+        .expect_err("bad MSI must surface as error");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("bad.msi"),
+        "error should mention the failing MSI; got: {msg}"
+    );
+}

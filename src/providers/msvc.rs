@@ -16,6 +16,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::vs_manifest::{self, MirrorUrls, Package, VsManifest, VsVersion};
 use super::{InstallCtx, Installed, Provider};
 use crate::cache::sanitize_fingerprint;
+use crate::download::FetchSource;
 use crate::extract;
 
 pub const ID: &str = "msvc";
@@ -163,8 +164,8 @@ impl Provider for MsvcProvider {
                     .download_with_outcome(&payload.url, payload.sha256.as_deref())
                     .with_context(|| format!("downloading {filename} for {}", pkg.id))?;
                 match source {
-                    crate::download::FetchSource::Cached => cached_count += 1,
-                    crate::download::FetchSource::Downloaded => downloaded_count += 1,
+                    FetchSource::Cached => cached_count += 1,
+                    FetchSource::Downloaded => downloaded_count += 1,
                 }
                 extract_payload(&archive, &filename, &staging)
                     .with_context(|| format!("extracting {filename} for {}", pkg.id))?;

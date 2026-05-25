@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::mpsc;
 
 /// `msidbFileAttributesNoncompressed` — file lives loose in the MSI
 /// directory rather than inside a CAB. SDK MSIs don't use this; we
@@ -331,6 +333,75 @@ fn extract_cab<R: Read + Seek>(reader: R, jobs: &[ExtractJob], cab_name: &str) -
         })?;
     }
     Ok(())
+}
+
+// ---- batch / parallel extraction -------------------------------------------
+
+/// Worker pool size for parallel batch MSI extraction. Matches the
+/// vsix-extractor's `EXTRACT_PARALLELISM` in `src/cli/msvc.rs`.
+const EXTRACT_PARALLELISM: usize = 16;
+
+/// Extract every MSI in `msis` into the shared `dest` directory, in
+/// parallel across a small worker pool. Each MSI emits one info-level
+/// `tracing` line as it starts so users see continuous progress instead
+/// of a silent multi-minute pause.
+///
+/// MSIs may safely write to the same `dest` concurrently — each one
+/// lays files out under its own `Directory`-table paths, and the few
+/// cases where two MSIs touch the same path (rare; SDK installers
+/// occasionally share a header file across components) the content is
+/// identical so the last writer wins benignly.
+///
+/// On the first per-MSI failure: drains the queue so in-flight workers
+/// exit after their current task, then returns the error.
+pub fn extract_msis_in_parallel(msis: &[PathBuf], dest: &Path) -> Result<()> {
+    let total = msis.len();
+    if total == 0 {
+        return Ok(());
+    }
+    let queue: Mutex<Vec<usize>> = Mutex::new((0..total).rev().collect());
+    let (tx, rx) = mpsc::channel::<Result<()>>();
+    let worker_count = EXTRACT_PARALLELISM.min(total);
+
+    std::thread::scope(|s| -> Result<()> {
+        for _ in 0..worker_count {
+            let tx = tx.clone();
+            // See cli/msvc.rs::extract_in_parallel for the rationale on
+            // rebinding the Mutex by reference for the `move` closure.
+            let queue = &queue;
+            s.spawn(move || loop {
+                let idx = match queue.lock().unwrap().pop() {
+                    Some(i) => i,
+                    None => return,
+                };
+                let msi = &msis[idx];
+                let name = msi
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| msi.display().to_string());
+                tracing::info!("[{}/{total}] extracting {name}", idx + 1);
+                let result = extract_msi(msi, dest)
+                    .with_context(|| format!("extracting MSI {}", msi.display()));
+                if tx.send(result).is_err() {
+                    return;
+                }
+            });
+        }
+        drop(tx);
+
+        // Cancel = drain the queue so in-flight workers exit after their
+        // current task instead of grinding through every remaining job
+        // before scope() can join.
+        let cancel = || queue.lock().unwrap().clear();
+
+        for msg in rx {
+            if let Err(e) = msg {
+                cancel();
+                return Err(e);
+            }
+        }
+        Ok(())
+    })
 }
 
 // ---- small helpers ---------------------------------------------------------

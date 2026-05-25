@@ -20,7 +20,7 @@ use super::vs_manifest::{
 };
 use super::{InstallCtx, Installed, Provider};
 use crate::cache::sanitize_fingerprint;
-use crate::download;
+use crate::download::FetchSource;
 use crate::extract;
 use crate::fs_util;
 
@@ -203,8 +203,8 @@ impl Provider for WindowsSdkProvider {
                     .download_with_outcome(&p.url, p.sha256.as_deref())
                     .with_context(|| format!("downloading SDK payload {filename} for {dep_id}"))?;
                 match source {
-                    download::FetchSource::Cached => cached_count += 1,
-                    download::FetchSource::Downloaded => downloaded_count += 1,
+                    FetchSource::Cached => cached_count += 1,
+                    FetchSource::Downloaded => downloaded_count += 1,
                 }
                 let dest = payloads_dir.join(&basename);
                 if !dest.exists() {
@@ -232,10 +232,8 @@ impl Provider for WindowsSdkProvider {
             opts.sdk_version,
         );
         tracing::info!("extracting {} SDK MSIs", msis_to_extract.len());
-        for msi in &msis_to_extract {
-            extract::extract_msi(msi, &extract_dir)
-                .with_context(|| format!("extracting MSI {}", msi.display()))?;
-        }
+        extract::extract_msis_in_parallel(&msis_to_extract, &extract_dir)
+            .context("extracting SDK MSIs")?;
         flatten_windows_kits_into(&extract_dir, &staging_raw)
             .context("flattening Windows Kits/10")?;
         let _ = fs_util::remove_dir_all_writable(&payloads_dir);
