@@ -20,6 +20,7 @@ use super::vs_manifest::{
 };
 use super::{InstallCtx, Installed, Provider};
 use crate::cache::sanitize_fingerprint;
+use crate::download::FetchSource;
 use crate::extract;
 use crate::fs_util;
 
@@ -174,17 +175,40 @@ impl Provider for WindowsSdkProvider {
             .with_context(|| format!("creating {}", extract_dir.display()))?;
 
         let mut msis_to_extract: Vec<std::path::PathBuf> = Vec::new();
+        let mut downloaded_count = 0usize;
+        let mut cached_count = 0usize;
         for dep_id in &dep_ids {
             let Some(pkg) = lookup_exact(&resolved.manifest, dep_id) else {
                 tracing::warn!("SDK dep package {dep_id} not in manifest; skipping");
                 continue;
             };
+
+            // Decide once per dep whether we'll extract any of its MSIs.
+            // If not, skip the whole dep — don't download its CABs either,
+            // since CABs are only useful as siblings of an MSI we're about
+            // to extract. For the typical `default` install (7 essentials),
+            // this skips ~85% of SDK component deps.
+            let install_this_dep = pkg.payloads.iter().any(|p| {
+                let filename = payload_filename(p);
+                if !filename.to_lowercase().ends_with(".msi") {
+                    return false;
+                }
+                msi_should_extract(&filename, &opts)
+            });
+            if !install_this_dep {
+                continue;
+            }
+
             for p in &pkg.payloads {
                 let filename = payload_filename(p);
                 let basename = strip_installer_prefix(&filename);
-                let downloaded = ctx
-                    .download(&p.url, p.sha256.as_deref())
+                let (downloaded, source) = ctx
+                    .download_with_outcome(&p.url, p.sha256.as_deref())
                     .with_context(|| format!("downloading SDK payload {filename} for {dep_id}"))?;
+                match source {
+                    FetchSource::Cached => cached_count += 1,
+                    FetchSource::Downloaded => downloaded_count += 1,
+                }
                 let dest = payloads_dir.join(&basename);
                 if !dest.exists() {
                     let r = std::fs::hard_link(&downloaded, &dest)
@@ -205,11 +229,14 @@ impl Provider for WindowsSdkProvider {
             }
         }
 
+        tracing::info!(
+            "windows_sdk {}: {downloaded_count} payloads downloaded, \
+             {cached_count} already cached",
+            opts.sdk_version,
+        );
         tracing::info!("extracting {} SDK MSIs", msis_to_extract.len());
-        for msi in &msis_to_extract {
-            extract::extract_msi(msi, &extract_dir)
-                .with_context(|| format!("extracting MSI {}", msi.display()))?;
-        }
+        extract::extract_msis_in_parallel(&msis_to_extract, &extract_dir)
+            .context("extracting SDK MSIs")?;
         flatten_windows_kits_into(&extract_dir, &staging_raw)
             .context("flattening Windows Kits/10")?;
         let _ = fs_util::remove_dir_all_writable(&payloads_dir);

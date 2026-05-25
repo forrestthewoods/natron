@@ -478,6 +478,118 @@ fn install_errors_on_extras_zero_match() {
     assert!(msg.contains("matched no MSIs"), "got: {msg}");
 }
 
+#[test]
+fn install_filters_downloads_to_essential_deps() {
+    // Regression: the install loop used to download every payload of
+    // every dep (MSI + sibling CABs) then filter MSIs at extract time.
+    // For a `default` install (7 essentials out of ~50 SDK deps) that
+    // wasted ~85% of the download bandwidth on CABs whose MSI we never
+    // install. Now we decide per-dep — if no MSI in this dep matches
+    // the selection, skip the whole dep including its CABs.
+    let tmp = TempDir::new().unwrap();
+    let sdk_v = "26100";
+
+    // Two deps:
+    //   - essential: MSI name matches DEFAULT_ESSENTIAL_MSIS prefix
+    //     ("Universal CRT Headers Libraries and Sources"). Has 1 MSI + 1 CAB.
+    //   - nonessential: MSI name matches no prefix. Has 1 MSI + 1 CAB.
+    //
+    // After install, the cache downloads dir should contain exactly 2
+    // files (the essential dep's payloads). 4 would indicate the filter
+    // regressed and the nonessential dep was also downloaded.
+    let fixtures = tmp.path().join("fixtures");
+    std::fs::create_dir_all(&fixtures).unwrap();
+    let mk = |name: &str, bytes: &[u8]| {
+        let path = fixtures.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let url = url::Url::from_file_path(&path).unwrap().to_string();
+        (name.to_string(), url)
+    };
+    let (essential_msi_name, essential_msi_url) =
+        mk("Universal CRT Headers Libraries and Sources-x86_en-us.msi", b"ESS_MSI");
+    let (essential_cab_name, essential_cab_url) = mk("essential.cab", b"ESS_CAB");
+    let (nonessential_msi_name, nonessential_msi_url) =
+        mk("Application Verifier ARM64 External Package-arm64_en-us.msi", b"NON_MSI");
+    let (nonessential_cab_name, nonessential_cab_url) = mk("nonessential.cab", b"NON_CAB");
+
+    let component = format!(
+        r#"{{"id":"Microsoft.VisualStudio.Component.Windows11SDK.{sdk_v}","version":"x","payloads":[],"dependencies":{{"Dep.Essential":"x","Dep.NonEssential":"x"}}}}"#
+    );
+    let essential_dep = format!(
+        r#"{{"id":"Dep.Essential","version":"x","payloads":[{{"url":"{essential_msi_url}","fileName":"{essential_msi_name}"}},{{"url":"{essential_cab_url}","fileName":"{essential_cab_name}"}}]}}"#
+    );
+    let nonessential_dep = format!(
+        r#"{{"id":"Dep.NonEssential","version":"x","payloads":[{{"url":"{nonessential_msi_url}","fileName":"{nonessential_msi_name}"}},{{"url":"{nonessential_cab_url}","fileName":"{nonessential_cab_name}"}}]}}"#
+    );
+    let pkgs_json = format!("{component},{essential_dep},{nonessential_dep}");
+
+    let fx = MirrorFixture::build(
+        tmp.path(),
+        &[(
+            VsVersion::Vs2026,
+            &[FxSnapshot {
+                sha: "s18",
+                date: "2026-05-01T00:00:00Z",
+                build_version: "18.6.0.0",
+                display_version: "18.6",
+                product_line_version: "18",
+                manifest_packages_json: pkgs_json,
+            }],
+        )],
+    );
+
+    let ctx = test_ctx(&tmp);
+    let mut ctx = ctx;
+    let cache_root = ctx.cache().root.clone();
+    let provider = WindowsSdkProvider::with_remote(fx.remote);
+    let mut opts = toml::Table::new();
+    opts.insert("sdk_version".into(), toml::Value::String(sdk_v.into()));
+
+    // The install will fail at MSI extraction (our fixtures aren't real
+    // MSIs). The failure is fine — it happens AFTER the download/staging
+    // phase, so the cache state still tells us which payloads were
+    // fetched.
+    let _err = provider.install(&opts, &mut ctx).unwrap_err();
+
+    // Count by examining the staged payloads dir directly (cache/downloads
+    // also contains manifest/channel fetches which we don't want to count).
+    // Install stages payloads at `<staging>/raw/__sdk_payloads/`; the
+    // raw subdir is what `ctx.staging_dir()` returns.
+    let payloads_dir = ctx
+        .staging_dir()
+        .expect("staging allocated by install")
+        .join("__sdk_payloads");
+    let basenames: Vec<String> = std::fs::read_dir(&payloads_dir)
+        .map(|it| {
+            it.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let basenames_set: std::collections::BTreeSet<&str> =
+        basenames.iter().map(String::as_str).collect();
+    assert!(
+        basenames_set.contains(essential_msi_name.as_str()),
+        "essential MSI must be staged; got {basenames:?}"
+    );
+    assert!(
+        basenames_set.contains(essential_cab_name.as_str()),
+        "essential CAB must be staged; got {basenames:?}"
+    );
+    assert!(
+        !basenames_set.contains(nonessential_msi_name.as_str()),
+        "nonessential MSI must NOT be staged; got {basenames:?}"
+    );
+    assert!(
+        !basenames_set.contains(nonessential_cab_name.as_str()),
+        "nonessential CAB must NOT be staged; got {basenames:?}"
+    );
+    // cache_root referenced to keep the binding alive past the assertion
+    // chain — exact files there are install-flow-dependent and not the
+    // subject of this test.
+    let _ = cache_root;
+}
+
 /// Build a manifest packages JSON with one SDK component + a dep package
 /// carrying a single MSI (so the SDK has at least one extractable target,
 /// but a typo'd extras prefix won't match).

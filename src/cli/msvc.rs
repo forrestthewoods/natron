@@ -155,19 +155,24 @@ fn run_packages(
     let family = msvc::family_prefix(&compiler.id)?;
     let compiler_version = primary_version(compiler)?;
 
-    // Scope to packages at the primary compiler's exact version. A snapshot
-    // contains thousands of unrelated entries — Android workloads, .NET
-    // tools, legacy compat toolsets at other versions — none of which a
-    // user running `msvc packages` would expect to see.
+    // Scoping rules:
+    //   in-family:     any package whose id starts with the primary
+    //                  compiler's family prefix. NO version filter —
+    //                  Microsoft sometimes patches the compiler without
+    //                  bumping CRT/ATL/MFC versions, so the family is at
+    //                  several versions inside a single snapshot.
+    //   out-of-family: NOT in family AND version matches the primary
+    //                  compiler's version. Catches `Microsoft.VC.Preview.*`
+    //                  style escape-hatch packages that ship as part of
+    //                  this release but live in a different id namespace.
+    // Everything else (legacy compat toolsets at other family prefixes,
+    // Android workloads, .NET tools, etc.) is excluded.
     let mut in_family: Vec<&Package> = Vec::new();
     let mut out_of_family: Vec<&Package> = Vec::new();
     for pkg in &manifest.packages {
-        if pkg.version.as_deref() != Some(compiler_version) {
-            continue;
-        }
         if starts_with_ignore_ascii_case(&pkg.id, &family) {
             in_family.push(pkg);
-        } else {
+        } else if pkg.version.as_deref() == Some(compiler_version) {
             out_of_family.push(pkg);
         }
     }
@@ -229,16 +234,19 @@ fn run_extract(
         .with_context(|| format!("creating {}", args.out.display()))?;
 
     let compiler = msvc::find_primary_compiler(&manifest, entry.vs)?;
+    let family = msvc::family_prefix(&compiler.id)?;
     let compiler_version = primary_version(compiler)?;
 
-    // Same scope as `packages`: filter to the primary compiler's exact
-    // version. Excludes Android/Python/etc. workloads + legacy compat
-    // toolsets at other versions that just happen to ship in the same
-    // VS snapshot.
+    // Same scope as `packages`: in-family (any version) ∪ out-of-family
+    // at the primary compiler's version. See run_packages above for the
+    // rationale.
     let mut to_extract: Vec<&Package> = manifest
         .packages
         .iter()
-        .filter(|p| p.version.as_deref() == Some(compiler_version))
+        .filter(|p| {
+            starts_with_ignore_ascii_case(&p.id, &family)
+                || p.version.as_deref() == Some(compiler_version)
+        })
         .collect();
     to_extract.sort_by_key(|p| sort_key(p));
 

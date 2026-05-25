@@ -28,6 +28,15 @@ pub fn agent() -> &'static ureq::Agent {
     })
 }
 
+/// Whether `fetch_with_outcome` served the request from cache or did a
+/// fresh network/file copy. Useful for "X downloaded, Y cached"
+/// reporting in install loops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchSource {
+    Cached,
+    Downloaded,
+}
+
 /// Fetch `url` into the `cache` directory and return the absolute path of the
 /// cached file. If `expected_sha256` is provided, the download stream is
 /// verified against it; if a cached file exists with the right hash, no
@@ -37,6 +46,17 @@ pub fn agent() -> &'static ureq::Agent {
 /// it's not known, we use `<8-hex-of-url-hash>-<basename>`. On hit we either
 /// re-verify (if expected sha is supplied) or trust the cache.
 pub fn fetch(url: &str, expected_sha256: Option<&str>, cache: &Path) -> Result<PathBuf> {
+    fetch_with_outcome(url, expected_sha256, cache).map(|(p, _)| p)
+}
+
+/// Same as [`fetch`], but additionally reports whether the result was
+/// served from cache or required a fresh download. Lets callers track
+/// per-install cache-hit ratios.
+pub fn fetch_with_outcome(
+    url: &str,
+    expected_sha256: Option<&str>,
+    cache: &Path,
+) -> Result<(PathBuf, FetchSource)> {
     std::fs::create_dir_all(cache)
         .with_context(|| format!("creating download cache {}", cache.display()))?;
 
@@ -50,7 +70,7 @@ pub fn fetch(url: &str, expected_sha256: Option<&str>, cache: &Path) -> Result<P
             match verify_file_sha256(&cached_path, expected) {
                 Ok(()) => {
                     tracing::debug!("download cache hit: {}", cached_path.display());
-                    return Ok(cached_path);
+                    return Ok((cached_path, FetchSource::Cached));
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -62,7 +82,7 @@ pub fn fetch(url: &str, expected_sha256: Option<&str>, cache: &Path) -> Result<P
             }
         } else {
             tracing::debug!("download cache hit (no sha verify): {}", cached_path.display());
-            return Ok(cached_path);
+            return Ok((cached_path, FetchSource::Cached));
         }
     }
 
@@ -79,7 +99,7 @@ pub fn fetch(url: &str, expected_sha256: Option<&str>, cache: &Path) -> Result<P
         other => bail!("unsupported URL scheme: {other}"),
     }
 
-    Ok(cached_path)
+    Ok((cached_path, FetchSource::Downloaded))
 }
 
 /// Derive the cached filename for a URL. Sha-keyed when known, URL-hash-keyed

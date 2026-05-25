@@ -4,6 +4,8 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Subcommand};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::mpsc;
 
 use crate::cli::resolve_config_path;
 use crate::extract;
@@ -11,6 +13,11 @@ use crate::fs_util;
 use crate::providers::vs_manifest::{self, ManifestHistory};
 use crate::providers::windows_sdk;
 use crate::providers::InstallCtx;
+
+/// Worker pool size for parallel per-MSI extract+flatten in
+/// `natron windows_sdk extract`. Matches the equivalent constants in
+/// `src/cli/msvc.rs` and `src/extract_msi.rs`.
+const EXTRACT_PARALLELISM: usize = 16;
 
 #[derive(Debug, Args)]
 pub struct WindowsSdkArgs {
@@ -200,28 +207,23 @@ fn run_extract(
         args.out.display(),
     )?;
 
-    let mut extracted = 0usize;
+    // Skip-vs-work partition runs sequentially (just stat()s) so the
+    // skip lines stay grouped at the top in stable order. Work goes to
+    // the parallel pool.
     let mut skipped = 0usize;
+    let mut work: Vec<(String, PathBuf, PathBuf)> = Vec::new();
     for (name, msi_path) in &msi_jobs {
         let dest = args.out.join(name);
         if dir_has_content(&dest) {
             writeln!(out, "  skip   {name} (already populated)")?;
             skipped += 1;
-            continue;
+        } else {
+            work.push((name.clone(), msi_path.clone(), dest));
         }
-        // Fresh scratch per MSI: the extractor writes
-        // `<scratch>/Windows Kits/10/*` per the MSI's Directory table.
-        // We then move just that subtree into `dest`.
-        let _ = fs_util::remove_dir_all_writable(&msi_scratch);
-        std::fs::create_dir_all(&msi_scratch)
-            .with_context(|| format!("creating {}", msi_scratch.display()))?;
-        extract::extract_msi(msi_path, &msi_scratch)
-            .with_context(|| format!("extracting {name}"))?;
-        windows_sdk::flatten_windows_kits_into(&msi_scratch, &dest)
-            .with_context(|| format!("flattening {name}"))?;
-        writeln!(out, "  ok     {name}")?;
-        extracted += 1;
     }
+
+    let extracted = extract_per_msi_in_parallel(out, &work, &msi_scratch)?;
+
     let _ = fs_util::remove_dir_all_writable(&payloads_dir);
     let _ = fs_util::remove_dir_all_writable(&msi_scratch);
 
@@ -231,6 +233,79 @@ fn run_extract(
         args.out.display(),
     )?;
     Ok(())
+}
+
+/// Parallel per-MSI extract + flatten. Each MSI gets its own scratch
+/// subdirectory under `scratch_root` (so workers don't trample each
+/// other), runs the pure-Rust extractor into that scratch, then
+/// flattens the `Windows Kits/10/` subtree into the MSI's dest.
+///
+/// Mirrors the pattern in `src/cli/msvc.rs::extract_in_parallel`:
+/// `Mutex<Vec<usize>>` queue + mpsc channel for live progress + cancel
+/// (queue drain) on the first error. See that function for details.
+fn extract_per_msi_in_parallel(
+    out: &mut dyn std::io::Write,
+    work: &[(String, PathBuf, PathBuf)],
+    scratch_root: &Path,
+) -> Result<usize> {
+    let total = work.len();
+    if total == 0 {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(scratch_root)
+        .with_context(|| format!("creating {}", scratch_root.display()))?;
+    let queue: Mutex<Vec<usize>> = Mutex::new((0..total).rev().collect());
+    let (tx, rx) = mpsc::channel::<Result<String>>();
+    let worker_count = EXTRACT_PARALLELISM.min(total);
+
+    std::thread::scope(|s| -> Result<usize> {
+        for _ in 0..worker_count {
+            let tx = tx.clone();
+            let queue = &queue;
+            s.spawn(move || loop {
+                let idx = match queue.lock().unwrap().pop() {
+                    Some(i) => i,
+                    None => return,
+                };
+                let (name, msi_path, dest) = &work[idx];
+                let scratch = scratch_root.join(name);
+                let result = (|| -> Result<String> {
+                    let _ = fs_util::remove_dir_all_writable(&scratch);
+                    std::fs::create_dir_all(&scratch)
+                        .with_context(|| format!("creating {}", scratch.display()))?;
+                    extract::extract_msi(msi_path, &scratch)
+                        .with_context(|| format!("extracting {name}"))?;
+                    windows_sdk::flatten_windows_kits_into(&scratch, dest)
+                        .with_context(|| format!("flattening {name}"))?;
+                    let _ = fs_util::remove_dir_all_writable(&scratch);
+                    Ok(name.clone())
+                })();
+                if tx.send(result).is_err() {
+                    return;
+                }
+            });
+        }
+        drop(tx);
+
+        let cancel = || queue.lock().unwrap().clear();
+        let mut count = 0usize;
+        for msg in rx {
+            match msg {
+                Ok(name) => {
+                    if let Err(e) = writeln!(out, "  ok     {name}") {
+                        cancel();
+                        return Err(e.into());
+                    }
+                    count += 1;
+                }
+                Err(e) => {
+                    cancel();
+                    return Err(e);
+                }
+            }
+        }
+        Ok(count)
+    })
 }
 
 // ---- helpers ---------------------------------------------------------------

@@ -16,6 +16,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::vs_manifest::{self, ManifestHistory, Package, VsManifest, VsVersion};
 use super::{InstallCtx, Installed, Provider};
 use crate::cache::sanitize_fingerprint;
+use crate::download::FetchSource;
 use crate::extract;
 
 pub const ID: &str = "msvc";
@@ -154,19 +155,30 @@ impl Provider for MsvcProvider {
             .with_context(|| format!("locating primary compiler for build {}", opts.build_version))?;
         let family = family_prefix(&compiler.id)?;
 
-        let selected = select_packages(&manifest, compiler, &family, &opts)?;
+        let selected = select_packages(&manifest, &family, &opts)?;
         let staging = ctx.staging_dir()?;
+        let mut downloaded_count = 0usize;
+        let mut cached_count = 0usize;
         for request in &selected {
             let pkg = lookup_package(&manifest, request)?;
             for payload in &pkg.payloads {
                 let filename = payload_filename(payload);
-                let archive = ctx
-                    .download(&payload.url, payload.sha256.as_deref())
+                let (archive, source) = ctx
+                    .download_with_outcome(&payload.url, payload.sha256.as_deref())
                     .with_context(|| format!("downloading {filename} for {}", pkg.id))?;
+                match source {
+                    FetchSource::Cached => cached_count += 1,
+                    FetchSource::Downloaded => downloaded_count += 1,
+                }
                 extract_payload(&archive, &filename, &staging)
                     .with_context(|| format!("extracting {filename} for {}", pkg.id))?;
             }
         }
+        tracing::info!(
+            "msvc build {}: {downloaded_count} payloads downloaded, \
+             {cached_count} already cached",
+            opts.build_version,
+        );
 
         Ok(Installed {
             fingerprint: fp,
@@ -253,22 +265,16 @@ fn version_key(v: &str) -> Vec<u64> {
 
 fn select_packages(
     manifest: &VsManifest,
-    compiler: &Package,
     family_prefix: &str,
     opts: &Options,
 ) -> Result<Vec<PackageRequest>> {
     let mut selected: BTreeSet<PackageRequest> = BTreeSet::new();
-    let compiler_version = compiler
-        .version
-        .as_deref()
-        .ok_or_else(|| anyhow!("primary compiler {} has no version field", compiler.id))?;
 
     match opts.base {
         BaseInstall::Full => {
-            // Every package in the snapshot at the compiler's exact version.
-            // Note: snapshots also contain LEGACY compat toolsets at different
-            // versions; "full" picks those up too because users opting in want
-            // the full snapshot.
+            // Every package in the snapshot. Snapshots also contain LEGACY
+            // compat toolsets at different family versions; "full" picks
+            // those up too because users opting in want the full snapshot.
             for pkg in &manifest.packages {
                 if pkg.version.is_some() {
                     selected.insert(package_request(pkg));
@@ -277,15 +283,15 @@ fn select_packages(
         }
         BaseInstall::Default => {
             for pattern in DEFAULT_PATTERNS {
-                match_pattern_into(&mut selected, manifest, compiler_version, family_prefix, pattern)?;
+                match_pattern_into(&mut selected, manifest, family_prefix, pattern)?;
             }
             for pattern in &opts.extras {
-                match_pattern_into(&mut selected, manifest, compiler_version, family_prefix, pattern)?;
+                match_pattern_into(&mut selected, manifest, family_prefix, pattern)?;
             }
         }
         BaseInstall::None => {
             for pattern in &opts.extras {
-                match_pattern_into(&mut selected, manifest, compiler_version, family_prefix, pattern)?;
+                match_pattern_into(&mut selected, manifest, family_prefix, pattern)?;
             }
         }
     }
@@ -296,7 +302,6 @@ fn select_packages(
 fn match_pattern_into(
     selected: &mut BTreeSet<PackageRequest>,
     manifest: &VsManifest,
-    compiler_version: &str,
     family_prefix: &str,
     pattern: &str,
 ) -> Result<()> {
@@ -312,11 +317,13 @@ fn match_pattern_into(
         require_literal_leading_dot: false,
     };
 
+    // Family-prefix is the scoping mechanism inside a snapshot. We do NOT
+    // filter by version: Microsoft routinely patches the compiler (cl.exe)
+    // without bumping CRT/ATL/MFC versions in the same release. Restricting
+    // to the family prefix already excludes legacy compat toolsets (which
+    // have a different family prefix) and unrelated workloads.
     let mut matched = 0usize;
     for pkg in &manifest.packages {
-        if pkg.version.as_deref() != Some(compiler_version) {
-            continue;
-        }
         let in_family = starts_with_ignore_ascii_case(&pkg.id, family_prefix);
         let candidate = if raw {
             pkg.id.as_str()
@@ -331,7 +338,8 @@ fn match_pattern_into(
         }
     }
     if matched == 0 {
-        bail!("msvc package pattern '{pattern}' matched no packages at version {compiler_version}");
+        let family = family_prefix.trim_end_matches('.');
+        bail!("msvc package pattern '{pattern}' matched no packages in family {family}");
     }
     Ok(())
 }
