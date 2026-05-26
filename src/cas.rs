@@ -15,6 +15,8 @@ use anyhow::{Context, Result, anyhow};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::mpsc;
 
 use crate::cache::Cache;
 use crate::fs_util;
@@ -42,10 +44,18 @@ pub struct CasReport {
 /// tree at `staging_tree/` is what gets atomically renamed into
 /// `installs/<fingerprint>/tree/`.
 pub fn run(cache: &Cache, staging_raw: &Path, staging_tree: &Path) -> Result<CasReport> {
-    let mut report = CasReport::default();
     std::fs::create_dir_all(staging_tree)
         .with_context(|| format!("creating {}", staging_tree.display()))?;
 
+    // Walk once, partitioning entries by kind. Directories and symlinks are
+    // cheap and order-sensitive (parents before children), so we materialize
+    // them serially; the per-file CAS work (hash + two hardlinks + a readonly
+    // mark — the bulk of the cost, especially on Windows where each syscall is
+    // expensive and an AV scanner sits in the path) is dispatched to a worker
+    // pool below.
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut symlinks: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    let mut files: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
     for entry in jwalk::WalkDir::new(staging_raw)
         .skip_hidden(false)
         .follow_links(false)
@@ -60,22 +70,109 @@ pub fn run(cache: &Cache, staging_raw: &Path, staging_tree: &Path) -> Result<Cas
             continue;
         }
         let dst = staging_tree.join(rel);
-
         let ft = entry.file_type();
         if ft.is_dir() {
-            std::fs::create_dir_all(&dst)
-                .with_context(|| format!("mkdir {}", dst.display()))?;
-            report.directories += 1;
+            dirs.push(dst);
         } else if ft.is_symlink() {
-            reproduce_symlink(&src, &dst)?;
-            report.symlinks += 1;
+            symlinks.push((src, dst));
         } else if ft.is_file() {
-            cas_file(cache, &src, &dst, &mut report)?;
+            files.push((src, dst));
         }
         // Other file types (block/char/socket/fifo) are not expected in our
         // archives; ignore.
     }
+
+    let mut report = CasReport::default();
+    // `sort(true)` on the walk yields parents before children, so a plain
+    // create_dir_all per entry suffices to reproduce the tree skeleton.
+    for d in &dirs {
+        std::fs::create_dir_all(d)
+            .with_context(|| format!("mkdir {}", d.display()))?;
+    }
+    report.directories = dirs.len();
+    for (src, dst) in &symlinks {
+        reproduce_symlink(src, dst)?;
+    }
+    report.symlinks = symlinks.len();
+
+    let partials = cas_files_parallel(cache, &files)?;
+    for p in partials {
+        report.files_processed += p.files_processed;
+        report.dedupe_hits += p.dedupe_hits;
+        report.bytes_freed += p.bytes_freed;
+    }
     Ok(report)
+}
+
+/// Per-file CAS outcome accumulated by a worker.
+#[derive(Default)]
+struct FilePartial {
+    files_processed: usize,
+    dedupe_hits: usize,
+    bytes_freed: u64,
+}
+
+/// Process `files` (src -> dst pairs) through the CAS across a worker pool.
+/// Each CAS insertion is independently race-safe (see module docs: hardlink
+/// publish + byte-compare on EEXIST), so concurrent workers — both within this
+/// pass and against peer processes sharing the cache — can't corrupt a blob.
+fn cas_files_parallel(
+    cache: &Cache,
+    files: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> Result<Vec<FilePartial>> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let worker_count = crate::fs_util::worker_count(files.len());
+    if worker_count <= 1 {
+        let mut partial = FilePartial::default();
+        for (src, dst) in files {
+            cas_file(cache, src, dst, &mut partial)?;
+        }
+        return Ok(vec![partial]);
+    }
+
+    let queue: Mutex<Vec<usize>> = Mutex::new((0..files.len()).rev().collect());
+    let (tx, rx) = mpsc::channel::<Result<FilePartial>>();
+    std::thread::scope(|s| -> Result<Vec<FilePartial>> {
+        for _ in 0..worker_count {
+            let tx = tx.clone();
+            let queue = &queue;
+            s.spawn(move || {
+                let mut partial = FilePartial::default();
+                let result = loop {
+                    let idx = match queue.lock().unwrap().pop() {
+                        Some(i) => i,
+                        None => break Ok(partial),
+                    };
+                    let (src, dst) = &files[idx];
+                    if let Err(e) = cas_file(cache, src, dst, &mut partial) {
+                        // Drain the queue so peers stop pulling new work.
+                        queue.lock().unwrap().clear();
+                        break Err(e);
+                    }
+                };
+                let _ = tx.send(result);
+            });
+        }
+        drop(tx);
+        let mut partials = Vec::with_capacity(worker_count);
+        let mut first_err: Option<anyhow::Error> = None;
+        for msg in rx {
+            match msg {
+                Ok(p) => partials.push(p),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(partials),
+        }
+    })
 }
 
 /// Like `run` but skips CAS — moves staging files directly into the install
@@ -120,7 +217,7 @@ fn cas_file(
     cache: &Cache,
     src: &Path,
     dst: &Path,
-    report: &mut CasReport,
+    report: &mut FilePartial,
 ) -> Result<()> {
     let hex = hash_file_xxh3_128(src)?;
     let cas_path = cache.cas_path(&hex);
@@ -188,10 +285,11 @@ fn cas_file(
     fs_util::hard_link(&cas_path, dst)?;
 
     if just_inserted {
-        // Best-effort readonly on the CAS blob. The hardlink we just
-        // created shares the inode, so this also makes our install-tree
-        // entry readonly. Failure here is non-fatal.
-        let _ = fs_util::clear_readonly(&cas_path); // first clear in case set
+        // Best-effort readonly on the CAS blob. The hardlink we just created
+        // shares the inode, so this also makes our install-tree entry
+        // readonly. A blob we just published is a fresh hardlink off a
+        // writable, freshly-extracted file, so it's never already readonly —
+        // no need to clear first. Failure here is non-fatal.
         let _ = mark_readonly(&cas_path);
     }
 

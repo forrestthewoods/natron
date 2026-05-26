@@ -91,8 +91,36 @@ fn extract_tar_xz(archive: &Path, dest: &Path, strip_prefix: Option<&str>) -> Re
     );
     let f = File::open(archive)
         .with_context(|| format!("opening {}", archive.display()))?;
-    let dec = xz2::read::XzDecoder::new(f);
+    let dec = mt_xz_decoder(f)?;
     extract_tar_inner(dec, dest, strip_prefix)
+}
+
+/// Build a multithreaded .xz decoder over `reader`. xz files written by `xz`
+/// (e.g. LLVM's release tarballs) are split into independent ~64 MiB blocks,
+/// so liblzma can decode them across threads. Falls back to a single-threaded
+/// auto-decoder if the MT decoder can't be initialized.
+fn mt_xz_decoder<R: std::io::Read>(reader: R) -> Result<liblzma::read::XzDecoder<R>> {
+    let threads = crate::fs_util::worker_count(usize::MAX) as u32;
+    if threads <= 1 {
+        return Ok(liblzma::read::XzDecoder::new(reader));
+    }
+    // memlimit_stop = MAX disables the hard decode limit; memlimit_threading is
+    // the soft budget below which liblzma keeps blocks single-threaded, so it
+    // must comfortably hold several in-flight 64 MiB blocks per worker.
+    let threading_budget = (threads as u64 + 1) * 256 * 1024 * 1024;
+    match liblzma::stream::MtStreamBuilder::new()
+        .threads(threads)
+        .memlimit_stop(u64::MAX)
+        .memlimit_threading(threading_budget)
+        .timeout_ms(0)
+        .decoder()
+    {
+        Ok(stream) => Ok(liblzma::read::XzDecoder::new_stream(reader, stream)),
+        Err(err) => {
+            tracing::warn!("MT xz decoder init failed ({err}); falling back to single-threaded");
+            Ok(liblzma::read::XzDecoder::new(reader))
+        }
+    }
 }
 
 fn extract_tar_gz(archive: &Path, dest: &Path, strip_prefix: Option<&str>) -> Result<()> {
@@ -114,6 +142,14 @@ fn extract_tar_gz(archive: &Path, dest: &Path, strip_prefix: Option<&str>) -> Re
     );
 }
 
+/// Files at or above this size are written inline on the reader thread
+/// (streamed, never buffered whole); smaller files are handed to the writer
+/// pool as an in-memory blob. This bounds the writer pool's memory to
+/// roughly `channel_capacity * THRESHOLD` while still parallelizing the many
+/// small-file creates — the per-file syscall + AV-scan cost that dominates on
+/// Windows.
+const TAR_INLINE_WRITE_THRESHOLD: u64 = 1 << 20; // 1 MiB
+
 fn extract_tar_inner<R: Read>(
     reader: R,
     dest: &Path,
@@ -121,66 +157,139 @@ fn extract_tar_inner<R: Read>(
 ) -> Result<()> {
     let mut archive = tar::Archive::new(reader);
     archive.set_overwrite(true);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let raw_path = entry.path()?.to_path_buf();
-        // Defend against tar-slip: reject absolute paths and `..` components.
-        if raw_path.is_absolute()
-            || raw_path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            bail!("tar entry has unsafe path (tar-slip?): {}", raw_path.display());
+
+    let workers = crate::fs_util::worker_count(usize::MAX);
+    // tar is a sequential stream, so a single reader thread parses entries and
+    // either writes large files inline or dispatches small ones to the pool.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(PathBuf, Vec<u8>)>(workers * 4);
+    let rx = std::sync::Mutex::new(rx);
+    let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+
+    std::thread::scope(|s| -> Result<()> {
+        for _ in 0..workers {
+            let rx = &rx;
+            let first_err = &first_err;
+            s.spawn(move || loop {
+                // Hold the lock only for the dequeue; the write happens after
+                // releasing it so workers write in parallel.
+                let job = {
+                    let guard = rx.lock().unwrap();
+                    guard.recv()
+                };
+                let (path, bytes) = match job {
+                    Ok(j) => j,
+                    Err(_) => return, // channel closed: no more work
+                };
+                if let Err(e) = write_file_bytes(&path, &bytes) {
+                    let mut g = first_err.lock().unwrap();
+                    if g.is_none() {
+                        *g = Some(e);
+                    }
+                }
+            });
         }
-        let rel = match apply_strip_prefix(&raw_path, strip_prefix) {
-            Some(r) => r,
-            None => continue,
-        };
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
-        let out = dest.join(&rel);
-        let kind = entry.header().entry_type();
-        if kind.is_dir() {
-            std::fs::create_dir_all(&out)?;
-            continue;
-        }
-        if kind.is_symlink() {
-            // Reproduce as a symlink. The `tar` crate's unpack would do this;
-            // we replicate manually so strip_prefix works.
-            let link_target = entry
-                .link_name()?
-                .ok_or_else(|| anyhow!("symlink entry without link_name"))?
-                .into_owned();
-            if let Some(parent) = out.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            // Best-effort: skip if symlink already exists.
-            let _ = std::fs::remove_file(&out);
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&link_target, &out)?;
-            }
-            #[cfg(windows)]
-            {
-                // Windows: try a file symlink; fall back silently if not allowed.
-                if let Err(err) = std::os::windows::fs::symlink_file(&link_target, &out) {
-                    tracing::warn!(
-                        "could not create symlink {} -> {}: {err}",
-                        out.display(),
-                        link_target.display()
-                    );
+
+        let mut produce = || -> Result<()> {
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                let raw_path = entry.path()?.to_path_buf();
+                // Defend against tar-slip: reject absolute paths and `..`.
+                if raw_path.is_absolute()
+                    || raw_path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    bail!("tar entry has unsafe path (tar-slip?): {}", raw_path.display());
+                }
+                let rel = match apply_strip_prefix(&raw_path, strip_prefix) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                if rel.as_os_str().is_empty() {
+                    continue;
+                }
+                let out = dest.join(&rel);
+                let kind = entry.header().entry_type();
+                if kind.is_dir() {
+                    std::fs::create_dir_all(&out)?;
+                    continue;
+                }
+                if kind.is_symlink() {
+                    let link_target = entry
+                        .link_name()?
+                        .ok_or_else(|| anyhow!("symlink entry without link_name"))?
+                        .into_owned();
+                    reproduce_tar_symlink(&out, &link_target)?;
+                    continue;
+                }
+                let size = entry.header().size().unwrap_or(0);
+                if size >= TAR_INLINE_WRITE_THRESHOLD {
+                    if let Some(parent) = out.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let mut outf = File::create(&out)
+                        .with_context(|| format!("creating {}", out.display()))?;
+                    std::io::copy(&mut entry, &mut outf)
+                        .with_context(|| format!("writing {}", out.display()))?;
+                } else {
+                    let mut buf = Vec::with_capacity(size as usize);
+                    entry
+                        .read_to_end(&mut buf)
+                        .with_context(|| format!("reading {}", out.display()))?;
+                    // A send error means all workers died; surface their error.
+                    if tx.send((out, buf)).is_err() {
+                        break;
+                    }
+                }
+                // Bail early if a worker has already failed.
+                if first_err.lock().unwrap().is_some() {
+                    break;
                 }
             }
-            continue;
+            Ok(())
+        };
+
+        let result = produce();
+        drop(tx); // close the channel so workers drain and exit
+        result
+    })?;
+
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `path`, creating parent directories. Used by the tar
+/// writer pool. `create_dir_all` is race-tolerant across workers.
+fn write_file_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+fn reproduce_tar_symlink(out: &Path, link_target: &Path) -> Result<()> {
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Best-effort: skip if symlink already exists.
+    let _ = std::fs::remove_file(out);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(link_target, out)?;
+    }
+    #[cfg(windows)]
+    {
+        // Windows: try a file symlink; fall back silently if not allowed.
+        if let Err(err) = std::os::windows::fs::symlink_file(link_target, out) {
+            tracing::warn!(
+                "could not create symlink {} -> {}: {err}",
+                out.display(),
+                link_target.display()
+            );
         }
-        if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut outf = File::create(&out)
-            .with_context(|| format!("creating {}", out.display()))?;
-        std::io::copy(&mut entry, &mut outf)
-            .with_context(|| format!("writing {}", out.display()))?;
     }
     Ok(())
 }

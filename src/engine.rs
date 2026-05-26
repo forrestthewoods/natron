@@ -4,6 +4,7 @@
 use anyhow::{Result, anyhow};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use crate::cache::{Cache, InstallMetadata, sanitize_fingerprint};
@@ -17,6 +18,13 @@ use crate::state::{DeployState, DeployedEntry, StateDiff};
 /// Maximum age of a `staging/<uuid>/` dir, after which we GC it on `sync`
 /// startup. 60 minutes covers slow LLVM downloads (~1.5 GB).
 const STAGING_GC_THRESHOLD_SECS: u64 = 60 * 60;
+
+/// Upper bound on toolchains processed concurrently. Each entry already uses a
+/// core-sized worker pool internally (xz decode, CAB extraction, CAS), so this
+/// is deliberately small: enough to overlap one entry's network/git phase with
+/// another's CPU-bound decode, without multiplying the live thread count by the
+/// toolchain count.
+const MAX_CONCURRENT_TOOLCHAINS: usize = 4;
 
 /// Toplevel orchestrator. Holds the parsed config, resolved cache layout, a
 /// provider registry, and run-time options (dry-run, no-cas, mode override).
@@ -167,30 +175,69 @@ impl Natron {
             }
         }
 
+        // Partition entries into per-position outcome slots (filtered entries
+        // resolve immediately as Skipped) and a work list of the rest. Slots
+        // keep the report in config order regardless of completion order.
         let mut report = SyncReport::default();
-        for entry in &self.config.toolchains {
+        let mut slots: Vec<Option<EntryOutcome>> = vec![None; self.config.toolchains.len()];
+        let mut work: Vec<(usize, &ToolchainEntry)> = Vec::new();
+        for (i, entry) in self.config.toolchains.iter().enumerate() {
             if !opts.only.is_empty() && !opts.only.contains(&entry.name) {
-                report.entries.push(EntryOutcome {
+                slots[i] = Some(EntryOutcome {
                     name: entry.name.clone(),
                     fingerprint: String::new(),
                     display: String::new(),
                     mode: self.effective_mode(entry, opts),
                     action: SyncAction::Skipped,
                 });
-                continue;
-            }
-            match self.sync_entry(entry, &mut state, opts) {
-                Ok(outcome) => report.entries.push(outcome),
-                Err(err) => {
-                    let msg = format!("{err:#}");
-                    tracing::error!("entry '{}' failed: {msg}", entry.name);
-                    report.errors.push(EntryError {
-                        name: entry.name.clone(),
-                        message: msg,
-                    });
-                }
+            } else {
+                work.push((i, entry));
             }
         }
+
+        // Run toolchains concurrently so one's download/git phase overlaps
+        // another's CPU-bound decode. Each entry already saturates cores
+        // internally (parallel xz / CAB / CAS), so we cap toolchain-level
+        // concurrency low to overlap I/O without massively oversubscribing.
+        let state = Mutex::new(state);
+        let errors: Mutex<Vec<EntryError>> = Mutex::new(Vec::new());
+        let outcomes: Mutex<Vec<(usize, EntryOutcome)>> = Mutex::new(Vec::new());
+        let concurrency = MAX_CONCURRENT_TOOLCHAINS.min(work.len()).max(1);
+        let queue: Mutex<Vec<usize>> = Mutex::new((0..work.len()).rev().collect());
+        std::thread::scope(|s| {
+            for _ in 0..concurrency {
+                let queue = &queue;
+                let work = &work;
+                let state = &state;
+                let errors = &errors;
+                let outcomes = &outcomes;
+                s.spawn(move || loop {
+                    let wi = match queue.lock().unwrap().pop() {
+                        Some(i) => i,
+                        None => return,
+                    };
+                    let (idx, entry) = work[wi];
+                    match self.sync_entry(entry, state, opts) {
+                        Ok(outcome) => outcomes.lock().unwrap().push((idx, outcome)),
+                        Err(err) => {
+                            let msg = format!("{err:#}");
+                            tracing::error!("entry '{}' failed: {msg}", entry.name);
+                            errors.lock().unwrap().push(EntryError {
+                                name: entry.name.clone(),
+                                message: msg,
+                            });
+                        }
+                    }
+                });
+            }
+        });
+
+        for (idx, outcome) in outcomes.into_inner().unwrap() {
+            slots[idx] = Some(outcome);
+        }
+        report.entries = slots.into_iter().flatten().collect();
+        report.errors = errors.into_inner().unwrap();
+        let state = state.into_inner().unwrap();
 
         if !opts.dry_run {
             state.write(&self.config.resolved_deploy_dir())?;
@@ -218,7 +265,7 @@ impl Natron {
     fn sync_entry(
         &self,
         entry: &ToolchainEntry,
-        state: &mut DeployState,
+        state: &Mutex<DeployState>,
         opts: &SyncOptions,
     ) -> Result<EntryOutcome> {
         let provider = self.registry.require(&entry.provider)?;
@@ -251,7 +298,10 @@ impl Natron {
                 cas::run(&self.cache, &staging_raw, &staging_tree)?
             };
             let cas_elapsed = t_cas.elapsed().as_secs_f64();
-            let total_files = cas_report.files_processed + cas_report.dedupe_hits;
+            // files_processed already counts every regular file (dedupe hits
+            // included); dedupe_hits is the subset that matched an existing
+            // blob.
+            let total_files = cas_report.files_processed;
             tracing::info!(
                 "[timing] {} cas pass: {} files in {:.2}s ({:.0} files/s), dedupe_hits={} bytes_freed={}",
                 entry.name,
@@ -299,7 +349,7 @@ impl Natron {
         let deploy_path = deploy_root.join(&entry.deploy_dir);
         let install_tree = self.cache.install_tree(&fingerprint);
 
-        let diff = state.diff(
+        let diff = state.lock().unwrap().diff(
             &entry.name,
             &fingerprint,
             &entry.deploy_dir,
@@ -333,7 +383,7 @@ impl Natron {
                 mode,
                 t_deploy.elapsed().as_secs_f64()
             );
-            state.upsert(
+            state.lock().unwrap().upsert(
                 entry.name.clone(),
                 DeployedEntry {
                     fingerprint: fingerprint.clone(),

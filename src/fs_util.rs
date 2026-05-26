@@ -316,6 +316,20 @@ pub fn latest_inside_mtime(dir: &Path) -> Result<std::time::SystemTime> {
     Ok(latest)
 }
 
+/// Worker-pool size for a batch of `items` units of work: the machine's
+/// parallelism, capped at 16 and never more than the number of items. Returns
+/// at least 1. Centralizes the sizing used by the CAS pass and the archive
+/// extractors so they all scale with the host rather than a hardcoded count.
+pub fn worker_count(items: usize) -> usize {
+    if items <= 1 {
+        return items;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    cores.clamp(1, 16).min(items)
+}
+
 /// Return forward-slash version of a path (best-effort UTF-8). Used when
 /// serializing paths into TOML / JSON state files.
 pub fn slash_str(path: &Path) -> String {

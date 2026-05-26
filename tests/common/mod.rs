@@ -57,7 +57,7 @@ impl TestEnv {
     pub fn make_tar_xz(&self, name: &str, entries: &[(&str, &[u8])]) -> PathBuf {
         let path = self.fixture_root.join(name);
         let f = File::create(&path).unwrap();
-        let enc = xz2::write::XzEncoder::new(f, 0);
+        let enc = liblzma::write::XzEncoder::new(f, 0);
         let mut tar = tar::Builder::new(enc);
         for (entry_name, bytes) in entries {
             let mut header = tar::Header::new_gnu();
