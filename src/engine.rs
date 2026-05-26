@@ -143,21 +143,9 @@ impl Natron {
         self.cache.ensure_layout()?;
         self.gc_stale_staging();
 
-        // deploy_dir must be unique per toolchain. Two entries deploying to
-        // the same path would clobber each other even serially; now that
-        // entries sync concurrently it is also a data race on that path.
-        // Reject it up front rather than corrupt a deploy tree.
-        {
-            let mut seen = HashSet::new();
-            for t in &self.config.toolchains {
-                if !seen.insert(t.deploy_dir.as_str()) {
-                    anyhow::bail!(
-                        "two toolchains share deploy_dir '{}'; deploy_dir must be unique per toolchain",
-                        t.deploy_dir
-                    );
-                }
-            }
-        }
+        // deploy_dir uniqueness (and non-emptiness) is already enforced by
+        // Config::validate at load time, so concurrent entries deploy to
+        // disjoint paths — we rely on that invariant rather than re-checking.
 
         let mut state = DeployState::read(&self.config.resolved_deploy_dir())?;
 
@@ -387,17 +375,18 @@ impl Natron {
         }
 
         if let StateDiff::Drift { old_deploy_dir } = &diff {
-            // Reclaim the old path only if no *current* toolchain owns it.
-            // deploy_dirs are unique (validated in run), so if some entry's
-            // deploy_dir equals this old path, that peer is the legitimate
-            // owner and may be deploying there concurrently — undeploying it
-            // would delete a peer's fresh deployment.
-            let claimed_by_peer = self
-                .config
-                .toolchains
-                .iter()
-                .any(|t| &t.deploy_dir == old_deploy_dir);
-            if old_deploy_dir != &entry.deploy_dir && !claimed_by_peer {
+            // Reclaim the path this entry drifted away from — but not if
+            // another entry that's actually being synced this run owns it
+            // (deploy_dirs are unique, so at most one does). That peer may be
+            // deploying there concurrently, and undeploying would delete its
+            // fresh deployment. If the owner isn't being synced, reclaiming the
+            // stale deployment is safe and correct.
+            let owned_by_active_peer = self.config.toolchains.iter().any(|t| {
+                &t.deploy_dir == old_deploy_dir
+                    && t.name != entry.name
+                    && (opts.only.is_empty() || opts.only.contains(&t.name))
+            });
+            if old_deploy_dir != &entry.deploy_dir && !owned_by_active_peer {
                 let old_path = deploy_root.join(old_deploy_dir);
                 deploy::undeploy(&old_path).ok();
             }
