@@ -175,44 +175,6 @@ fn cas_files_parallel(
     })
 }
 
-/// Like `run` but skips CAS — moves staging files directly into the install
-/// tree without hardlinking through the CAS dir. Used for `--no-cas`.
-pub fn run_no_cas(staging_raw: &Path, staging_tree: &Path) -> Result<CasReport> {
-    let mut report = CasReport::default();
-    std::fs::create_dir_all(staging_tree)?;
-
-    for entry in jwalk::WalkDir::new(staging_raw)
-        .skip_hidden(false)
-        .follow_links(false)
-        .sort(true)
-    {
-        let entry = entry?;
-        let src = entry.path();
-        let rel = src.strip_prefix(staging_raw)?;
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
-        let dst = staging_tree.join(rel);
-        let ft = entry.file_type();
-        if ft.is_dir() {
-            std::fs::create_dir_all(&dst)?;
-            report.directories += 1;
-        } else if ft.is_symlink() {
-            reproduce_symlink(&src, &dst)?;
-            report.symlinks += 1;
-        } else if ft.is_file() {
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::rename(&src, &dst).with_context(|| {
-                format!("rename {} -> {}", src.display(), dst.display())
-            })?;
-            report.files_processed += 1;
-        }
-    }
-    Ok(report)
-}
-
 fn cas_file(
     cache: &Cache,
     src: &Path,
@@ -387,15 +349,6 @@ fn files_equal(a: &Path, b: &Path) -> Result<bool> {
             return Ok(false);
         }
     }
-}
-
-/// Clear the read-only attr on a CAS file briefly so callers can do things
-/// like add a hardlink (some platforms refuse to mutate readonly inodes).
-/// Only hardlinking into a readonly inode actually works on every platform
-/// in practice — this helper is reserved for emergencies.
-#[allow(dead_code)]
-pub fn ensure_writable(path: &Path) -> Result<()> {
-    fs_util::clear_readonly(path)
 }
 #[cfg(test)]
 #[path = "tests/cas.rs"]

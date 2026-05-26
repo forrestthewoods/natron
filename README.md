@@ -5,8 +5,8 @@ Vendor compiler toolchains into source-controlled projects.
 natron is a small Rust library + CLI that downloads, caches, and deploys
 compiler toolchains (LLVM, Zig, NASM, MSVC, Windows SDK, etc.) declared in
 a TOML config file. Toolchains live in a shared content-addressed cache;
-each project gets a deploy directory containing hardlinks (or symlinks, or
-copies) into the cache.
+each project gets a deploy directory that symlinks into the cache (or holds
+real copies, if you want to commit the toolchain into source control).
 
 The name comes from the Egyptian preservation salt — natron preserves
 toolchains the way mummification preserved bodies, with rather better
@@ -47,7 +47,7 @@ A `natron.toml` at your project root:
 ```toml
 [settings]
 deploy_dir   = "toolchains"
-deploy_mode  = "hardlink"     # default; per-toolchain may override
+deploy_mode  = "symlink"      # default; per-toolchain may override
 cache_dir    = "~/.cache/natron"  # optional
 
 [[toolchain]]
@@ -252,10 +252,6 @@ natron windows_sdk extract --sdk-version 26100 --out C:\temp\sdk
   to the cache install tree. Instant. Atomic version swaps (just rewrite
   the link). Cross-volume safe. On Windows, falls back to a directory
   junction when creating symlinks lacks privilege.
-- **`hardlink`**: mirror the cache tree with one hardlink per file. The
-  deploy looks like a plain directory tree to every tool. Requires the
-  deploy dir on the same filesystem volume as the cache. Use this when
-  a tool you depend on can't follow reparse points (rare).
 - **`copy`**: a real file copy. Slow and uses real disk space, but the
   only mode where deployed files are independent of the cache — use
   when you want to commit the toolchain into source control.

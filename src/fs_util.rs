@@ -2,36 +2,10 @@
 //! symlinks/junctions on Windows, etc.
 
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Recursively mark every regular file under `path` as read-only.
-///
-/// Uses `jwalk` for parallel walking. Errors on individual files are logged
-/// at warn level rather than failing the whole operation — readonly marking
-/// is best-effort.
-pub fn set_readonly_recursive(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    for entry in jwalk::WalkDir::new(path)
-        .skip_hidden(false)
-        .follow_links(false)
-    {
-        match entry {
-            Ok(e) if e.file_type().is_file() => {
-                let p = e.path();
-                if let Err(err) = mark_file_readonly(&p) {
-                    tracing::warn!("failed to mark readonly: {}: {err}", p.display());
-                }
-            }
-            Ok(_) => {}
-            Err(err) => tracing::warn!("walk error in {}: {err}", path.display()),
-        }
-    }
-    Ok(())
-}
-
-fn mark_file_readonly(path: &Path) -> Result<()> {
+/// Mark a single regular file as read-only.
+pub fn mark_file_readonly(path: &Path) -> Result<()> {
     let md = std::fs::metadata(path)?;
     let mut perms = md.permissions();
     perms.set_readonly(true);
@@ -251,50 +225,6 @@ pub fn symlink_points_to(link: &Path, expected_target: &Path) -> bool {
     canon_actual == canon_expected
 }
 
-/// Return the device/volume identifier for a path. Used for same-volume
-/// detection (hardlinks require single-filesystem).
-#[cfg(unix)]
-pub fn volume_id(path: &Path) -> Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    let md = std::fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?;
-    Ok(md.dev())
-}
-
-#[cfg(windows)]
-pub fn volume_id(path: &Path) -> Result<u64> {
-    // GetVolumePathNameW gives us the volume root (e.g. "C:\"). We hash the
-    // resulting string to get a comparable id. This is sufficient: two paths
-    // share a volume iff their volume roots match.
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::PathBuf;
-    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
-
-    let abs: PathBuf = std::fs::canonicalize(path)
-        .with_context(|| format!("canonicalizing {}", path.display()))?;
-    let wide: Vec<u16> = abs.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut buf = vec![0u16; 260];
-    let ok = unsafe {
-        GetVolumePathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32)
-    };
-    if ok == 0 {
-        anyhow::bail!("GetVolumePathNameW failed for {}", path.display());
-    }
-    // Find null terminator.
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    let s = String::from_utf16_lossy(&buf[..len]).to_lowercase();
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    s.hash(&mut h);
-    Ok(h.finish())
-}
-
-/// Return true if both paths live on the same filesystem volume.
-pub fn same_volume(a: &Path, b: &Path) -> Result<bool> {
-    Ok(volume_id(a)? == volume_id(b)?)
-}
-
 /// Walk a directory and return the most-recent mtime found across any file
 /// (recursively). Used for stale-staging GC: we want to know whether anyone
 /// has touched anything inside the dir recently, not just the dir's own mtime.
@@ -333,11 +263,6 @@ pub fn worker_count(items: usize) -> usize {
 /// serializing paths into TOML / JSON state files.
 pub fn slash_str(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
-}
-
-/// Like `slash_str` but takes a `String` slot directly.
-pub fn slash_path_buf(path: PathBuf) -> String {
-    slash_str(&path)
 }
 #[cfg(test)]
 #[path = "tests/fs_util.rs"]

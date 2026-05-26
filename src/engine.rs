@@ -40,16 +40,10 @@ pub struct Natron {
 #[derive(Debug, Clone, Default)]
 pub struct SyncOptions {
     pub dry_run: bool,
-    pub no_cas: bool,
     /// Override the deploy mode for every entry this run.
     pub mode_override: Option<DeployMode>,
     /// If non-empty, only sync entries whose `name` is in this set.
     pub only: HashSet<String>,
-    /// Keep the `downloads/` cache at the end of the run (currently we
-    /// never auto-purge; this is a placeholder for future `--purge-downloads`
-    /// or similar).
-    #[allow(dead_code)]
-    pub keep_downloads: bool,
 }
 
 /// Per-entry sync outcome, surfaced to the CLI for human-readable output.
@@ -129,14 +123,6 @@ impl Natron {
     /// Sync every entry in config (filtered by `options.only` if set).
     pub fn sync(&self) -> Result<SyncReport> {
         self.run(&self.options)
-    }
-
-    /// Sync one entry by name.
-    pub fn sync_one(&self, name: &str) -> Result<SyncReport> {
-        let mut opts = self.options.clone();
-        opts.only.clear();
-        opts.only.insert(name.to_string());
-        self.run(&opts)
     }
 
     fn run(&self, opts: &SyncOptions) -> Result<SyncReport> {
@@ -299,11 +285,7 @@ impl Natron {
             let staging_tree = staging_root.join("tree");
 
             let t_cas = std::time::Instant::now();
-            let cas_report = if opts.no_cas {
-                cas::run_no_cas(&staging_raw, &staging_tree)?
-            } else {
-                cas::run(&self.cache, &staging_raw, &staging_tree)?
-            };
+            let cas_report = cas::run(&self.cache, &staging_raw, &staging_tree)?;
             let cas_elapsed = t_cas.elapsed().as_secs_f64();
             // files_processed already counts every regular file (dedupe hits
             // included); dedupe_hits is the subset that matched an existing
@@ -319,10 +301,8 @@ impl Natron {
                 cas_report.bytes_freed
             );
 
-            // Note: we do NOT walk staging_tree to mark files readonly here.
             // CAS-managed files are marked readonly at insertion time inside
-            // cas::run; --no-cas mode leaves files writable, which is the
-            // correct semantic for that opt-out (FAT32 / cross-volume).
+            // cas::run, so there's no separate readonly walk here.
             let _ = std::fs::remove_dir_all(&staging_raw);
 
             let metadata = InstallMetadata::new(

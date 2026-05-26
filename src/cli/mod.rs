@@ -53,15 +53,6 @@ pub struct InstallArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Keep `<cache>/downloads/` after the run (default behavior).
-    #[arg(long)]
-    pub keep_downloads: bool,
-
-    /// Skip CAS hardlinking. Files in install tree are independent copies.
-    /// Use on filesystems without hardlink support (FAT32, some net mounts).
-    #[arg(long)]
-    pub no_cas: bool,
-
     /// Only sync these toolchain `name`s (repeatable).
     #[arg(long = "only", value_name = "NAME")]
     pub only: Vec<String>,
@@ -77,11 +68,10 @@ impl InstallArgs {
     pub fn parse_mode(&self) -> Result<Option<DeployMode>> {
         match self.mode.as_deref() {
             None => Ok(None),
-            Some("hardlink") => Ok(Some(DeployMode::Hardlink)),
             Some("symlink") => Ok(Some(DeployMode::Symlink)),
             Some("copy") => Ok(Some(DeployMode::Copy)),
             Some(other) => anyhow::bail!(
-                "unknown --mode '{other}' (expected: hardlink | symlink | copy)"
+                "unknown --mode '{other}' (expected: symlink | copy)"
             ),
         }
     }
@@ -139,8 +129,6 @@ pub fn run(cli: Cli) -> Result<()> {
     init_logging(cli.verbose).ok();
     let command = cli.command.unwrap_or(Command::Install(InstallArgs {
         dry_run: false,
-        keep_downloads: false,
-        no_cas: false,
         only: Vec::new(),
         mode: None,
     }));

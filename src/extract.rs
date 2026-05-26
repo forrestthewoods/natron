@@ -311,7 +311,6 @@ fn apply_strip_prefix(path: &Path, prefix: Option<&str>) -> Option<PathBuf> {
 
 /// VSIX is a zip whose payload lives under a `Contents/` prefix. Anything
 /// outside `Contents/` is metadata we don't want.
-#[allow(dead_code)] // Used by msvc provider in step 11
 pub fn extract_vsix(archive: &Path, dest: &Path) -> Result<()> {
     tracing::debug!("extracting vsix {} -> {}", archive.display(), dest.display());
     std::fs::create_dir_all(dest)?;

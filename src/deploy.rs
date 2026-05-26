@@ -27,40 +27,12 @@ pub fn deploy(cache_tree: &Path, dest: &Path, mode: DeployMode) -> Result<()> {
 
     match mode {
         DeployMode::Symlink => deploy_symlink(cache_tree, dest),
-        DeployMode::Hardlink => deploy_hardlink(cache_tree, dest),
         DeployMode::Copy => deploy_copy(cache_tree, dest),
     }
 }
 
 fn deploy_symlink(cache_tree: &Path, dest: &Path) -> Result<()> {
     fs_util::dir_symlink(cache_tree, dest)
-}
-
-fn deploy_hardlink(cache_tree: &Path, dest: &Path) -> Result<()> {
-    // Pre-flight same-volume check.
-    let parent = dest
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("no parent for {}", dest.display()))?;
-    if !fs_util::same_volume(cache_tree, parent)? {
-        bail!(
-            "hardlink mode requires deploy dir {} to be on the same filesystem as the cache ({}); use --mode copy or --mode symlink",
-            parent.display(),
-            cache_tree.display()
-        );
-    }
-    std::fs::create_dir_all(dest)?;
-    walk_and_apply(cache_tree, dest, &|src, dst, ft| {
-        if ft.is_dir() {
-            std::fs::create_dir_all(dst)?;
-        } else if ft.is_symlink() {
-            reproduce_symlink(src, dst)?;
-        } else if ft.is_file() {
-            // Don't try to hardlink a symlink — the walk routes symlinks
-            // through reproduce_symlink. Plain files only here.
-            fs_util::hard_link(src, dst)?;
-        }
-        Ok(())
-    })
 }
 
 fn deploy_copy(cache_tree: &Path, dest: &Path) -> Result<()> {

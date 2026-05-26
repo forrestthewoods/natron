@@ -218,7 +218,6 @@ impl Provider for MsvcProvider {
 /// via `base_install = "full"` or an explicit `Microsoft.*` raw extra.
 pub fn find_primary_compiler(manifest: &VsManifest, vs: VsVersion) -> Result<&Package> {
     let infix = format!(".tools.host{HOST}.target{TARGET}.base");
-    let major_dot = format!("{}.", vs.channel());
     let mut best: Option<(&Package, Vec<u64>)> = None;
     for pkg in &manifest.packages {
         let id_lower = pkg.id.to_lowercase();
@@ -244,7 +243,6 @@ pub fn find_primary_compiler(manifest: &VsManifest, vs: VsVersion) -> Result<&Pa
         if vs_maj != vs.channel().to_string() || vs_min.parse::<u64>().is_err() {
             continue;
         }
-        let _ = major_dot; // silence unused — we already split.
         let Some(ver) = &pkg.version else { continue };
         let key = version_key(ver);
         let take = match &best {

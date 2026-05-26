@@ -41,12 +41,6 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 liblzma = { version = "0.4", features = ["static", "parallel"] }
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 [dev-dependencies]
 tempfile = "3"
 # Integration tests build synthetic archives + URLs at runtime. These also
