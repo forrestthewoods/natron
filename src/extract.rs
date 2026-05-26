@@ -220,7 +220,7 @@ fn extract_tar_inner<R: Read>(
                         .link_name()?
                         .ok_or_else(|| anyhow!("symlink entry without link_name"))?
                         .into_owned();
-                    reproduce_tar_symlink(&out, &link_target)?;
+                    crate::fs_util::symlink_any(&link_target, &out)?;
                     continue;
                 }
                 let size = entry.header().size().unwrap_or(0);
@@ -271,30 +271,6 @@ fn write_file_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))
 }
 
-fn reproduce_tar_symlink(out: &Path, link_target: &Path) -> Result<()> {
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Best-effort: skip if symlink already exists.
-    let _ = std::fs::remove_file(out);
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(link_target, out)?;
-    }
-    #[cfg(windows)]
-    {
-        // Windows: try a file symlink; fall back silently if not allowed.
-        if let Err(err) = std::os::windows::fs::symlink_file(link_target, out) {
-            tracing::warn!(
-                "could not create symlink {} -> {}: {err}",
-                out.display(),
-                link_target.display()
-            );
-        }
-    }
-    Ok(())
-}
-
 /// Strip the leading `prefix` (a path component, may be multi-component) from
 /// `path`. Returns `None` if the path doesn't start with the prefix (such
 /// entries are dropped during extraction).
@@ -311,7 +287,6 @@ fn apply_strip_prefix(path: &Path, prefix: Option<&str>) -> Option<PathBuf> {
 
 /// VSIX is a zip whose payload lives under a `Contents/` prefix. Anything
 /// outside `Contents/` is metadata we don't want.
-#[allow(dead_code)] // Used by msvc provider in step 11
 pub fn extract_vsix(archive: &Path, dest: &Path) -> Result<()> {
     tracing::debug!("extracting vsix {} -> {}", archive.display(), dest.display());
     std::fs::create_dir_all(dest)?;
@@ -346,6 +321,21 @@ pub fn extract_vsix(archive: &Path, dest: &Path) -> Result<()> {
         }
         let mut outf = File::create(&out)?;
         std::io::copy(&mut entry, &mut outf)?;
+    }
+    Ok(())
+}
+
+/// Extract one MSVC / Windows SDK payload, dispatching on filename extension:
+/// `.vsix` / `.zip` via the VSIX `Contents/` extractor, `.msi` via the
+/// pure-Rust MSI extractor. Unknown extensions are logged and skipped.
+pub fn extract_msvc_payload(archive: &Path, filename: &str, dest: &Path) -> Result<()> {
+    let lower = filename.to_lowercase();
+    if lower.ends_with(".vsix") || lower.ends_with(".zip") {
+        extract_vsix(archive, dest)?;
+    } else if lower.ends_with(".msi") {
+        extract_msi(archive, dest)?;
+    } else {
+        tracing::warn!("skipping payload with unknown extension: {filename}");
     }
     Ok(())
 }

@@ -27,7 +27,6 @@ pub fn deploy(cache_tree: &Path, dest: &Path, mode: DeployMode) -> Result<()> {
 
     match mode {
         DeployMode::Symlink => deploy_symlink(cache_tree, dest),
-        DeployMode::Hardlink => deploy_hardlink(cache_tree, dest),
         DeployMode::Copy => deploy_copy(cache_tree, dest),
     }
 }
@@ -36,40 +35,13 @@ fn deploy_symlink(cache_tree: &Path, dest: &Path) -> Result<()> {
     fs_util::dir_symlink(cache_tree, dest)
 }
 
-fn deploy_hardlink(cache_tree: &Path, dest: &Path) -> Result<()> {
-    // Pre-flight same-volume check.
-    let parent = dest
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("no parent for {}", dest.display()))?;
-    if !fs_util::same_volume(cache_tree, parent)? {
-        bail!(
-            "hardlink mode requires deploy dir {} to be on the same filesystem as the cache ({}); use --mode copy or --mode symlink",
-            parent.display(),
-            cache_tree.display()
-        );
-    }
-    std::fs::create_dir_all(dest)?;
-    walk_and_apply(cache_tree, dest, &|src, dst, ft| {
-        if ft.is_dir() {
-            std::fs::create_dir_all(dst)?;
-        } else if ft.is_symlink() {
-            reproduce_symlink(src, dst)?;
-        } else if ft.is_file() {
-            // Don't try to hardlink a symlink — the walk routes symlinks
-            // through reproduce_symlink. Plain files only here.
-            fs_util::hard_link(src, dst)?;
-        }
-        Ok(())
-    })
-}
-
 fn deploy_copy(cache_tree: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)?;
     walk_and_apply(cache_tree, dest, &|src, dst, ft| {
         if ft.is_dir() {
             std::fs::create_dir_all(dst)?;
         } else if ft.is_symlink() {
-            reproduce_symlink(src, dst)?;
+            fs_util::reproduce_symlink(src, dst)?;
         } else if ft.is_file() {
             if let Some(parent) = dst.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -142,34 +114,6 @@ impl<C: jwalk::ClientState> From<&jwalk::DirEntry<C>> for FileTypeKind {
             FileTypeKind::Other
         }
     }
-}
-
-fn reproduce_symlink(src: &Path, dst: &Path) -> Result<()> {
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let target = std::fs::read_link(src)
-        .with_context(|| format!("read_link {}", src.display()))?;
-    let _ = std::fs::remove_file(dst);
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&target, dst).with_context(|| {
-            format!("symlink {} -> {}", dst.display(), target.display())
-        })?;
-    }
-    #[cfg(windows)]
-    {
-        let r = std::os::windows::fs::symlink_file(&target, dst)
-            .or_else(|_| std::os::windows::fs::symlink_dir(&target, dst));
-        if let Err(err) = r {
-            tracing::warn!(
-                "could not reproduce symlink {} -> {}: {err}",
-                dst.display(),
-                target.display()
-            );
-        }
-    }
-    Ok(())
 }
 
 /// Remove a deployed dir cleanly. Used when an entry is removed from config

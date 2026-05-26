@@ -120,9 +120,10 @@ fn discovers_config_upward() {
 }
 
 #[test]
-fn discover_returns_none_when_missing() {
+fn load_errors_when_no_config_found_upward() {
     let tmp = TempDir::new().unwrap();
-    assert!(Config::discover(tmp.path()).is_none());
+    let err = Config::load(tmp.path()).unwrap_err();
+    assert!(err.to_string().contains("no `natron.toml`"));
 }
 
 #[test]

@@ -34,23 +34,6 @@ fn deploy_copy_produces_independent_files() {
 }
 
 #[test]
-fn deploy_hardlink_shares_inodes_on_unix() {
-    let tmp = TempDir::new().unwrap();
-    let tree = make_install_tree(tmp.path());
-    let dest = tmp.path().join("project").join("toolchains").join("llvm");
-    deploy(&tree, &dest, DeployMode::Hardlink).unwrap();
-
-    assert_eq!(std::fs::read(dest.join("bin").join("clang")).unwrap(), b"BIN");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let a = std::fs::metadata(tree.join("LICENSE")).unwrap();
-        let b = std::fs::metadata(dest.join("LICENSE")).unwrap();
-        assert_eq!(a.ino(), b.ino(), "hardlinked files share inode");
-    }
-}
-
-#[test]
 fn deploy_symlink_makes_directory_link() {
     let tmp = TempDir::new().unwrap();
     let tree = make_install_tree(tmp.path());
@@ -95,7 +78,8 @@ fn deploy_can_switch_mode() {
     assert!(std::fs::symlink_metadata(&dest).unwrap().file_type().is_symlink() || cfg!(windows));
     assert_eq!(std::fs::read(dest.join("LICENSE")).unwrap(), b"LIC");
 
-    deploy(&tree, &dest, DeployMode::Hardlink).unwrap();
+    // Switch back to a real-file mode.
+    deploy(&tree, &dest, DeployMode::Copy).unwrap();
     assert_eq!(std::fs::read(dest.join("LICENSE")).unwrap(), b"LIC");
 }
 

@@ -20,8 +20,6 @@ pub fn run(
     let registry = crate::providers::ProviderRegistry::default();
     let mut opts = SyncOptions::default();
     opts.dry_run = args.dry_run;
-    opts.keep_downloads = args.keep_downloads;
-    opts.no_cas = args.no_cas;
     opts.mode_override = args.parse_mode()?;
     for n in &args.only {
         opts.only.insert(n.clone());

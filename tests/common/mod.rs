@@ -81,7 +81,7 @@ impl TestEnv {
         Config {
             settings: Settings {
                 deploy_dir: deploy_dir.clone(),
-                deploy_mode: DeployMode::Hardlink,
+                deploy_mode: DeployMode::Symlink,
                 cache_dir: Some(self.cache_dir.clone()),
             },
             toolchains: entries,

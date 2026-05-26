@@ -105,23 +105,6 @@ fn cas_run_handles_subdirs() {
 }
 
 #[test]
-fn cas_run_no_cas_skips_dedupe() {
-    let tmp = TempDir::new().unwrap();
-    let raw = tmp.path().join("staging").join("raw");
-    write(&raw.join("a.txt"), b"AAA");
-    write(&raw.join("d").join("b.txt"), b"BBB");
-    let tree = tmp.path().join("staging").join("tree");
-    let report = run_no_cas(&raw, &tree).unwrap();
-    assert_eq!(report.files_processed, 2);
-    assert_eq!(report.dedupe_hits, 0);
-    assert_eq!(std::fs::read(tree.join("a.txt")).unwrap(), b"AAA");
-    assert_eq!(
-        std::fs::read(tree.join("d").join("b.txt")).unwrap(),
-        b"BBB"
-    );
-}
-
-#[test]
 fn cas_run_creates_2hex_parent_lazily() {
     let tmp = TempDir::new().unwrap();
     let cache = Cache::at(tmp.path().join("cache"));

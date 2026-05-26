@@ -40,16 +40,10 @@ pub struct Natron {
 #[derive(Debug, Clone, Default)]
 pub struct SyncOptions {
     pub dry_run: bool,
-    pub no_cas: bool,
     /// Override the deploy mode for every entry this run.
     pub mode_override: Option<DeployMode>,
     /// If non-empty, only sync entries whose `name` is in this set.
     pub only: HashSet<String>,
-    /// Keep the `downloads/` cache at the end of the run (currently we
-    /// never auto-purge; this is a placeholder for future `--purge-downloads`
-    /// or similar).
-    #[allow(dead_code)]
-    pub keep_downloads: bool,
 }
 
 /// Per-entry sync outcome, surfaced to the CLI for human-readable output.
@@ -129,14 +123,6 @@ impl Natron {
     /// Sync every entry in config (filtered by `options.only` if set).
     pub fn sync(&self) -> Result<SyncReport> {
         self.run(&self.options)
-    }
-
-    /// Sync one entry by name.
-    pub fn sync_one(&self, name: &str) -> Result<SyncReport> {
-        let mut opts = self.options.clone();
-        opts.only.clear();
-        opts.only.insert(name.to_string());
-        self.run(&opts)
     }
 
     fn run(&self, opts: &SyncOptions) -> Result<SyncReport> {
@@ -299,11 +285,7 @@ impl Natron {
             let staging_tree = staging_root.join("tree");
 
             let t_cas = std::time::Instant::now();
-            let cas_report = if opts.no_cas {
-                cas::run_no_cas(&staging_raw, &staging_tree)?
-            } else {
-                cas::run(&self.cache, &staging_raw, &staging_tree)?
-            };
+            let cas_report = cas::run(&self.cache, &staging_raw, &staging_tree)?;
             let cas_elapsed = t_cas.elapsed().as_secs_f64();
             // files_processed already counts every regular file (dedupe hits
             // included); dedupe_hits is the subset that matched an existing
@@ -319,10 +301,8 @@ impl Natron {
                 cas_report.bytes_freed
             );
 
-            // Note: we do NOT walk staging_tree to mark files readonly here.
             // CAS-managed files are marked readonly at insertion time inside
-            // cas::run; --no-cas mode leaves files writable, which is the
-            // correct semantic for that opt-out (FAT32 / cross-volume).
+            // cas::run, so there's no separate readonly walk here.
             let _ = std::fs::remove_dir_all(&staging_raw);
 
             let metadata = InstallMetadata::new(
@@ -408,7 +388,7 @@ impl Natron {
                     deploy_dir: entry.deploy_dir.clone(),
                     mode,
                     target: fs_util::slash_str(&install_tree),
-                    deployed_at: now_datetime(),
+                    deployed_at: crate::cache::now_datetime(),
                 },
             );
             if installed.freshly_extracted {
@@ -455,36 +435,6 @@ impl Natron {
     }
 }
 
-fn now_datetime() -> toml::value::Datetime {
-    use std::time::UNIX_EPOCH;
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let s = format_datetime(secs);
-    s.parse().unwrap_or_else(|_| "1970-01-01T00:00:00Z".parse().unwrap())
-}
-
-fn format_datetime(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let sod = (secs % 86_400) as u32;
-    let h = sod / 3600;
-    let m = (sod / 60) % 60;
-    let s = sod % 60;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mm = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = (y + if mm <= 2 { 1 } else { 0 }) as i32;
-    format!(
-        "{year:04}-{mm:02}-{d:02}T{h:02}:{m:02}:{s:02}Z"
-    )
-}
 #[cfg(test)]
 #[path = "tests/engine.rs"]
 mod tests;

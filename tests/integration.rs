@@ -127,32 +127,6 @@ fn test_cas_dedupe() {
 }
 
 #[test]
-fn test_deploy_mode_hardlink() {
-    let env = TestEnv::new();
-    let archive = env.make_zip("a.zip", &[("bin", b"DATA")]);
-    let mut cfg = env.build_config(vec![url_entry("a", "a", &archive)]);
-    cfg.toolchains[0].deploy_mode = Some(DeployMode::Hardlink);
-    let n = env.make_natron(cfg);
-    n.sync().unwrap();
-
-    let deployed = env.deploy_root().join("a").join("bin");
-    assert_eq!(fs::read(&deployed).unwrap(), b"DATA");
-
-    #[cfg(unix)]
-    {
-        // Deploy file shares inode with cache file.
-        use std::os::unix::fs::MetadataExt;
-        // Find the install tree inside cache/installs/<fp>/tree/bin.
-        let installs = env.cache_dir.join("installs");
-        let install_dir = fs::read_dir(&installs).unwrap().next().unwrap().unwrap();
-        let cache_bin = install_dir.path().join("tree").join("bin");
-        let deployed_md = fs::metadata(&deployed).unwrap();
-        let cache_md = fs::metadata(&cache_bin).unwrap();
-        assert_eq!(deployed_md.ino(), cache_md.ino());
-    }
-}
-
-#[test]
 fn test_deploy_mode_symlink() {
     let env = TestEnv::new();
     let archive = env.make_zip("a.zip", &[("file", b"X")]);
@@ -203,14 +177,14 @@ fn test_change_deploy_mode() {
     let deploy = env.deploy_root().join("a");
     assert!(fs::symlink_metadata(&deploy).unwrap().file_type().is_symlink() || cfg!(windows));
 
-    // Switch to hardlink, sync again.
+    // Switch to copy, sync again.
     let mut cfg2 = cfg;
-    cfg2.toolchains[0].deploy_mode = Some(DeployMode::Hardlink);
+    cfg2.toolchains[0].deploy_mode = Some(DeployMode::Copy);
     let n2 = env.make_natron(cfg2);
     let report = n2.sync().unwrap();
     assert_eq!(report.entries[0].action, SyncAction::Redeployed);
 
-    // Now it's a real directory with hardlinked files, not a symlink.
+    // Now it's a real directory with copied files, not a symlink.
     let md = fs::symlink_metadata(&deploy).unwrap();
     assert!(md.file_type().is_dir());
     assert_eq!(fs::read(deploy.join("file")).unwrap(), b"X");
@@ -261,22 +235,6 @@ fn test_sha_pin_mismatch() {
     let installs = env.cache_dir.join("installs");
     let count = fs::read_dir(&installs).map(|d| d.count()).unwrap_or(0);
     assert_eq!(count, 0);
-}
-
-#[test]
-fn test_no_cas_flag() {
-    let env = TestEnv::new();
-    let archive = env.make_zip("a.zip", &[("f", b"X")]);
-    let cfg = env.build_config(vec![url_entry("a", "a", &archive)]);
-    let mut opts = SyncOptions::default();
-    opts.no_cas = true;
-    let n = env.make_natron(cfg).with_options(opts);
-    n.sync().unwrap();
-    let cas = env.cache_dir.join("cas");
-    let count = fs::read_dir(&cas).map(|d| d.count()).unwrap_or(0);
-    assert_eq!(count, 0, "CAS should be empty in --no-cas mode");
-    // Install tree still present.
-    assert!(env.deploy_root().join("a").join("f").is_file());
 }
 
 #[test]

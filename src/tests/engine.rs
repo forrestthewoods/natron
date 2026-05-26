@@ -231,28 +231,6 @@ fn sync_handles_unknown_provider_gracefully() {
 }
 
 #[test]
-fn sync_no_cas_skips_dedupe() {
-    let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("project");
-    std::fs::create_dir_all(&project).unwrap();
-    let deploy_dir = project.join("toolchains");
-    let cfg = build_config(&deploy_dir, vec![entry("foo", "foo")]);
-    let cache = Cache::at(tmp.path().join("cache"));
-    let mut reg = ProviderRegistry::empty();
-    reg.register(StubProvider {
-        files: vec![("LICENSE", b"LIC")],
-        fingerprint_seed: "v1",
-    });
-    let mut opts = SyncOptions::default();
-    opts.no_cas = true;
-    let n = Natron::new(cfg, cache.clone(), reg).with_options(opts);
-    n.sync().unwrap();
-    // CAS should be empty (no entries).
-    let cas_entries: Vec<_> = std::fs::read_dir(&cache.cas).unwrap().collect();
-    assert!(cas_entries.is_empty(), "CAS should be empty in --no-cas mode");
-}
-
-#[test]
 fn sync_redeploys_on_mode_change() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("project");

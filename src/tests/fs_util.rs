@@ -2,6 +2,7 @@
 //! file shows only the implementation).
 
 use super::*;
+use std::path::PathBuf;
 use tempfile::TempDir;
 
 #[test]
@@ -46,11 +47,11 @@ fn try_rename_returns_false_on_collision() {
 }
 
 #[test]
-fn set_readonly_recursive_marks_files() {
+fn mark_file_readonly_sets_attr() {
     let tmp = TempDir::new().unwrap();
     let f = tmp.path().join("a.txt");
     std::fs::write(&f, "x").unwrap();
-    set_readonly_recursive(tmp.path()).unwrap();
+    mark_file_readonly(&f).unwrap();
     let md = std::fs::metadata(&f).unwrap();
     assert!(md.permissions().readonly());
 }
@@ -60,8 +61,9 @@ fn remove_dir_all_writable_handles_readonly() {
     let tmp = TempDir::new().unwrap();
     let inner = tmp.path().join("inner");
     std::fs::create_dir_all(&inner).unwrap();
-    std::fs::write(inner.join("a.txt"), "x").unwrap();
-    set_readonly_recursive(&inner).unwrap();
+    let f = inner.join("a.txt");
+    std::fs::write(&f, "x").unwrap();
+    mark_file_readonly(&f).unwrap();
     remove_dir_all_writable(&inner).unwrap();
     assert!(!inner.exists());
 }
@@ -74,16 +76,6 @@ fn hard_link_creates_link() {
     std::fs::write(&a, "data").unwrap();
     hard_link(&a, &b).unwrap();
     assert_eq!(std::fs::read_to_string(&b).unwrap(), "data");
-}
-
-#[test]
-fn same_volume_within_tempdir() {
-    let tmp = TempDir::new().unwrap();
-    let a = tmp.path().join("a");
-    let b = tmp.path().join("b");
-    std::fs::create_dir_all(&a).unwrap();
-    std::fs::create_dir_all(&b).unwrap();
-    assert!(same_volume(&a, &b).unwrap());
 }
 
 #[test]

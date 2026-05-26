@@ -953,7 +953,6 @@ dependencies = [
  "glob",
  "indicatif",
  "jwalk",
- "libc",
  "liblzma",
  "msi",
  "serde",
@@ -967,7 +966,6 @@ dependencies = [
  "ureq",
  "url",
  "uuid",
- "windows-sys 0.61.2",
  "xxhash-rust",
  "zip",
 ]
