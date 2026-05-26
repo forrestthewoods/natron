@@ -216,9 +216,10 @@ fn create_junction(_target: &Path, _link: &Path) -> Result<()> {
 /// Create a symlink at `link` pointing to `target`, reproducing a symlink from
 /// an archive or another tree. Creates parent dirs and replaces any existing
 /// entry at `link`. On Windows we don't know if the target is a file or a dir,
-/// so we try a file symlink then fall back to a dir symlink; a failure (e.g.
-/// missing privilege) is logged and swallowed rather than aborting the whole
-/// extraction/deploy.
+/// so we try a file symlink then fall back to a dir symlink. A failure (e.g.
+/// the symlink-create privilege is not held on Windows) is returned as an
+/// error — a tree missing a symlink is an incomplete, invalid install, not
+/// something to silently continue past.
 pub fn symlink_any(target: &Path, link: &Path) -> Result<()> {
     if let Some(parent) = link.parent() {
         std::fs::create_dir_all(parent)?;
@@ -232,15 +233,11 @@ pub fn symlink_any(target: &Path, link: &Path) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        let r = std::os::windows::fs::symlink_file(target, link)
-            .or_else(|_| std::os::windows::fs::symlink_dir(target, link));
-        if let Err(err) = r {
-            tracing::warn!(
-                "could not create symlink {} -> {}: {err}",
-                link.display(),
-                target.display()
-            );
-        }
+        std::os::windows::fs::symlink_file(target, link)
+            .or_else(|_| std::os::windows::fs::symlink_dir(target, link))
+            .with_context(|| {
+                format!("symlink {} -> {}", link.display(), target.display())
+            })?;
     }
     Ok(())
 }
