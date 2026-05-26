@@ -10,9 +10,9 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeSet;
-use std::path::Path;
 use xxhash_rust::xxh3::xxh3_64;
 
+use super::options::{self, BaseInstall};
 use super::vs_manifest::{self, ManifestHistory, Package, VsManifest, VsVersion};
 use super::{InstallCtx, Installed, Provider};
 use crate::cache::sanitize_fingerprint;
@@ -37,32 +37,6 @@ const DEFAULT_PATTERNS: &[&str] = &[
 
 // ---- option types ----------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BaseInstall {
-    None,
-    Default,
-    Full,
-}
-
-impl BaseInstall {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Default => "default",
-            Self::Full => "full",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "none" => Ok(Self::None),
-            "default" => Ok(Self::Default),
-            "full" => Ok(Self::Full),
-            other => bail!("invalid base_install '{other}'; valid: none, default, full"),
-        }
-    }
-}
-
 #[derive(Debug)]
 struct Options {
     build_version: String,
@@ -72,16 +46,16 @@ struct Options {
 
 impl Options {
     fn parse(options: &toml::Table) -> Result<Self> {
-        let build_version = required_str(options, "build_version")?.to_string();
+        let build_version = options::required_str(options, "build_version", "msvc")?.to_string();
         // Validate now so config-time typos surface without needing network.
         let major = vs_manifest::build_version_major(&build_version)
             .map_err(|e| anyhow!("`msvc` provider: {e}"))?;
         VsVersion::from_channel(major).map_err(|e| anyhow!("`msvc` provider: {e}"))?;
-        let base = match optional_str(options, "base_install")? {
+        let base = match options::optional_str(options, "base_install", "msvc")? {
             Some(v) => BaseInstall::parse(v)?,
             None => BaseInstall::Default,
         };
-        let extras = optional_string_list(options, "extras")?;
+        let extras = options::optional_string_list(options, "extras", "msvc")?;
 
         if base == BaseInstall::None && extras.is_empty() {
             bail!("`msvc`: base_install='none' with empty extras would install nothing");
@@ -169,7 +143,7 @@ impl Provider for MsvcProvider {
         for request in &selected {
             let pkg = lookup_package(&manifest, request)?;
             for payload in &pkg.payloads {
-                let filename = payload_filename(payload);
+                let filename = vs_manifest::payload_filename(payload);
                 let t_dl = std::time::Instant::now();
                 let (archive, source) = ctx
                     .download_with_outcome(&payload.url, payload.sha256.as_deref())
@@ -180,7 +154,7 @@ impl Provider for MsvcProvider {
                     FetchSource::Downloaded => downloaded_count += 1,
                 }
                 let t_ex = std::time::Instant::now();
-                extract_payload(&archive, &filename, &staging)
+                extract::extract_msvc_payload(&archive, &filename, &staging)
                     .with_context(|| format!("extracting {filename} for {}", pkg.id))?;
                 ex_secs += t_ex.elapsed().as_secs_f64();
             }
@@ -323,7 +297,7 @@ fn match_pattern_into(
     if pattern.is_empty() {
         bail!("msvc package pattern may not be empty");
     }
-    let raw = starts_with_ignore_ascii_case(pattern, "Microsoft.");
+    let raw = vs_manifest::starts_with_ignore_ascii_case(pattern, "Microsoft.");
     let compiled = glob::Pattern::new(pattern)
         .with_context(|| format!("msvc package pattern '{pattern}' is not a valid glob"))?;
     let opts = glob::MatchOptions {
@@ -339,7 +313,7 @@ fn match_pattern_into(
     // have a different family prefix) and unrelated workloads.
     let mut matched = 0usize;
     for pkg in &manifest.packages {
-        let in_family = starts_with_ignore_ascii_case(&pkg.id, family_prefix);
+        let in_family = vs_manifest::starts_with_ignore_ascii_case(&pkg.id, family_prefix);
         let candidate = if raw {
             pkg.id.as_str()
         } else if in_family {
@@ -407,78 +381,6 @@ fn lookup_package<'a>(manifest: &'a VsManifest, request: &PackageRequest) -> Res
                     .unwrap_or_default()
             )
         })
-}
-
-fn payload_filename(payload: &vs_manifest::Payload) -> String {
-    if let Some(name) = &payload.file_name {
-        return name.clone();
-    }
-    if let Ok(parsed) = url::Url::parse(&payload.url) {
-        if let Some(seg) = parsed.path_segments().and_then(|mut s| s.next_back()) {
-            if !seg.is_empty() {
-                return seg.to_string();
-            }
-        }
-    }
-    "unknown.bin".to_string()
-}
-
-fn extract_payload(archive: &Path, filename: &str, dest: &Path) -> Result<()> {
-    let lower = filename.to_lowercase();
-    if lower.ends_with(".vsix") || lower.ends_with(".zip") {
-        extract::extract_vsix(archive, dest)?;
-    } else if lower.ends_with(".msi") {
-        extract::extract_msi(archive, dest)?;
-    } else {
-        tracing::warn!("skipping MSVC payload of unknown type: {filename}");
-    }
-    Ok(())
-}
-
-fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
-    value.len() >= prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix)
-}
-
-// ---- option helpers --------------------------------------------------------
-
-fn required_str<'a>(options: &'a toml::Table, key: &str) -> Result<&'a str> {
-    options
-        .get(key)
-        .ok_or_else(|| anyhow!("`msvc` provider requires options.{key}"))?
-        .as_str()
-        .ok_or_else(|| anyhow!("`msvc` option '{key}' must be a string"))
-}
-
-fn optional_str<'a>(options: &'a toml::Table, key: &str) -> Result<Option<&'a str>> {
-    match options.get(key) {
-        None => Ok(None),
-        Some(v) => v
-            .as_str()
-            .map(Some)
-            .ok_or_else(|| anyhow!("`msvc` option '{key}' must be a string")),
-    }
-}
-
-fn optional_string_list(options: &toml::Table, key: &str) -> Result<Vec<String>> {
-    let Some(v) = options.get(key) else {
-        return Ok(Vec::new());
-    };
-    let arr = v
-        .as_array()
-        .ok_or_else(|| anyhow!("`msvc` option '{key}' must be an array of strings"))?;
-    let mut out = Vec::new();
-    for item in arr {
-        let s = item
-            .as_str()
-            .ok_or_else(|| anyhow!("`msvc` option '{key}' entries must be strings"))?;
-        if s.is_empty() {
-            bail!("`msvc` option '{key}' entries may not be empty");
-        }
-        if !out.iter().any(|x: &String| x == s) {
-            out.push(s.to_string());
-        }
-    }
-    Ok(out)
 }
 
 // ---- fingerprint + display -------------------------------------------------

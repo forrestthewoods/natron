@@ -392,6 +392,29 @@ fn clone_into(remote: &str, dest: &Path, meta_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The filename of a payload: its explicit `fileName`, else the last path
+/// segment of its URL, else a placeholder. Shared by both providers and the
+/// `msvc` / `windows_sdk` debug CLIs.
+pub fn payload_filename(payload: &Payload) -> String {
+    if let Some(name) = &payload.file_name {
+        return name.clone();
+    }
+    if let Ok(parsed) = url::Url::parse(&payload.url) {
+        if let Some(seg) = parsed.path_segments().and_then(|mut s| s.next_back()) {
+            if !seg.is_empty() {
+                return seg.to_string();
+            }
+        }
+    }
+    "unknown.bin".to_string()
+}
+
+/// Case-insensitive `starts_with` over the raw bytes, used to match package
+/// ids against a family prefix.
+pub fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value.len() >= prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
 /// Parse the major component (first dot-segment) of a buildVersion.
 pub fn build_version_major(build_version: &str) -> Result<u8> {
     let head = build_version

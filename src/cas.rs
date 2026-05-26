@@ -91,7 +91,7 @@ pub fn run(cache: &Cache, staging_raw: &Path, staging_tree: &Path) -> Result<Cas
     }
     report.directories = dirs.len();
     for (src, dst) in &symlinks {
-        reproduce_symlink(src, dst)?;
+        fs_util::reproduce_symlink(src, dst)?;
     }
     report.symlinks = symlinks.len();
 
@@ -252,18 +252,10 @@ fn cas_file(
         // readonly. A blob we just published is a fresh hardlink off a
         // writable, freshly-extracted file, so it's never already readonly —
         // no need to clear first. Failure here is non-fatal.
-        let _ = mark_readonly(&cas_path);
+        let _ = fs_util::mark_file_readonly(&cas_path);
     }
 
     report.files_processed += 1;
-    Ok(())
-}
-
-fn mark_readonly(path: &Path) -> Result<()> {
-    let md = std::fs::metadata(path)?;
-    let mut perms = md.permissions();
-    perms.set_readonly(true);
-    std::fs::set_permissions(path, perms)?;
     Ok(())
 }
 
@@ -273,34 +265,6 @@ fn move_into_install_tree(src: &Path, dst: &Path) -> Result<()> {
     }
     std::fs::rename(src, dst)
         .with_context(|| format!("rename {} -> {}", src.display(), dst.display()))?;
-    Ok(())
-}
-
-fn reproduce_symlink(src: &Path, dst: &Path) -> Result<()> {
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let target = std::fs::read_link(src)
-        .with_context(|| format!("read_link {}", src.display()))?;
-    let _ = std::fs::remove_file(dst); // tolerate prior partial run
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&target, dst)
-            .with_context(|| format!("symlink {} -> {}", dst.display(), target.display()))?;
-    }
-    #[cfg(windows)]
-    {
-        // We don't know if the link is to a file or dir; try file first.
-        let r = std::os::windows::fs::symlink_file(&target, dst)
-            .or_else(|_| std::os::windows::fs::symlink_dir(&target, dst));
-        if let Err(err) = r {
-            tracing::warn!(
-                "could not reproduce symlink {} -> {}: {err}",
-                dst.display(),
-                target.display()
-            );
-        }
-    }
     Ok(())
 }
 

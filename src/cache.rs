@@ -215,7 +215,7 @@ impl InstallMetadata {
     }
 }
 
-fn now_datetime() -> toml::value::Datetime {
+pub(crate) fn now_datetime() -> toml::value::Datetime {
     // Format: YYYY-MM-DDTHH:MM:SSZ
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()

@@ -213,6 +213,46 @@ fn create_junction(_target: &Path, _link: &Path) -> Result<()> {
     anyhow::bail!("junctions are Windows-only");
 }
 
+/// Create a symlink at `link` pointing to `target`, reproducing a symlink from
+/// an archive or another tree. Creates parent dirs and replaces any existing
+/// entry at `link`. On Windows we don't know if the target is a file or a dir,
+/// so we try a file symlink then fall back to a dir symlink; a failure (e.g.
+/// missing privilege) is logged and swallowed rather than aborting the whole
+/// extraction/deploy.
+pub fn symlink_any(target: &Path, link: &Path) -> Result<()> {
+    if let Some(parent) = link.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(link); // tolerate a prior partial run
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).with_context(|| {
+            format!("symlink {} -> {}", link.display(), target.display())
+        })?;
+    }
+    #[cfg(windows)]
+    {
+        let r = std::os::windows::fs::symlink_file(target, link)
+            .or_else(|_| std::os::windows::fs::symlink_dir(target, link));
+        if let Err(err) = r {
+            tracing::warn!(
+                "could not create symlink {} -> {}: {err}",
+                link.display(),
+                target.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reproduce the symlink at `src` as a new symlink at `dst` (reads `src`'s
+/// target via `read_link`, then recreates it at `dst`).
+pub fn reproduce_symlink(src: &Path, dst: &Path) -> Result<()> {
+    let target = std::fs::read_link(src)
+        .with_context(|| format!("read_link {}", src.display()))?;
+    symlink_any(&target, dst)
+}
+
 /// Return true if `link` is a symlink (or junction on Windows) that resolves
 /// to `expected_target`. Returns false on any kind of mismatch or error.
 pub fn symlink_points_to(link: &Path, expected_target: &Path) -> bool {

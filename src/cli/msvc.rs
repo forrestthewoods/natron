@@ -170,7 +170,7 @@ fn run_packages(
     let mut in_family: Vec<&Package> = Vec::new();
     let mut out_of_family: Vec<&Package> = Vec::new();
     for pkg in &manifest.packages {
-        if starts_with_ignore_ascii_case(&pkg.id, &family) {
+        if vs_manifest::starts_with_ignore_ascii_case(&pkg.id, &family) {
             in_family.push(pkg);
         } else if pkg.version.as_deref() == Some(compiler_version) {
             out_of_family.push(pkg);
@@ -244,7 +244,7 @@ fn run_extract(
         .packages
         .iter()
         .filter(|p| {
-            starts_with_ignore_ascii_case(&p.id, &family)
+            vs_manifest::starts_with_ignore_ascii_case(&p.id, &family)
                 || p.version.as_deref() == Some(compiler_version)
         })
         .collect();
@@ -351,10 +351,10 @@ fn extract_one(pkg: &Package, dest: &Path, downloads: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)
         .with_context(|| format!("creating {}", dest.display()))?;
     for payload in &pkg.payloads {
-        let filename = payload_filename(payload);
+        let filename = vs_manifest::payload_filename(payload);
         let archive = download::fetch(&payload.url, payload.sha256.as_deref(), downloads)
             .with_context(|| format!("downloading {filename} for {}", pkg.id))?;
-        extract_payload(&archive, &filename, dest)
+        extract::extract_msvc_payload(&archive, &filename, dest)
             .with_context(|| format!("extracting {filename} for {}", pkg.id))?;
     }
     Ok(())
@@ -393,36 +393,6 @@ fn dir_has_content(p: &Path) -> bool {
         Ok(mut it) => it.next().is_some(),
         Err(_) => false,
     }
-}
-
-fn payload_filename(payload: &vs_manifest::Payload) -> String {
-    if let Some(name) = &payload.file_name {
-        return name.clone();
-    }
-    if let Ok(parsed) = url::Url::parse(&payload.url) {
-        if let Some(seg) = parsed.path_segments().and_then(|mut s| s.next_back()) {
-            if !seg.is_empty() {
-                return seg.to_string();
-            }
-        }
-    }
-    "unknown.bin".to_string()
-}
-
-fn extract_payload(archive: &Path, filename: &str, dest: &Path) -> Result<()> {
-    let lower = filename.to_lowercase();
-    if lower.ends_with(".vsix") || lower.ends_with(".zip") {
-        extract::extract_vsix(archive, dest)?;
-    } else if lower.ends_with(".msi") {
-        extract::extract_msi(archive, dest)?;
-    } else {
-        tracing::warn!("skipping payload with unknown extension: {filename}");
-    }
-    Ok(())
-}
-
-fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
-    value.len() >= prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 #[cfg(test)]

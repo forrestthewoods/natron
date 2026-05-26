@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use xxhash_rust::xxh3::xxh3_64;
 
+use super::options::{self, BaseInstall};
 use super::vs_manifest::{
     self, BuildIndexEntry, ManifestHistory, Package, VsManifest, VsVersion,
 };
@@ -41,32 +42,6 @@ pub const DEFAULT_ESSENTIAL_MSIS: &[&str] = &[
 
 // ---- option types ----------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BaseInstall {
-    None,
-    Default,
-    Full,
-}
-
-impl BaseInstall {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Default => "default",
-            Self::Full => "full",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "none" => Ok(Self::None),
-            "default" => Ok(Self::Default),
-            "full" => Ok(Self::Full),
-            other => bail!("invalid base_install '{other}'; valid: none, default, full"),
-        }
-    }
-}
-
 #[derive(Debug)]
 struct Options {
     sdk_version: String,
@@ -76,17 +51,17 @@ struct Options {
 
 impl Options {
     fn parse(options: &toml::Table) -> Result<Self> {
-        let sdk_version = required_str(options, "sdk_version")?.to_string();
+        let sdk_version = options::required_str(options, "sdk_version", "windows_sdk")?.to_string();
         if !is_numeric_sdk_version(&sdk_version) {
             bail!(
                 "`windows_sdk`: sdk_version '{sdk_version}' must be a numeric build number (e.g. 26100)"
             );
         }
-        let base = match optional_str(options, "base_install")? {
+        let base = match options::optional_str(options, "base_install", "windows_sdk")? {
             Some(v) => BaseInstall::parse(v)?,
             None => BaseInstall::Default,
         };
-        let extras = optional_string_list(options, "extras")?;
+        let extras = options::optional_string_list(options, "extras", "windows_sdk")?;
 
         if base == BaseInstall::None && extras.is_empty() {
             bail!("`windows_sdk`: base_install='none' with empty extras would install nothing");
@@ -195,7 +170,7 @@ impl Provider for WindowsSdkProvider {
             // to extract. For the typical `default` install (7 essentials),
             // this skips ~85% of SDK component deps.
             let install_this_dep = pkg.payloads.iter().any(|p| {
-                let filename = payload_filename(p);
+                let filename = vs_manifest::payload_filename(p);
                 if !filename.to_lowercase().ends_with(".msi") {
                     return false;
                 }
@@ -206,7 +181,7 @@ impl Provider for WindowsSdkProvider {
             }
 
             for p in &pkg.payloads {
-                let filename = payload_filename(p);
+                let filename = vs_manifest::payload_filename(p);
                 let basename = strip_installer_prefix(&filename);
                 let (downloaded, source) = ctx
                     .download_with_outcome(&p.url, p.sha256.as_deref())
@@ -398,7 +373,7 @@ pub fn enumerate_msis(manifest: &VsManifest, sdk_pkg_id: &str) -> Result<Vec<(St
             continue;
         };
         for p in &pkg.payloads {
-            let filename = payload_filename(p);
+            let filename = vs_manifest::payload_filename(p);
             if !filename.to_lowercase().ends_with(".msi") {
                 continue;
             }
@@ -433,7 +408,7 @@ fn check_extras_match(
             continue;
         };
         for p in &pkg.payloads {
-            let filename = payload_filename(p);
+            let filename = vs_manifest::payload_filename(p);
             if !filename.to_lowercase().ends_with(".msi") {
                 continue;
             }
@@ -488,20 +463,6 @@ fn lookup_exact<'a>(manifest: &'a VsManifest, id: &str) -> Option<&'a Package> {
         .find(|p| p.language.as_deref() == Some("en-US"))
         .or_else(|| matches.iter().copied().find(|p| p.language.is_none()))
         .or_else(|| matches.first().copied())
-}
-
-fn payload_filename(p: &vs_manifest::Payload) -> String {
-    if let Some(name) = &p.file_name {
-        return name.clone();
-    }
-    if let Ok(parsed) = url::Url::parse(&p.url) {
-        if let Some(seg) = parsed.path_segments().and_then(|mut s| s.next_back()) {
-            if !seg.is_empty() {
-                return seg.to_string();
-            }
-        }
-    }
-    "unknown.bin".to_string()
 }
 
 /// VS manifest filenames sometimes embed install-subdirectory components
@@ -560,48 +521,6 @@ fn merge_into(src: &Path, dst: &Path) -> Result<()> {
 
 fn numeric_key(v: &str) -> Vec<u64> {
     v.split('.').map(|s| s.parse::<u64>().unwrap_or(0)).collect()
-}
-
-// ---- option helpers --------------------------------------------------------
-
-fn required_str<'a>(options: &'a toml::Table, key: &str) -> Result<&'a str> {
-    options
-        .get(key)
-        .ok_or_else(|| anyhow!("`windows_sdk` provider requires options.{key}"))?
-        .as_str()
-        .ok_or_else(|| anyhow!("`windows_sdk` option '{key}' must be a string"))
-}
-
-fn optional_str<'a>(options: &'a toml::Table, key: &str) -> Result<Option<&'a str>> {
-    match options.get(key) {
-        None => Ok(None),
-        Some(v) => v
-            .as_str()
-            .map(Some)
-            .ok_or_else(|| anyhow!("`windows_sdk` option '{key}' must be a string")),
-    }
-}
-
-fn optional_string_list(options: &toml::Table, key: &str) -> Result<Vec<String>> {
-    let Some(v) = options.get(key) else {
-        return Ok(Vec::new());
-    };
-    let arr = v
-        .as_array()
-        .ok_or_else(|| anyhow!("`windows_sdk` option '{key}' must be an array of strings"))?;
-    let mut out = Vec::new();
-    for item in arr {
-        let s = item
-            .as_str()
-            .ok_or_else(|| anyhow!("`windows_sdk` option '{key}' entries must be strings"))?;
-        if s.is_empty() {
-            bail!("`windows_sdk` option '{key}' entries may not be empty");
-        }
-        if !out.iter().any(|x: &String| x == s) {
-            out.push(s.to_string());
-        }
-    }
-    Ok(out)
 }
 
 // ---- fingerprint + display -------------------------------------------------

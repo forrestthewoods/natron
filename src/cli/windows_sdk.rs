@@ -180,7 +180,7 @@ fn run_extract(
             continue;
         };
         for p in &pkg.payloads {
-            let filename = payload_filename(p);
+            let filename = vs_manifest::payload_filename(p);
             let basename = windows_sdk::strip_installer_prefix(&filename);
             let downloaded = ctx
                 .download(&p.url, p.sha256.as_deref())
@@ -315,20 +315,6 @@ fn manifest_lookup<'a>(
     id: &str,
 ) -> Option<&'a vs_manifest::Package> {
     manifest.packages.iter().find(|p| p.id.eq_ignore_ascii_case(id))
-}
-
-fn payload_filename(p: &vs_manifest::Payload) -> String {
-    if let Some(name) = &p.file_name {
-        return name.clone();
-    }
-    if let Ok(parsed) = url::Url::parse(&p.url) {
-        if let Some(seg) = parsed.path_segments().and_then(|mut s| s.next_back()) {
-            if !seg.is_empty() {
-                return seg.to_string();
-            }
-        }
-    }
-    "unknown.bin".to_string()
 }
 
 fn dir_has_content(p: &Path) -> bool {

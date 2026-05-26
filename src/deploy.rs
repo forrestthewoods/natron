@@ -41,7 +41,7 @@ fn deploy_copy(cache_tree: &Path, dest: &Path) -> Result<()> {
         if ft.is_dir() {
             std::fs::create_dir_all(dst)?;
         } else if ft.is_symlink() {
-            reproduce_symlink(src, dst)?;
+            fs_util::reproduce_symlink(src, dst)?;
         } else if ft.is_file() {
             if let Some(parent) = dst.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -114,34 +114,6 @@ impl<C: jwalk::ClientState> From<&jwalk::DirEntry<C>> for FileTypeKind {
             FileTypeKind::Other
         }
     }
-}
-
-fn reproduce_symlink(src: &Path, dst: &Path) -> Result<()> {
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let target = std::fs::read_link(src)
-        .with_context(|| format!("read_link {}", src.display()))?;
-    let _ = std::fs::remove_file(dst);
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&target, dst).with_context(|| {
-            format!("symlink {} -> {}", dst.display(), target.display())
-        })?;
-    }
-    #[cfg(windows)]
-    {
-        let r = std::os::windows::fs::symlink_file(&target, dst)
-            .or_else(|_| std::os::windows::fs::symlink_dir(&target, dst));
-        if let Err(err) = r {
-            tracing::warn!(
-                "could not reproduce symlink {} -> {}: {err}",
-                dst.display(),
-                target.display()
-            );
-        }
-    }
-    Ok(())
 }
 
 /// Remove a deployed dir cleanly. Used when an entry is removed from config

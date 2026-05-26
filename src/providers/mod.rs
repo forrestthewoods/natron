@@ -11,6 +11,7 @@ use crate::download;
 
 pub mod github;
 pub mod msvc;
+mod options;
 pub mod url;
 pub mod vs_manifest;
 pub mod windows_sdk;
