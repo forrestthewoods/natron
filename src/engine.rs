@@ -143,6 +143,22 @@ impl Natron {
         self.cache.ensure_layout()?;
         self.gc_stale_staging();
 
+        // deploy_dir must be unique per toolchain. Two entries deploying to
+        // the same path would clobber each other even serially; now that
+        // entries sync concurrently it is also a data race on that path.
+        // Reject it up front rather than corrupt a deploy tree.
+        {
+            let mut seen = HashSet::new();
+            for t in &self.config.toolchains {
+                if !seen.insert(t.deploy_dir.as_str()) {
+                    anyhow::bail!(
+                        "two toolchains share deploy_dir '{}'; deploy_dir must be unique per toolchain",
+                        t.deploy_dir
+                    );
+                }
+            }
+        }
+
         let mut state = DeployState::read(&self.config.resolved_deploy_dir())?;
 
         // Entries in state but not in config: clean their deploy dirs.
@@ -212,17 +228,20 @@ impl Natron {
                 let errors = &errors;
                 let outcomes = &outcomes;
                 s.spawn(move || loop {
-                    let wi = match queue.lock().unwrap().pop() {
+                    let wi = match queue.lock().unwrap_or_else(|e| e.into_inner()).pop() {
                         Some(i) => i,
                         None => return,
                     };
                     let (idx, entry) = work[wi];
                     match self.sync_entry(entry, state, opts) {
-                        Ok(outcome) => outcomes.lock().unwrap().push((idx, outcome)),
+                        Ok(outcome) => outcomes
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((idx, outcome)),
                         Err(err) => {
                             let msg = format!("{err:#}");
                             tracing::error!("entry '{}' failed: {msg}", entry.name);
-                            errors.lock().unwrap().push(EntryError {
+                            errors.lock().unwrap_or_else(|e| e.into_inner()).push(EntryError {
                                 name: entry.name.clone(),
                                 message: msg,
                             });
@@ -232,12 +251,12 @@ impl Natron {
             }
         });
 
-        for (idx, outcome) in outcomes.into_inner().unwrap() {
+        for (idx, outcome) in outcomes.into_inner().unwrap_or_else(|e| e.into_inner()) {
             slots[idx] = Some(outcome);
         }
         report.entries = slots.into_iter().flatten().collect();
-        report.errors = errors.into_inner().unwrap();
-        let state = state.into_inner().unwrap();
+        report.errors = errors.into_inner().unwrap_or_else(|e| e.into_inner());
+        let state = state.into_inner().unwrap_or_else(|e| e.into_inner());
 
         if !opts.dry_run {
             state.write(&self.config.resolved_deploy_dir())?;
@@ -349,7 +368,7 @@ impl Natron {
         let deploy_path = deploy_root.join(&entry.deploy_dir);
         let install_tree = self.cache.install_tree(&fingerprint);
 
-        let diff = state.lock().unwrap().diff(
+        let diff = state.lock().unwrap_or_else(|e| e.into_inner()).diff(
             &entry.name,
             &fingerprint,
             &entry.deploy_dir,
@@ -368,7 +387,17 @@ impl Natron {
         }
 
         if let StateDiff::Drift { old_deploy_dir } = &diff {
-            if old_deploy_dir != &entry.deploy_dir {
+            // Reclaim the old path only if no *current* toolchain owns it.
+            // deploy_dirs are unique (validated in run), so if some entry's
+            // deploy_dir equals this old path, that peer is the legitimate
+            // owner and may be deploying there concurrently — undeploying it
+            // would delete a peer's fresh deployment.
+            let claimed_by_peer = self
+                .config
+                .toolchains
+                .iter()
+                .any(|t| &t.deploy_dir == old_deploy_dir);
+            if old_deploy_dir != &entry.deploy_dir && !claimed_by_peer {
                 let old_path = deploy_root.join(old_deploy_dir);
                 deploy::undeploy(&old_path).ok();
             }
@@ -383,7 +412,7 @@ impl Natron {
                 mode,
                 t_deploy.elapsed().as_secs_f64()
             );
-            state.lock().unwrap().upsert(
+            state.lock().unwrap_or_else(|e| e.into_inner()).upsert(
                 entry.name.clone(),
                 DeployedEntry {
                     fingerprint: fingerprint.clone(),

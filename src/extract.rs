@@ -98,7 +98,8 @@ fn extract_tar_xz(archive: &Path, dest: &Path, strip_prefix: Option<&str>) -> Re
 /// Build a multithreaded .xz decoder over `reader`. xz files written by `xz`
 /// (e.g. LLVM's release tarballs) are split into independent ~64 MiB blocks,
 /// so liblzma can decode them across threads. Falls back to a single-threaded
-/// auto-decoder if the MT decoder can't be initialized.
+/// stream decoder (the same flags=0 decoder the old `xz2` path used) if the MT
+/// decoder can't be initialized.
 fn mt_xz_decoder<R: std::io::Read>(reader: R) -> Result<liblzma::read::XzDecoder<R>> {
     let threads = crate::fs_util::worker_count(usize::MAX) as u32;
     if threads <= 1 {

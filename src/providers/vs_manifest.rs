@@ -164,6 +164,10 @@ impl ManifestHistory {
     /// down) leaves the existing clone usable. Requires `git` on PATH.
     pub fn open(remote: &str, cache: &Cache) -> Result<Self> {
         let git_dir = cache.meta.join(MIRROR_REPO);
+        // Hold the lock across the is_dir check + clone/fetch: a concurrent
+        // peer that loses the race then observes the published clone and just
+        // fetches, instead of both cold-cache opens cloning the mirror twice.
+        let _guard = meta_git_lock().lock().unwrap_or_else(|e| e.into_inner());
         if git_dir.is_dir() {
             let _ = git_in(&git_dir, &["fetch", "--quiet", "origin"]);
         } else {
@@ -304,8 +308,25 @@ impl ManifestHistory {
     /// `git cat-file blob <sha>:<path>` — the bytes of a file at a commit.
     fn cat_blob(&self, sha: &str, path: &str) -> Result<Vec<u8>> {
         let spec = format!("{sha}:{path}");
+        // `cat-file` lazily fetches blobs the partial clone filtered out
+        // (notably the big manifest.json) from the promisor remote. Serialize
+        // so concurrent providers don't collide on git's pack/index lock and
+        // fail with an opaque "git failed". Local-blob reads (channel.json)
+        // pay only a cheap uncontended lock.
+        let _guard = meta_git_lock().lock().unwrap_or_else(|e| e.into_inner());
         git_in(&self.git_dir, &["cat-file", "blob", spec.as_str()])
     }
+}
+
+/// Serializes git operations on the shared mirror clone under `<cache>/meta`.
+/// The `msvc` and `windows_sdk` providers can sync concurrently and share this
+/// one clone; without serialization two cold-cache opens double-clone, and
+/// concurrent `git fetch` / promisor `cat-file` fetches collide on git's
+/// pack/index/ref lockfiles. In-process only — cross-process contention is
+/// left to git's own locking, as before this change.
+fn meta_git_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 /// Run `git <args>` and return stdout. Maps a missing `git` binary to a clear

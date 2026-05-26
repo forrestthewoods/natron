@@ -56,6 +56,9 @@ enum CabSource {
 struct CabUnit {
     source: CabSource,
     cab_name: String,
+    /// Source MSI filename, kept for error/progress context (which MSI a
+    /// failing CAB came from).
+    msi_name: String,
     jobs: Vec<ExtractJob>,
 }
 
@@ -90,6 +93,10 @@ fn plan_msi(msi: &Path, dest: &Path) -> Result<Vec<CabUnit>> {
     let jobs_by_cab = enumerate_files(&mut package, &components, &dir_paths, &media)
         .with_context(|| format!("enumerating File rows from {}", msi.display()))?;
 
+    let msi_name = msi
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| msi.display().to_string());
     let mut units = Vec::with_capacity(jobs_by_cab.len());
     for (cab_name, jobs) in jobs_by_cab {
         let source = if let Some(stream_name) = cab_name.strip_prefix('#') {
@@ -103,6 +110,7 @@ fn plan_msi(msi: &Path, dest: &Path) -> Result<Vec<CabUnit>> {
         units.push(CabUnit {
             source,
             cab_name,
+            msi_name: msi_name.clone(),
             jobs,
         });
     }
@@ -397,10 +405,11 @@ fn extract_cab<R: Read + Seek>(reader: R, jobs: &[ExtractJob], cab_name: &str) -
 /// references dozens of external sibling CABs) gives hundreds of evenly-sized
 /// work units that keep all cores busy.
 ///
-/// CABs may safely write to the same `dest` concurrently — files land under
-/// their `Directory`-table paths, and the rare case where two CABs touch the
-/// same path (a header shared across components) writes identical content, so
-/// last-writer-wins is benign.
+/// Destination paths are deduplicated across all CABs before extraction, so a
+/// file shared across components/MSIs is extracted once (first occurrence in
+/// MSI order wins, deterministically). That removes redundant work AND the
+/// only concurrency hazard — two workers writing the same path at once, which
+/// `File::create` + `io::copy` would tear rather than cleanly last-writer-win.
 ///
 /// On the first failure: drains the queue so in-flight workers exit after
 /// their current task, then returns the error.
@@ -417,23 +426,45 @@ pub fn extract_msis_in_parallel(msis: &[PathBuf], dest: &Path) -> Result<()> {
             .with_context(|| format!("planning MSI {}", msi.display()))?;
         units.append(&mut planned);
     }
+
+    // Dedup destination paths across all CABs (see fn-doc): keep the first job
+    // to claim each path, drop the rest, then drop any CAB left with no work.
+    {
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for unit in &mut units {
+            unit.jobs.retain(|job| seen.insert(job.dest_path.clone()));
+        }
+        units.retain(|u| !u.jobs.is_empty());
+    }
+
     let total = units.len();
     if total == 0 {
         return Ok(());
     }
     tracing::info!("extracting {total} CABs across {} MSIs", msis.len());
 
+    // Log at info on ~10 evenly-spaced milestones so a long extraction shows
+    // continuous progress without one line per CAB.
+    let step = (total / 10).max(1);
+    let log_progress = |done: usize, unit: &CabUnit| {
+        if done % step == 0 || done == total {
+            tracing::info!("[{done}/{total}] extracted CAB {} ({})", unit.cab_name, unit.msi_name);
+        }
+    };
+
     let worker_count = crate::fs_util::worker_count(total);
     if worker_count <= 1 {
-        for unit in &units {
-            extract_cab_unit(unit)
-                .with_context(|| format!("extracting CAB {}", unit.cab_name))?;
+        for (i, unit) in units.iter().enumerate() {
+            extract_cab_unit(unit).with_context(|| {
+                format!("extracting CAB {} from {}", unit.cab_name, unit.msi_name)
+            })?;
+            log_progress(i + 1, unit);
         }
         return Ok(());
     }
 
     let queue: Mutex<Vec<usize>> = Mutex::new((0..total).rev().collect());
-    let (tx, rx) = mpsc::channel::<Result<()>>();
+    let (tx, rx) = mpsc::channel::<(usize, Result<()>)>();
 
     std::thread::scope(|s| -> Result<()> {
         for _ in 0..worker_count {
@@ -441,14 +472,15 @@ pub fn extract_msis_in_parallel(msis: &[PathBuf], dest: &Path) -> Result<()> {
             let queue = &queue;
             let units = &units;
             s.spawn(move || loop {
-                let idx = match queue.lock().unwrap().pop() {
+                let idx = match queue.lock().unwrap_or_else(|e| e.into_inner()).pop() {
                     Some(i) => i,
                     None => return,
                 };
                 let unit = &units[idx];
-                let result = extract_cab_unit(unit)
-                    .with_context(|| format!("extracting CAB {}", unit.cab_name));
-                if tx.send(result).is_err() {
+                let result = extract_cab_unit(unit).with_context(|| {
+                    format!("extracting CAB {} from {}", unit.cab_name, unit.msi_name)
+                });
+                if tx.send((idx, result)).is_err() {
                     return;
                 }
             });
@@ -458,13 +490,16 @@ pub fn extract_msis_in_parallel(msis: &[PathBuf], dest: &Path) -> Result<()> {
         // Cancel = drain the queue so in-flight workers exit after their
         // current task instead of grinding through every remaining job
         // before scope() can join.
-        let cancel = || queue.lock().unwrap().clear();
+        let cancel = || queue.lock().unwrap_or_else(|e| e.into_inner()).clear();
 
-        for msg in rx {
+        let mut done = 0usize;
+        for (idx, msg) in rx {
             if let Err(e) = msg {
                 cancel();
                 return Err(e);
             }
+            done += 1;
+            log_progress(done, &units[idx]);
         }
         Ok(())
     })
