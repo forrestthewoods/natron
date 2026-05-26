@@ -34,6 +34,37 @@ const FILE_ATTR_NONCOMPRESSED: i32 = 0x2000;
 /// callers (e.g. `windows_sdk` install) manage scratch dirs themselves.
 pub fn extract_msi(msi: &Path, dest: &Path) -> Result<()> {
     tracing::debug!("extract_msi {} -> {}", msi.display(), dest.display());
+    let units = plan_msi(msi, dest)?;
+    for unit in &units {
+        extract_cab_unit(unit)?;
+    }
+    Ok(())
+}
+
+/// Where a CAB's bytes live: a loose sibling file on disk, or a `#CabN`
+/// stream embedded inside the MSI itself.
+enum CabSource {
+    External(PathBuf),
+    Embedded { msi: PathBuf, stream: String },
+}
+
+/// One unit of extraction work: a single CAB plus the files to pull from it.
+/// CABs are the natural parallelism granularity — each is an independent
+/// compressed container — and a single SDK MSI typically references dozens of
+/// external CABs, so planning at this level lets the worker pool saturate all
+/// cores instead of bottlenecking on one giant MSI.
+struct CabUnit {
+    source: CabSource,
+    cab_name: String,
+    /// Source MSI filename, kept for error/progress context (which MSI a
+    /// failing CAB came from).
+    msi_name: String,
+    jobs: Vec<ExtractJob>,
+}
+
+/// Read an MSI's tables and resolve its file layout into a list of per-CAB
+/// extraction units, without touching any CAB bytes. Cheap (metadata only).
+fn plan_msi(msi: &Path, dest: &Path) -> Result<Vec<CabUnit>> {
     std::fs::create_dir_all(dest)
         .with_context(|| format!("creating {}", dest.display()))?;
 
@@ -62,21 +93,50 @@ pub fn extract_msi(msi: &Path, dest: &Path) -> Result<()> {
     let jobs_by_cab = enumerate_files(&mut package, &components, &dir_paths, &media)
         .with_context(|| format!("enumerating File rows from {}", msi.display()))?;
 
+    let msi_name = msi
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| msi.display().to_string());
+    let mut units = Vec::with_capacity(jobs_by_cab.len());
     for (cab_name, jobs) in jobs_by_cab {
-        if let Some(stream_name) = cab_name.strip_prefix('#') {
-            let stream = package.read_stream(stream_name).with_context(|| {
-                format!("opening embedded CAB stream {cab_name} in {}", msi.display())
-            })?;
-            extract_cab(stream, &jobs, &cab_name)?;
+        let source = if let Some(stream_name) = cab_name.strip_prefix('#') {
+            CabSource::Embedded {
+                msi: msi.to_path_buf(),
+                stream: stream_name.to_string(),
+            }
         } else {
-            let cab_path = msi_dir.join(&cab_name);
-            let cab_file = File::open(&cab_path)
+            CabSource::External(msi_dir.join(&cab_name))
+        };
+        units.push(CabUnit {
+            source,
+            cab_name,
+            msi_name: msi_name.clone(),
+            jobs,
+        });
+    }
+    Ok(units)
+}
+
+/// Open a unit's CAB and stream its files out to their resolved dest paths.
+fn extract_cab_unit(unit: &CabUnit) -> Result<()> {
+    match &unit.source {
+        CabSource::External(cab_path) => {
+            let cab_file = File::open(cab_path)
                 .with_context(|| format!("opening external CAB {}", cab_path.display()))?;
-            extract_cab(cab_file, &jobs, &cab_name)?;
+            extract_cab(cab_file, &unit.jobs, &unit.cab_name)
+        }
+        CabSource::Embedded { msi, stream } => {
+            // Re-open the MSI per embedded unit so units stay independent and
+            // Send-able across worker threads. SDK MSIs use external sibling
+            // CABs, so this path is rarely hit.
+            let mut package = msi::open(msi)
+                .with_context(|| format!("re-opening MSI {} for embedded CAB", msi.display()))?;
+            let reader = package.read_stream(stream).with_context(|| {
+                format!("opening embedded CAB stream #{stream} in {}", msi.display())
+            })?;
+            extract_cab(reader, &unit.jobs, &unit.cab_name)
         }
     }
-
-    Ok(())
 }
 
 // ---- table readers ---------------------------------------------------------
@@ -337,52 +397,90 @@ fn extract_cab<R: Read + Seek>(reader: R, jobs: &[ExtractJob], cab_name: &str) -
 
 // ---- batch / parallel extraction -------------------------------------------
 
-/// Worker pool size for parallel batch MSI extraction. Matches the
-/// vsix-extractor's `EXTRACT_PARALLELISM` in `src/cli/msvc.rs`.
-const EXTRACT_PARALLELISM: usize = 16;
-
-/// Extract every MSI in `msis` into the shared `dest` directory, in
-/// parallel across a small worker pool. Each MSI emits one info-level
-/// `tracing` line as it starts so users see continuous progress instead
-/// of a silent multi-minute pause.
+/// Extract every MSI in `msis` into the shared `dest` directory, parallelized
+/// across a worker pool at **CAB granularity** rather than per-MSI. SDK MSIs
+/// vary wildly in size (a CRT-sources MSI dwarfs a header MSI), so a per-MSI
+/// pool leaves cores idle once the small MSIs finish; planning every MSI into
+/// its constituent CABs first (each an independent container, and one MSI
+/// references dozens of external sibling CABs) gives hundreds of evenly-sized
+/// work units that keep all cores busy.
 ///
-/// MSIs may safely write to the same `dest` concurrently — each one
-/// lays files out under its own `Directory`-table paths, and the few
-/// cases where two MSIs touch the same path (rare; SDK installers
-/// occasionally share a header file across components) the content is
-/// identical so the last writer wins benignly.
+/// Destination paths are deduplicated across all CABs before extraction, so a
+/// file shared across components/MSIs is extracted once (first occurrence in
+/// MSI order wins, deterministically). That removes redundant work AND the
+/// only concurrency hazard — two workers writing the same path at once, which
+/// `File::create` + `io::copy` would tear rather than cleanly last-writer-win.
 ///
-/// On the first per-MSI failure: drains the queue so in-flight workers
-/// exit after their current task, then returns the error.
+/// On the first failure: drains the queue so in-flight workers exit after
+/// their current task, then returns the error.
 pub fn extract_msis_in_parallel(msis: &[PathBuf], dest: &Path) -> Result<()> {
-    let total = msis.len();
+    if msis.is_empty() {
+        return Ok(());
+    }
+
+    // Plan phase: read each MSI's tables (metadata only — fast) and flatten
+    // into one big list of per-CAB units.
+    let mut units: Vec<CabUnit> = Vec::new();
+    for msi in msis {
+        let mut planned = plan_msi(msi, dest)
+            .with_context(|| format!("planning MSI {}", msi.display()))?;
+        units.append(&mut planned);
+    }
+
+    // Dedup destination paths across all CABs (see fn-doc): keep the first job
+    // to claim each path, drop the rest, then drop any CAB left with no work.
+    {
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for unit in &mut units {
+            unit.jobs.retain(|job| seen.insert(job.dest_path.clone()));
+        }
+        units.retain(|u| !u.jobs.is_empty());
+    }
+
+    let total = units.len();
     if total == 0 {
         return Ok(());
     }
+    tracing::info!("extracting {total} CABs across {} MSIs", msis.len());
+
+    // Log at info on ~10 evenly-spaced milestones so a long extraction shows
+    // continuous progress without one line per CAB.
+    let step = (total / 10).max(1);
+    let log_progress = |done: usize, unit: &CabUnit| {
+        if done % step == 0 || done == total {
+            tracing::info!("[{done}/{total}] extracted CAB {} ({})", unit.cab_name, unit.msi_name);
+        }
+    };
+
+    let worker_count = crate::fs_util::worker_count(total);
+    if worker_count <= 1 {
+        for (i, unit) in units.iter().enumerate() {
+            extract_cab_unit(unit).with_context(|| {
+                format!("extracting CAB {} from {}", unit.cab_name, unit.msi_name)
+            })?;
+            log_progress(i + 1, unit);
+        }
+        return Ok(());
+    }
+
     let queue: Mutex<Vec<usize>> = Mutex::new((0..total).rev().collect());
-    let (tx, rx) = mpsc::channel::<Result<()>>();
-    let worker_count = EXTRACT_PARALLELISM.min(total);
+    let (tx, rx) = mpsc::channel::<(usize, Result<()>)>();
 
     std::thread::scope(|s| -> Result<()> {
         for _ in 0..worker_count {
             let tx = tx.clone();
-            // See cli/msvc.rs::extract_in_parallel for the rationale on
-            // rebinding the Mutex by reference for the `move` closure.
             let queue = &queue;
+            let units = &units;
             s.spawn(move || loop {
-                let idx = match queue.lock().unwrap().pop() {
+                let idx = match queue.lock().unwrap_or_else(|e| e.into_inner()).pop() {
                     Some(i) => i,
                     None => return,
                 };
-                let msi = &msis[idx];
-                let name = msi
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| msi.display().to_string());
-                tracing::info!("[{}/{total}] extracting {name}", idx + 1);
-                let result = extract_msi(msi, dest)
-                    .with_context(|| format!("extracting MSI {}", msi.display()));
-                if tx.send(result).is_err() {
+                let unit = &units[idx];
+                let result = extract_cab_unit(unit).with_context(|| {
+                    format!("extracting CAB {} from {}", unit.cab_name, unit.msi_name)
+                });
+                if tx.send((idx, result)).is_err() {
                     return;
                 }
             });
@@ -392,13 +490,16 @@ pub fn extract_msis_in_parallel(msis: &[PathBuf], dest: &Path) -> Result<()> {
         // Cancel = drain the queue so in-flight workers exit after their
         // current task instead of grinding through every remaining job
         // before scope() can join.
-        let cancel = || queue.lock().unwrap().clear();
+        let cancel = || queue.lock().unwrap_or_else(|e| e.into_inner()).clear();
 
-        for msg in rx {
+        let mut done = 0usize;
+        for (idx, msg) in rx {
             if let Err(e) = msg {
                 cancel();
                 return Err(e);
             }
+            done += 1;
+            log_progress(done, &units[idx]);
         }
         Ok(())
     })

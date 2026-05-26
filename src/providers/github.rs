@@ -98,18 +98,28 @@ impl Provider for GithubProvider {
             tag,
             asset,
         );
+        let t_dl = std::time::Instant::now();
         let archive_path = ctx
             .download(&asset_url, sha256)
             .with_context(|| format!("downloading {asset} from {asset_url}"))?;
+        tracing::info!(
+            "[timing] github {asset}: download took {:.2}s",
+            t_dl.elapsed().as_secs_f64()
+        );
 
         // Extract into the staging dir.
         let staging_raw = ctx.staging_dir()?;
+        let t_ex = std::time::Instant::now();
         extract::extract_archive(
             &archive_path,
             archive_kind,
             &staging_raw,
             strip_prefix.as_deref(),
         )?;
+        tracing::info!(
+            "[timing] github {asset}: extract took {:.2}s",
+            t_ex.elapsed().as_secs_f64()
+        );
 
         Ok(Installed {
             fingerprint,

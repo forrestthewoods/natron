@@ -18,7 +18,7 @@ fn build_zip(path: &Path, entries: &[(&str, &[u8])]) {
 
 fn build_tar_xz(path: &Path, entries: &[(&str, &[u8])]) {
     let f = File::create(path).unwrap();
-    let enc = xz2::write::XzEncoder::new(f, 0);
+    let enc = liblzma::write::XzEncoder::new(f, 0);
     let mut tar = tar::Builder::new(enc);
     for (name, data) in entries {
         let mut header = tar::Header::new_gnu();
